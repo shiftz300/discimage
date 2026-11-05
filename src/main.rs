@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use discimage::{
-    author, burn, device,
+    author, burn, calibrate, device,
     layout::Plan,
     preview,
     project::{Artwork, Project},
     template,
 };
+
+mod guide;
 
 #[derive(Parser)]
 #[command(
@@ -22,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Prepare and record a music-first disc on a blank CD-R (macOS).
+    /// Prepare and record a music-first disc on a blank CD-R or CD-RW (macOS).
     Burn {
         project: PathBuf,
         #[arg(long)]
@@ -64,7 +66,7 @@ enum Commands {
     },
     /// Check asset/file hashes and every Mode 1 header, EDC and ECC byte.
     Verify { directory: PathBuf },
-    /// Verify and render the actual encoded drawing payload from a bundle.
+    /// Verify and project the encoded drawing payload using the authoring geometry.
     Readback {
         directory: PathBuf,
         #[arg(short, long)]
@@ -102,6 +104,36 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Create a CD calibration target, mark a photo, or fit radial geometry.
+    #[command(subcommand)]
+    Calibrate(Calibration),
+}
+
+#[derive(Subcommand)]
+enum Calibration {
+    /// Walk through target recording, photo measurements and fitting in one directory.
+    Guide(guide::Options),
+    /// Generate a standalone three-band calibration project with a silent music track.
+    Target {
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 360_000)]
+        capacity_sectors: u32,
+    },
+    /// Export a local photo point picker for the bundle that was actually written.
+    Mark {
+        bundle: PathBuf,
+        photo: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Fit a [disc.calibration] TOML section using the six marked band edges.
+    Fit {
+        bundle: PathBuf,
+        points: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -116,6 +148,39 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Calibrate(command) => match command {
+            Calibration::Guide(options) => guide::run(options)?,
+            Calibration::Target {
+                output,
+                capacity_sectors,
+            } => {
+                calibrate::create(&output, capacity_sectors)?;
+                println!("Created {}", output.join("target.toml").display());
+            }
+            Calibration::Mark {
+                bundle,
+                photo,
+                output,
+            } => {
+                calibrate::mark(&bundle, &photo, &output)?;
+                println!("Open {} in a browser to mark the photo.", output.display());
+            }
+            Calibration::Fit {
+                bundle,
+                points,
+                output,
+            } => {
+                let profile = calibrate::fit(&bundle, &points, &output)?;
+                println!(
+                    "Saved {} · radii {:.4}–{:.4} mm at {} sectors · RMS {:.3} mm",
+                    output.display(),
+                    profile.inner_radius_mm,
+                    profile.outer_radius_mm,
+                    profile.reference_sectors,
+                    profile.rms_mm
+                );
+            }
+        },
         Commands::Burn {
             project,
             device: id,
@@ -133,7 +198,7 @@ fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 println!(
-                    "Disc finalized and verified. Measured session bundle: {}",
+                    "Two sessions finalized and data verified. Artwork appearance requires visual inspection. Measured session bundle: {}",
                     result.actual(&output).display()
                 );
             }
@@ -146,7 +211,7 @@ fn run(cli: Cli) -> Result<()> {
             device::install_cancel_handler()?;
             let result = burn::resume(&mut *recorder, &directory)?;
             println!(
-                "Disc finalized and verified. Measured session bundle: {}",
+                "Two sessions finalized and data verified. Artwork appearance requires visual inspection. Measured session bundle: {}",
                 result.actual(&directory).display()
             );
         }
@@ -196,7 +261,7 @@ fn run(cli: Cli) -> Result<()> {
             let manifest = author::verify(&directory)?;
             preview::readback(&directory, &manifest, &output, size, samples)?;
             println!(
-                "Saved {} — sampled payload readback, not an optical simulation.",
+                "Saved {} — payload projected with the authoring model. Verify the physical artwork by inspecting the disc.",
                 output.display()
             );
         }
@@ -210,7 +275,10 @@ fn run(cli: Cli) -> Result<()> {
                 for drive in devices {
                     println!("{} [{}]\n  id: {}", drive.name, drive.backend, drive.id);
                     if let Some(c) = drive.capabilities {
-                        println!("  CD-R: {} · SAO: {} · TAO: {}", c.cdr, c.sao, c.tao);
+                        println!(
+                            "  CD-R: {} · CD-RW: {} · SAO: {} · TAO: {}",
+                            c.cdr, c.cdrw, c.sao, c.tao
+                        );
                     }
                     if let Some(m) = drive.media {
                         println!(
@@ -261,7 +329,10 @@ fn run(cli: Cli) -> Result<()> {
                     plan.artwork_inner_radius_mm,
                     plan.artwork_outer_radius_mm
                 );
-                println!("Uncalibrated estimate. This command does not access the optical drive.");
+                println!(
+                    "{}. This command does not access the optical drive.",
+                    plan.geometry_label()
+                );
             }
         }
     }

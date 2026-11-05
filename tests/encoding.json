@@ -1,0 +1,30 @@
+{
+  "disc": {
+    "session2.iso": "b241d32d78c5c15dd307e0331edb0b35812c2bc40693b1dabf36d246b1e0f1d2",
+    "session2.bin": "d2bed3b6452550669036a099645caf3463d2017688d0db6b30b4da0a930109ff",
+    "design.png": "42c1d5176bd57c4e43c022a9e22a868ddcadd44791396636ba013b67e927ac59",
+    "readback.png": "50dda7dee1e3cdb20328a2d46c7d173ca251cd1999228f7b4579c3742a433c2d",
+    "difference.png": "cb8428e68834d4bc773946c22c1ac42f046218dc214030975f90342862648ad1"
+  },
+  "strip": {
+    "session2.iso": "68419611d74be68466001f7dba58bb9071344c20ddc66243b1f1cd97fe63aa77",
+    "session2.bin": "2a120ae48ac9e7150fd6911a9da7d7f02d40bcdb65aaf81f77bc9cde92e57ee4",
+    "design.png": "bdf459c81b646ac00a9a6be8c5295e8d30bf767ebfda84fdc67823792ee1ed66",
+    "readback.png": "eaacd166254e02adf8dbf6fff658f2a05158a2b4d5eebac947d2f54c35fbefbe",
+    "difference.png": "918ba4194e4d80f74f7b4a3800f610c72ad3e7513939b43471f48202a4307972"
+  },
+  "radial": {
+    "session2.iso": "a1dce45a56917c70cf2edf77c7f53cdb0e2d95335dd927e36db2bb36b4eb638d",
+    "session2.bin": "643926ab6e502026635503fa852ed1af288f11c3e01c13f496068b7f2c055a26",
+    "design.png": "ca90b2d2af7da23574e65a3bb379a27644c1a4c329a3885c59da6454b9fe190c",
+    "readback.png": "f56e50ddce0e09313736e5bac51b7a5930a078c80c198a415c9e31684bd69cd7",
+    "difference.png": "921f25954c1f92e50b0fc9fa5e630401fa56407084b5e462ff984bece625215f"
+  },
+  "phase": {
+    "session2.iso": "adf391660f40488f2ab081bc8258b078062744b763cddc414b56584d9b0a3859",
+    "session2.bin": "df6ea4f6278ec8204da61f53530e854ef35ef44e10bc6900b20ee31ad6a9afbe",
+    "design.png": "6a27d1b0643cef39ffaacb0dedc71cfc04c0364dc44f2ea4ffdb36f1e7225c5e",
+    "readback.png": "cf8302c5a230b929d16d868c2a2dbbfb165439744cd45fc50cfc2917da088bb5",
+    "difference.png": "267cb30fa0fe46edf5264897c0b5c8cbba7d5fbe10783774ce22a25086d2f650"
+  }
+}

@@ -18,6 +18,8 @@ pub fn install_cancel_handler() -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub cdr: bool,
+    #[serde(default)]
+    pub cdrw: bool,
     pub sao: bool,
     pub tao: bool,
 }
@@ -59,13 +61,20 @@ pub struct Music {
     pub gap: u32,
 }
 
-/// A backend must return after the framework has finished writing AND verification.
-/// `music` leaves the disc appendable; `data` closes/finalizes it. No fallback modes.
+/// `music` closes the audio session and leaves the disc appendable.
+/// `verify_music` confirms its content before `data` writes, verifies and finalizes.
 /// The recorder owns its media reservation until dropped.
 pub trait Recorder {
     fn inspect(&mut self) -> Result<Device>;
+    fn music_gap(&self, _drive: &Device, requested: u32) -> u32 {
+        requested
+    }
+    fn audio_sectors(&mut self, _path: &Path) -> Result<Option<u32>> {
+        Ok(None)
+    }
     fn lock(&mut self) -> Result<()>;
     fn music(&mut self, tracks: &[Music], speed: u32) -> Result<()>;
+    fn verify_music(&mut self, tracks: &[Music]) -> Result<()>;
     fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: u32) -> Result<()>;
     fn cancelled(&self) -> bool {
         cancelled()

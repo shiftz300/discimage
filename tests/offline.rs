@@ -513,3 +513,226 @@ fn strip_build_encodes_the_same_clockwise_mapping_and_keeps_its_aspect_ratio() {
     )
     .unwrap();
 }
+
+#[test]
+fn calibration_cli_binds_photo_points_to_the_written_target() {
+    let temp = Temp::new();
+    let cli = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_discimage"))
+            .current_dir(&temp.0)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    cli(&[
+        "calibrate",
+        "target",
+        "--output",
+        "target",
+        "--capacity-sectors",
+        "16500",
+    ]);
+    cli(&[
+        "build",
+        "target/target.toml",
+        "--output",
+        "written",
+        "--session-start",
+        "11775",
+    ]);
+    let directory = temp.0.join("written");
+    let target: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("target.json")).unwrap()).unwrap();
+    let bands: [[u32; 2]; 3] = serde_json::from_value(target["bands"].clone()).unwrap();
+    let manifest = author::verify(&directory).unwrap();
+    assert_eq!(manifest.session_start, 11775);
+    let codec = discimage::codec::Codec::default();
+    let mut data = std::fs::File::open(directory.join("session2.iso")).unwrap();
+    let [start, end] = bands[0];
+    for (lba, value) in [(start - 5, 0xaa), (start + 5, 0x0d), (end + 5, 0xaa)] {
+        data.seek(SeekFrom::Start(
+            u64::from(lba - manifest.session_start) * 2048,
+        ))
+        .unwrap();
+        let mut byte = [0];
+        data.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0] ^ codec.scramble[4], value);
+    }
+
+    // Synthetic front-on photo coordinates with known radii, different from the target defaults.
+    let (inner, outer) = (24.6_f64, 57.2_f64);
+    let circle = |radius: f64| {
+        let d = radius * 8.0;
+        [
+            [512.0, 512.0 - d],
+            [512.0 + d, 512.0],
+            [512.0, 512.0 + d],
+            [512.0 - d, 512.0],
+        ]
+    };
+    let edges = bands
+        .into_iter()
+        .flatten()
+        .map(|lba| {
+            let radius = (inner.powi(2)
+                + f64::from(lba) / 16_500.0 * (outer.powi(2) - inner.powi(2)))
+            .sqrt();
+            [512.0 + 8.0 * radius, 512.0]
+        })
+        .collect::<Vec<_>>();
+    let digest = author::digest(&directory.join("manifest.json")).unwrap();
+    let points = serde_json::json!({
+        "width": 1024, "height": 1024, "rim": circle(60.0), "hole": circle(7.5),
+        "edges": edges, "bundle_sha256": digest,
+    });
+    std::fs::write(
+        temp.0.join("points.json"),
+        serde_json::to_vec(&points).unwrap(),
+    )
+    .unwrap();
+    image::GrayImage::new(1024, 1024)
+        .save(temp.0.join("photo.png"))
+        .unwrap();
+    cli(&[
+        "calibrate",
+        "mark",
+        "written",
+        "photo.png",
+        "--output",
+        "points.html",
+    ]);
+    let page = std::fs::read_to_string(temp.0.join("points.html")).unwrap();
+    assert!(page.contains(&digest) && page.contains("data:image/png;base64,"));
+    cli(&[
+        "calibrate",
+        "fit",
+        "written",
+        "points.json",
+        "--output",
+        "profile.toml",
+    ]);
+    let profile = std::fs::read_to_string(temp.0.join("profile.toml")).unwrap();
+    let guided = [
+        "calibrate",
+        "guide",
+        "--output",
+        "guide",
+        "--bundle",
+        "written",
+    ];
+    cli(&[guided.as_slice(), &["--photo", "photo.png"]].concat());
+    let workspace = temp.0.join("guide");
+    assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 1);
+    assert!(!workspace.join("record").exists());
+    std::fs::copy(temp.0.join("points.json"), workspace.join("points.json")).unwrap();
+    cli(&guided);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("calibration.toml")).unwrap(),
+        profile
+    );
+    cli(&guided);
+    let mut mismatched = points.clone();
+    mismatched["bundle_sha256"] = "wrong target".into();
+    std::fs::write(
+        temp.0.join("other.json"),
+        serde_json::to_vec(&mismatched).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        discimage::calibrate::fit(
+            &directory,
+            &temp.0.join("other.json"),
+            &temp.0.join("bad.toml")
+        )
+        .is_err()
+    );
+    mismatched = points;
+    mismatched["rim"][0][1] = 55.0.into();
+    std::fs::write(
+        temp.0.join("other.json"),
+        serde_json::to_vec(&mismatched).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        discimage::calibrate::fit(
+            &directory,
+            &temp.0.join("other.json"),
+            &temp.0.join("bad.toml")
+        )
+        .is_err()
+    );
+
+    image::RgbaImage::from_fn(128, 32, |x, _| {
+        image::Rgba(if x < 64 { [0, 0, 0, 255] } else { [255; 4] })
+    })
+    .save(temp.0.join("art.png"))
+    .unwrap();
+    for mode in ["strip", "disc"] {
+        let config = temp.0.join("album.toml");
+        std::fs::write(&config, format!(
+            "title='EP'\ntracks=[{{path='target/silence.wav'}}]\n[disc]\ndata_reserve_sectors=300\n[artwork]\npath='art.png'\nmode='{mode}'\n{profile}"
+        )).unwrap();
+        let output = temp.0.join(mode);
+        let built = author::build(&config, &output, Some(11775)).unwrap();
+        let measured = built.plan.disc.calibration.as_ref().unwrap();
+        assert!((measured.inner_radius_mm - inner).abs() < 1e-9);
+        assert!((measured.outer_radius_mm - outer).abs() < 1e-9);
+        assert_eq!(built.plan.disc.capacity_sectors, 16500);
+        assert_eq!(built.plan.model, "constant-pitch-radial-fit-v1");
+        assert!(
+            std::fs::read_to_string(output.join("preview.svg"))
+                .unwrap()
+                .contains("Radially calibrated")
+        );
+        author::verify(&output).unwrap();
+    }
+}
+
+#[test]
+fn encoding_and_previews_match_the_pre_refactor_fixtures() {
+    // Captured from the working encoder before the 0.3.1 reorganization.
+    // This detects geometry/palette drift that self-consistent readback misses.
+    let expected: serde_json::Value = serde_json::from_str(include_str!("encoding.json")).unwrap();
+    let temp = Temp::new();
+    wav(&temp.0.join("audio.wav"), 300 * 588, 44100);
+    image::GrayImage::from_fn(16, 8, |x, y| image::Luma([((x * 37 + y * 19) % 256) as u8]))
+        .save(temp.0.join("source.png"))
+        .unwrap();
+    for (name, capacity, settings) in [
+        (
+            "disc",
+            14000,
+            "[artwork]\npath='source.png'\nmode='disc'\ntone='ordered'\nrotation=37.0\n",
+        ),
+        (
+            "strip",
+            14000,
+            "[artwork]\npath='source.png'\nmode='strip'\ntone='threshold'\nrotation=180.0\n",
+        ),
+        ("radial", 20000, "calibration_target=true\n"),
+        (
+            "phase",
+            14000,
+            "[disc.phase_target]\ncontrols=[[12000,12080],[13750,13830]]\nbands=[{start=12200,check=13000,end=13500,velocity=1183.177343317657}]\n",
+        ),
+    ] {
+        let project = temp.0.join(format!("{name}.toml"));
+        std::fs::write(&project, format!(
+            "title='Regression'\ntracks=[{{path='audio.wav'}}]\n[disc]\ncapacity_sectors={capacity}\ndata_reserve_sectors=300\n{settings}"
+        )).unwrap();
+        let output = temp.0.join(name);
+        author::build(&project, &output, None).unwrap();
+        for (file, hash) in expected[name].as_object().unwrap() {
+            assert_eq!(
+                author::digest(&output.join(file)).unwrap(),
+                hash.as_str().unwrap(),
+                "{name}/{file}"
+            );
+        }
+    }
+}

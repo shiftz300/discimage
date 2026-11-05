@@ -14,10 +14,11 @@ pub fn save(plan: &Plan, directory: &Path, size: u32) -> Result<()> {
     let circumference = std::f64::consts::TAU * (inner + outer) / 2.0;
     let thickness = outer - inner;
     // Match disc pixel density at the middle of the annulus, bounded by the input decoder.
-    let density = (f64::from(size) / (2.0 * plan.disc.outer_radius_mm)).min(8192.0 / circumference);
+    let density =
+        (f64::from(size) / (2.0 * plan.recording_outer_radius())).min(8192.0 / circumference);
     let width = (circumference * density).round().clamp(1.0, 8192.0) as u32;
     let height = (thickness * density).round().max(1.0) as u32;
-    let scale = f64::from(size) / (2.0 * plan.disc.outer_radius_mm);
+    let scale = f64::from(size) / (2.0 * plan.recording_outer_radius());
     let center = f64::from(size) / 2.0;
     let disc = RgbaImage::from_fn(size, size, |x, y| {
         let r = (f64::from(x) + 0.5 - center).hypot(f64::from(y) + 0.5 - center) / scale;
@@ -48,11 +49,11 @@ pub fn save(plan: &Plan, directory: &Path, size: u32) -> Result<()> {
     let metadata = serde_json::json!({
         "format":"discimage-template-v1",
         "plan":plan,
-        "disc":{"width":size,"height":size,"recording_radius_mm":plan.disc.outer_radius_mm},
+        "disc":{"width":size,"height":size,"recording_radius_mm":plan.recording_outer_radius()},
         "strip":{"width":width,"height":height,"middle_circumference_mm":circumference,
             "thickness_mm":thickness,"origin":"12 o'clock before artwork.rotation",
             "direction":"clockwise","top":"outer radius","bottom":"inner radius"},
-        "notes":["Uncalibrated geometry estimate. Regenerate when album layout changes.",
+        "notes":[plan.geometry_label(), "Regenerate when album layout changes.",
             "Paint the artwork layer; SVG guides are hidden by default and must remain hidden on export.",
             "Export SVG artwork as PNG at the declared canvas size; SVG is not an encoder input.",
             "Strip width and height are recommended pixel dimensions, rounded to whole pixels.",
@@ -69,8 +70,8 @@ pub fn save(plan: &Plan, directory: &Path, size: u32) -> Result<()> {
 fn disc_svg(plan: &Plan, size: u32) -> String {
     let title = preview::escape(&plan.title);
     let c = f64::from(size) / 2.0;
-    let inner = c * plan.artwork_inner_radius_mm / plan.disc.outer_radius_mm;
-    let outer = c * plan.artwork_outer_radius_mm / plan.disc.outer_radius_mm;
+    let inner = c * plan.artwork_inner_radius_mm / plan.recording_outer_radius();
+    let outer = c * plan.artwork_outer_radius_mm / plan.recording_outer_radius();
     let left = c - outer;
     let right = c + outer;
     let hole_left = c - inner;

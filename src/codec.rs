@@ -118,14 +118,7 @@ impl Codec {
 
 /// Absolute disc coordinates; byte origin is first music INDEX 01, not session 2.
 pub fn point(disc: &Disc, byte: i64) -> (f64, f64) {
-    let fraction = byte.max(0) as f64 / (f64::from(disc.capacity_sectors) * RAW as f64);
-    let span = disc.outer_radius_mm.powi(2) - disc.inner_radius_mm.powi(2);
-    let radius = (disc.inner_radius_mm.powi(2) + fraction * span).sqrt();
-    let theta = disc.angle.to_radians()
-        + 2.0 * disc.velocity * (f64::from(disc.capacity_sectors) / 75.0) / span
-            * (radius - disc.inner_radius_mm);
-    let (sin, cos) = theta.sin_cos();
-    (radius * cos, radius * sin)
+    crate::spiral::Spiral::new(disc).point(byte)
 }
 
 #[cfg(test)]

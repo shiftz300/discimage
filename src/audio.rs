@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -114,13 +114,47 @@ pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
     );
     let mut input = File::open(&track.path)?;
     input.seek(SeekFrom::Start(track.data_offset))?;
-    let mut output = std::io::BufWriter::new(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?,
-    );
+    let mut output =
+        std::io::BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path)?);
     let bytes = track.sectors * 2352;
+    header(&mut output, bytes)?;
+    let expected = u64::from(track.sample_frames) * 4;
+    ensure!(
+        std::io::copy(&mut input.take(expected), &mut output)? == expected,
+        "truncated audio source"
+    );
+    output.write_all(&vec![0; track.padding_sample_frames as usize * 4])?;
+    output.flush()?;
+    Ok(())
+}
+
+pub(crate) fn silence(path: &Path) -> Result<()> {
+    let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let bytes = 300 * 2352;
+    header(&mut output, bytes)?;
+    output.set_len(44 + u64::from(bytes))?;
+    Ok(())
+}
+
+pub(crate) fn extend_normalized(path: &Path, sectors: u32) -> Result<()> {
+    let track = inspect(path)?;
+    let mut wav = OpenOptions::new().write(true).open(path)?;
+    ensure!(
+        track.data_offset == 44
+            && track.padding_sample_frames == 0
+            && wav.metadata()?.len() == 44 + u64::from(track.sectors) * 2352
+            && sectors == track.sectors + 1,
+        "expected a normalized WAV and one additional sector"
+    );
+    let bytes = sectors
+        .checked_mul(2352)
+        .filter(|&size| size <= u32::MAX - 36)
+        .context("padded WAV exceeds the RIFF size limit")?;
+    wav.set_len(44 + u64::from(bytes))?;
+    header(&mut wav, bytes)
+}
+
+fn header(output: &mut impl Write, bytes: u32) -> Result<()> {
     output.write_all(b"RIFF")?;
     output.write_all(&(36 + bytes).to_le_bytes())?;
     output.write_all(b"WAVEfmt ")?;
@@ -135,12 +169,5 @@ pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
     }
     output.write_all(b"data")?;
     output.write_all(&bytes.to_le_bytes())?;
-    let expected = u64::from(track.sample_frames) * 4;
-    ensure!(
-        std::io::copy(&mut input.take(expected), &mut output)? == expected,
-        "truncated audio source"
-    );
-    output.write_all(&vec![0; track.padding_sample_frames as usize * 4])?;
-    output.flush()?;
     Ok(())
 }

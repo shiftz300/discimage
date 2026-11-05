@@ -96,6 +96,29 @@ impl Artwork {
     }
 }
 
+/// A measured radial fit, stored separately from the write extent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub reference_sectors: u32,
+    pub inner_radius_mm: f64,
+    pub outer_radius_mm: f64,
+    pub rms_mm: f64,
+}
+
+impl Profile {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=360_000).contains(&self.reference_sectors)
+                && (15.0..=35.0).contains(&self.inner_radius_mm)
+                && (self.inner_radius_mm + 4.0..=60.0).contains(&self.outer_radius_mm)
+                && (0.0..=0.30).contains(&self.rms_mm),
+            "invalid radial calibration profile"
+        );
+        Ok(())
+    }
+}
+
 /// Planning inputs, never a replacement for the drive's reported capacity/NWA.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -109,6 +132,11 @@ pub struct Disc {
     pub end_margin_sectors: u32,
     pub velocity: f64,
     pub angle: f64,
+    pub calibration_target: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_target: Option<crate::target::PhaseTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<Profile>,
 }
 
 impl Default for Disc {
@@ -123,6 +151,38 @@ impl Default for Disc {
             end_margin_sectors: 150,
             velocity: 1200.0,
             angle: 0.0,
+            calibration_target: false,
+            phase_target: None,
+            calibration: None,
+        }
+    }
+}
+
+impl Disc {
+    /// Restrict the write extent without changing the reference spiral.
+    pub(crate) fn limit_end(&mut self, end: u32) {
+        let capacity = self
+            .calibration
+            .as_ref()
+            .map_or(self.capacity_sectors, |p| {
+                self.capacity_sectors.min(p.reference_sectors)
+            });
+        self.end_margin_sectors = self.end_margin_sectors.max(capacity.saturating_sub(end));
+    }
+
+    /// The reference span is independent of the writable range of a particular job.
+    pub fn geometry(&self) -> (f64, f64, u32) {
+        match &self.calibration {
+            Some(profile) => (
+                profile.inner_radius_mm,
+                profile.outer_radius_mm,
+                profile.reference_sectors,
+            ),
+            None => (
+                self.inner_radius_mm,
+                self.outer_radius_mm,
+                self.capacity_sectors,
+            ),
         }
     }
 }

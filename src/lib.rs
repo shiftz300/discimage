@@ -2,6 +2,7 @@ pub mod art;
 pub mod audio;
 pub mod author;
 pub mod burn;
+pub mod calibrate;
 pub mod codec;
 pub mod device;
 pub mod iso;
@@ -10,6 +11,8 @@ pub mod layout;
 mod macos;
 pub mod preview;
 pub mod project;
+mod spiral;
+pub mod target;
 pub mod template;
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

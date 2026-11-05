@@ -4,13 +4,14 @@
 // 3a5cde635c182d6a7e01ff99c2cc1be2ac3ab668, Copyright (c) 2026 Disc Image Studio contributors.
 // Rust adaptation adds absolute session LBAs, allocated artwork extents and checksummed bundles.
 use crate::{
-    art::{self, Sampler},
+    art::{self, Drawing},
     audio,
-    codec::{self, COOKED, Codec, RAW},
+    codec::{COOKED, Codec, RAW},
     iso::{Entry, Volume},
     layout::Plan,
     preview,
     project::{Artwork, Project},
+    target::Target,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -51,8 +52,8 @@ pub(crate) fn build_project(
     session_start: Option<u32>,
 ) -> Result<Manifest> {
     let plan = Plan::from_project(&project, session_start)?;
-    let start = plan.music_sectors + plan.gap_sectors + plan.disc.session_reserve_sectors;
-    let sectors = plan.disc.capacity_sectors - plan.disc.end_margin_sectors - start;
+    let start = plan.session_start();
+    let sectors = plan.data_sectors();
     let volume = Volume::new(
         project.files.as_deref(),
         start,
@@ -74,13 +75,17 @@ pub(crate) fn build_project(
         source.save(output.join("source.png"))?;
         artwork.as_mut().unwrap().path = output.join("source.png");
     }
-    let sampler = artwork
-        .as_ref()
-        .map(|a| Sampler::new(a, &plan))
-        .transpose()?;
+    let drawing = Drawing::new(&plan, artwork.as_ref())?;
     let mut assets = music(&plan, output)?;
-    let files = data(&plan, &volume, sampler.as_ref(), output)?;
+    let files = data(&plan, &volume, &drawing, output)?;
     assets.extend(["session2.iso", "session2.bin", "session2.toc"].map(str::to_owned));
+    if plan.disc.calibration_target {
+        std::fs::write(
+            output.join("target.json"),
+            serde_json::to_vec_pretty(&Target::new(&plan))?,
+        )?;
+        assets.push("target.json".into());
+    }
     preview::save(&plan, artwork.as_ref(), &output.join("preview.svg"), 1024)?;
     preview::save(&plan, artwork.as_ref(), &output.join("design.png"), 1024)?;
     assets.extend(["preview.svg", "design.png"].map(str::to_owned));
@@ -154,12 +159,7 @@ fn music(plan: &Plan, output: &Path) -> Result<Vec<String>> {
     Ok(assets)
 }
 
-fn data(
-    plan: &Plan,
-    volume: &Volume,
-    sampler: Option<&Sampler>,
-    output: &Path,
-) -> Result<Vec<Entry>> {
+fn data(plan: &Plan, volume: &Volume, drawing: &Drawing<'_>, output: &Path) -> Result<Vec<Entry>> {
     let start = volume.base;
     let sectors = volume.sectors;
     let codec = Codec::default();
@@ -173,12 +173,7 @@ fn data(
         let mut sector = [0; COOKED];
         for (offset, byte) in sector.iter_mut().enumerate() {
             let physical = codec.physical(lba, offset);
-            let value = if let Some(sampler) = &sampler {
-                let (x, y) = codec::point(&plan.disc, physical);
-                sampler.palette(x, y, physical)
-            } else {
-                0xaa
-            };
+            let value = drawing.palette(physical);
             *byte = value ^ codec.scramble[offset + 4];
         }
         iso.write_all(&sector)?;
@@ -234,10 +229,15 @@ pub fn load(directory: &Path) -> Result<Manifest> {
         "unsupported bundle format"
     );
     let p = &manifest.plan;
+    ensure!(
+        !(p.disc.calibration_target || p.disc.phase_target.is_some()) || manifest.artwork.is_none(),
+        "a calibration target cannot also contain artwork"
+    );
     let expected = Plan::new(p.title.clone(), p.disc.clone(), p.tracks.clone())?;
     ensure!(
         p.model == expected.model
             && !p.burn_ready
+            && p.disc.capacity_sectors == expected.disc.capacity_sectors
             && p.music_sectors == expected.music_sectors
             && p.gap_sectors == expected.gap_sectors
             && p.estimated_art_start_sector == expected.estimated_art_start_sector
@@ -248,8 +248,7 @@ pub fn load(directory: &Path) -> Result<Manifest> {
         "manifest layout does not match its inputs"
     );
     ensure!(
-        manifest.session_start == p.music_sectors + p.gap_sectors + p.disc.session_reserve_sectors
-            && manifest.data_sectors == p.estimated_art_end_sector - manifest.session_start,
+        manifest.session_start == p.session_start() && manifest.data_sectors == p.data_sectors(),
         "inconsistent session layout"
     );
     ensure!(
@@ -270,7 +269,7 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
                     .all(|c| matches!(c, Component::Normal(_))),
             "invalid asset path"
         );
-        ensure!(seen.insert(&asset.path), "duplicate asset path");
+        ensure!(seen.insert(asset.path.as_str()), "duplicate asset path");
         let path = directory.join(&asset.path);
         ensure!(
             std::fs::symlink_metadata(&path)?.is_file(),
@@ -283,14 +282,15 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
         );
     }
     for required in ["session2.iso", "session2.bin", "session1.cue"] {
-        ensure!(
-            seen.contains(&required.to_owned()),
-            "missing required asset {required}"
-        );
+        ensure!(seen.contains(required), "missing required asset {required}");
     }
+    ensure!(
+        !manifest.plan.disc.calibration_target || seen.contains("target.json"),
+        "missing calibration target metadata"
+    );
     for (i, track) in manifest.plan.tracks.iter().enumerate() {
         let name = format!("audio/{:02}.wav", i + 1);
-        ensure!(seen.contains(&name), "missing audio asset {name}");
+        ensure!(seen.contains(name.as_str()), "missing audio asset {name}");
         let exported = audio::inspect(&directory.join(name))?;
         ensure!(
             exported.sample_frames == track.sectors * 588 && exported.sectors == track.sectors,

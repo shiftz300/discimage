@@ -1,9 +1,74 @@
 use crate::{
+    codec::{self, RAW},
     layout::Plan,
-    project::{Artwork, Fit, Mode, Tone},
+    project::{Artwork, Disc, Fit, Mode, Tone},
+    target::{PhaseTarget, Target},
 };
 use anyhow::{Context, Result, ensure};
 use image::{GrayImage, ImageFormat, ImageReader, Rgba, RgbaImage, imageops};
+
+/// Select the drawing once. Encoding and design previews use the same source;
+/// physical byte dithering and screen pixel dithering remain distinct.
+pub(crate) enum Drawing<'a> {
+    Blank,
+    Image(Sampler, &'a Disc),
+    Radial(Target),
+    Phase(&'a PhaseTarget, &'a Disc),
+}
+
+impl<'a> Drawing<'a> {
+    pub(crate) fn new(plan: &'a Plan, artwork: Option<&Artwork>) -> Result<Self> {
+        let disc = &plan.disc;
+        ensure!(
+            !(disc.calibration_target || disc.phase_target.is_some()) || artwork.is_none(),
+            "a calibration target cannot also contain artwork"
+        );
+        ensure!(
+            !disc.calibration_target || disc.phase_target.is_none(),
+            "choose one calibration target type"
+        );
+        Ok(if disc.calibration_target {
+            Self::Radial(Target::new(plan))
+        } else if let Some(target) = &disc.phase_target {
+            Self::Phase(target, disc)
+        } else if let Some(artwork) = artwork {
+            Self::Image(Sampler::new(artwork, plan)?, disc)
+        } else {
+            Self::Blank
+        })
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        !matches!(self, Self::Blank)
+    }
+
+    pub(crate) fn palette(&self, physical: i64) -> u8 {
+        match self {
+            Self::Blank => 0xaa,
+            Self::Image(source, disc) => {
+                let (x, y) = codec::point(disc, physical);
+                source.palette(x, y, physical)
+            }
+            Self::Radial(target) => target.palette(physical),
+            Self::Phase(target, disc) => target.palette(disc, physical as f64 / RAW as f64),
+        }
+    }
+
+    pub(crate) fn design(&self, x: f64, y: f64, sector: u32, pixel: (u32, u32)) -> Option<u8> {
+        Some(match self {
+            Self::Blank => return None,
+            Self::Image(source, _) => source.design(x, y, pixel.0, pixel.1),
+            Self::Radial(target) => {
+                if target.dark(sector) {
+                    0
+                } else {
+                    255
+                }
+            }
+            Self::Phase(target, disc) => target.preview(disc, x.hypot(y), y.atan2(x)),
+        })
+    }
+}
 
 /// A fixed source grid shared by every physical sample in an authoring job.
 pub struct Sampler {
@@ -26,7 +91,7 @@ impl Sampler {
         Ok(Self {
             image,
             settings: settings.clone(),
-            radius: plan.disc.outer_radius_mm,
+            radius: plan.recording_outer_radius(),
             inner: plan.artwork_inner_radius_mm,
             outer: plan.artwork_outer_radius_mm,
             rotation: settings.rotation.to_radians().sin_cos(),

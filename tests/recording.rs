@@ -56,6 +56,7 @@ fn wav(path: &Path, sectors: u32) {
 enum Fault {
     None,
     Music,
+    AudioReadback,
     MissingNwa,
     MovingNwa,
     Close,
@@ -65,6 +66,7 @@ struct Drive {
     status: Device,
     calls: Vec<&'static str>,
     fault: Fault,
+    adjust_audio: bool,
 }
 impl Drive {
     fn new(work: &Work, fault: Fault) -> Self {
@@ -72,12 +74,14 @@ impl Drive {
             job: work.job.clone(),
             calls: Vec::new(),
             fault,
+            adjust_audio: false,
             status: Device {
                 id: "fixture-drive".into(),
                 name: "Fixture".into(),
                 backend: "test".into(),
                 capabilities: Some(Capabilities {
                     cdr: true,
+                    cdrw: false,
                     sao: true,
                     tao: true,
                 }),
@@ -119,6 +123,14 @@ impl Recorder for Drive {
         self.media().reserved = true;
         Ok(())
     }
+    fn audio_sectors(&mut self, path: &Path) -> Result<Option<u32>> {
+        if self.adjust_audio {
+            let sectors = discimage::audio::inspect(path)?.sectors;
+            Ok(Some(if sectors == 310 { 311 } else { sectors }))
+        } else {
+            Ok(None)
+        }
+    }
     fn music(&mut self, tracks: &[Music], speed: u32) -> Result<()> {
         assert_eq!(Journal::load(&self.job)?.stage, Stage::MusicWriting);
         assert_eq!(
@@ -143,8 +155,9 @@ impl Recorder for Drive {
         } else {
             Some(12150)
         };
+        let kind = self.media().kind.clone();
         *self.media() = Media {
-            kind: "cd-r".into(),
+            kind,
             blank: false,
             appendable: true,
             reserved: true,
@@ -153,7 +166,19 @@ impl Recorder for Drive {
             sessions: 1,
             tracks: 2,
         };
-        self.status.tracks = vec![track(1, 1, 0, 300, true), track(2, 1, 375, 310, true)];
+        self.status.tracks = vec![track(1, 1, 0, 298, true), track(2, 1, 375, 308, true)];
+        Ok(())
+    }
+    fn verify_music(&mut self, tracks: &[Music]) -> Result<()> {
+        assert!(matches!(
+            Journal::load(&self.job)?.stage,
+            Stage::MusicWritten | Stage::DataReady
+        ));
+        assert_eq!(tracks.len(), 2);
+        self.calls.push("verify_music");
+        if self.fault == Fault::AudioReadback {
+            bail!("simulated PCM mismatch");
+        }
         Ok(())
     }
     fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: u32) -> Result<()> {
@@ -214,7 +239,11 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     assert!(drive.calls.is_empty());
     assert!(work.job.join("source/files/empty").is_dir());
     let planned = author::load(&work.job.join("planned")).unwrap();
-    assert_eq!(planned.plan.disc.capacity_sectors, 13500);
+    // The default 360000-sector spiral survives a smaller writable range.
+    assert_eq!(planned.plan.disc.capacity_sectors, 360000);
+    assert_eq!(planned.plan.estimated_art_end_sector, 13350);
+    let original = discimage::project::Project::load(&work.project).unwrap();
+    assert_eq!(planned.plan.disc.geometry(), original.disc.geometry());
     assert_eq!(planned.session_start, 12085);
     // Existing source files may change without changing the already-prepared job.
     std::fs::write(work.root.join("one.wav"), b"original later edited").unwrap();
@@ -229,11 +258,19 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     drop(lock);
     let complete = burn::resume(&mut drive, &work.job).unwrap();
     assert_eq!(complete.stage, Stage::Complete);
-    assert_eq!(drive.calls, ["lock", "music", "data"]);
+    assert_eq!(drive.calls, ["lock", "music", "verify_music", "data"]);
     let actual = author::verify(&complete.actual(&work.job)).unwrap();
     assert_eq!(actual.session_start, 12150);
     assert_eq!(actual.data_sectors, 1100);
-    assert_eq!(actual.plan.disc.end_margin_sectors, 250);
+    assert_eq!(actual.plan.estimated_art_end_sector, 13250);
+    assert_eq!(actual.plan.disc.geometry(), original.disc.geometry());
+    for lba in [0, 12085, 12385, 13249] {
+        let byte = i64::from(lba) * 2352;
+        assert_eq!(
+            discimage::codec::point(&original.disc, byte),
+            discimage::codec::point(&actual.plan.disc, byte)
+        );
+    }
     assert_ne!(
         planned
             .assets
@@ -253,6 +290,19 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
 }
 
 #[test]
+fn smaller_replacement_media_is_rejected_before_music() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    let planned = author::load(&work.job.join("planned")).unwrap();
+    drive.media().free_sectors = Some(planned.plan.estimated_art_end_sector - 1);
+    let error = burn::resume(&mut drive, &work.job).unwrap_err();
+    assert!(format!("{error:#}").contains("blank CD is smaller"));
+    assert_eq!(drive.writes(), 0);
+    assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::Prepared);
+}
+
+#[test]
 fn missing_nwa_stops_after_music_and_resume_does_not_rewrite_music() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::MissingNwa);
@@ -263,7 +313,51 @@ fn missing_nwa_stops_after_music_and_resume_does_not_rewrite_music() {
     drive.media().nwa = Some(12150);
     let complete = burn::resume(&mut drive, &work.job).unwrap();
     assert_eq!(complete.stage, Stage::Complete);
-    assert_eq!(drive.calls, ["lock", "music", "lock", "data"]);
+    assert_eq!(
+        drive.calls,
+        ["lock", "music", "lock", "verify_music", "data"]
+    );
+}
+
+#[test]
+fn pcm_mismatch_blocks_data_and_resume_rechecks_without_writing_music_again() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::AudioReadback);
+    let error = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap_err();
+    assert!(format!("{error:#}").contains("simulated PCM mismatch"));
+    assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::MusicWritten);
+    assert_eq!(drive.calls, ["lock", "music", "verify_music"]);
+    drive.fault = Fault::None;
+    let complete = burn::resume(&mut drive, &work.job).unwrap();
+    assert_eq!(complete.stage, Stage::Complete);
+    assert_eq!(
+        drive.calls,
+        [
+            "lock",
+            "music",
+            "verify_music",
+            "lock",
+            "verify_music",
+            "data"
+        ]
+    );
+}
+
+#[test]
+fn preparation_stabilizes_decoder_length_before_any_write() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    drive.adjust_audio = true;
+    let prepared = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    assert_eq!(prepared.stage, Stage::Prepared);
+    assert!(drive.calls.is_empty());
+    let original = std::fs::read(work.root.join("two.wav")).unwrap();
+    let frozen = std::fs::read(work.job.join("source/audio/02.wav")).unwrap();
+    assert_eq!(original.len() + 2352, frozen.len());
+    assert_eq!(original[44..], frozen[44..original.len()]);
+    assert_eq!(frozen[original.len()..], [0; 2352]);
+    let planned = author::verify(&work.job.join("planned")).unwrap();
+    assert_eq!(planned.plan.music_sectors, 611);
 }
 
 #[test]
@@ -320,4 +414,33 @@ fn rejects_unsafe_media_and_modified_snapshot_before_writing() {
     std::fs::write(work.job.join("source/files/note.txt"), "changed").unwrap();
     assert!(burn::resume(&mut drive, &work.job).is_err());
     assert!(drive.calls.is_empty());
+}
+
+#[test]
+fn blank_cdrw_uses_the_same_measured_nwa_and_frozen_calibration() {
+    let work = Work::new();
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&work.project)
+        .unwrap();
+    writeln!(config, "[disc.calibration]\nreference_sectors=14000\ninner_radius_mm=24.6\nouter_radius_mm=57.2\nrms_mm=0.1").unwrap();
+    let mut drive = Drive::new(&work, Fault::None);
+    let capabilities = drive.status.capabilities.as_mut().unwrap();
+    capabilities.cdr = false;
+    capabilities.cdrw = true;
+    drive.media().kind = "cd-rw".into();
+    drive.media().blank = false;
+    assert!(burn::start(&mut drive, &work.project, &work.job, 8, false).is_err());
+    assert!(!work.job.exists() && drive.calls.is_empty());
+    drive.media().blank = true;
+
+    let complete = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap();
+    assert_eq!(complete.stage, Stage::Complete);
+    assert_eq!(complete.observed.media.unwrap().kind, "cd-rw");
+    assert_eq!(drive.calls, ["lock", "music", "verify_music", "data"]);
+    let planned = author::load(&work.job.join("planned")).unwrap();
+    let actual = author::load(&work.job.join("actual-1")).unwrap();
+    assert_eq!(actual.session_start, 12150);
+    assert_eq!(actual.plan.disc.geometry(), (24.6, 57.2, 14000));
+    assert_eq!(planned.plan.disc.geometry(), actual.plan.disc.geometry());
 }

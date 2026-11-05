@@ -97,8 +97,22 @@ pub fn start(
     let observed = backend.inspect()?;
     let available = blank(&observed, false)?;
     let mut project = Project::load(project)?;
-    project.disc.capacity_sectors = project.disc.capacity_sectors.min(available);
+    project
+        .disc
+        .limit_end(available.saturating_sub(project.disc.end_margin_sectors));
+    if project.tracks.len() > 1 {
+        let requested = project.disc.intertrack_gap_sectors;
+        let gap = backend.music_gap(&observed, requested);
+        if gap != requested {
+            eprintln!(
+                "Adjusting gaps between music tracks from {requested} to {gap} sectors for {}",
+                observed.name
+            );
+            project.disc.intertrack_gap_sectors = gap;
+        }
+    }
     let plan = Plan::from_project(&project, None)?;
+    project.disc.capacity_sectors = plan.disc.capacity_sectors;
     let volume = volume(&project, &plan)?;
     let source = project.artwork.as_ref().map(art::load).transpose()?;
     check_cancel(backend)?;
@@ -126,8 +140,11 @@ pub fn start(
         std::fs::create_dir(snapshot.join("audio"))?;
         project.tracks.clear();
         for (i, track) in plan.tracks.iter().enumerate() {
+            check_cancel(backend)?;
             let path = PathBuf::from(format!("audio/{:02}.wav", i + 1));
-            audio::export(track, &snapshot.join(&path))?;
+            let frozen = snapshot.join(&path);
+            audio::export(track, &frozen)?;
+            normalize_length(backend, &frozen, track.sectors)?;
             project.tracks.push(Input { path });
         }
         if project.files.is_some() {
@@ -154,6 +171,31 @@ pub fn start(
         Ok(())
     })();
     finish(&directory, journal, result)
+}
+
+fn normalize_length(backend: &mut dyn Recorder, path: &Path, mut sectors: u32) -> Result<()> {
+    // Some decoders round an exact CD frame boundary up by one sector.
+    let original = sectors;
+    while let Some(reported) = backend.audio_sectors(path)? {
+        if reported == sectors {
+            break;
+        }
+        ensure!(
+            reported == sectors + 1 && sectors - original < 4,
+            "{}: system decoder reports {reported} sectors for a {sectors}-sector WAV",
+            path.display()
+        );
+        audio::extend_normalized(path, reported)?;
+        sectors = reported;
+    }
+    if sectors != original {
+        eprintln!(
+            "{}: added {} silent tail sector(s) to match the system decoder",
+            path.display(),
+            sectors - original
+        );
+    }
+    Ok(())
 }
 
 pub fn resume(backend: &mut dyn Recorder, directory: &Path) -> Result<Journal> {
@@ -211,40 +253,46 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     let planned = directory.join("planned");
     let manifest = checked_bundle(&planned, journal.planned_sha256.as_deref())?;
     let observed = backend.inspect()?;
-    ensure!(
-        observed.id == journal.device,
-        "recording job belongs to a different drive"
-    );
-    capabilities(&observed)?;
+    check_device(&observed, journal)?;
     check_cancel(backend)?;
     backend.lock()?;
     let observed = backend.inspect()?;
     check_device(&observed, journal)?;
     journal.observed = observed;
+    let gap = manifest.plan.disc.intertrack_gap_sectors;
+    let tracks = manifest
+        .plan
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Music {
+            path: planned.join(format!("audio/{:02}.wav", i + 1)),
+            sectors: t.sectors,
+            gap: if i == 0 { 150 } else { gap },
+        })
+        .collect::<Vec<_>>();
     if journal.stage == Stage::Prepared {
         let available = blank(&journal.observed, true)?;
         ensure!(
-            available >= manifest.plan.disc.capacity_sectors,
-            "blank CD-R is smaller than the prepared plan; create a new job"
+            available >= manifest.plan.estimated_art_end_sector,
+            "blank CD is smaller than the prepared plan; create a new job"
         );
-        let tracks = manifest
-            .plan
-            .tracks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| Music {
-                path: planned.join(format!("audio/{:02}.wav", i + 1)),
-                sectors: t.sectors,
-                gap: if i == 0 {
-                    150
-                } else {
-                    manifest.plan.disc.intertrack_gap_sectors
-                },
-            })
-            .collect::<Vec<_>>();
+        ensure!(
+            tracks.len() == 1 || backend.music_gap(&journal.observed, gap) == gap,
+            "prepared track gaps are incompatible with this drive; create a new job"
+        );
+        for track in &tracks {
+            ensure!(
+                backend
+                    .audio_sectors(&track.path)?
+                    .is_none_or(|reported| reported == track.sectors),
+                "{}: system decoder changed the prepared track length; create a new job",
+                track.path.display()
+            );
+        }
         check_cancel(backend)?;
         journal.advance(directory, Stage::MusicWriting)?;
-        eprintln!("Writing music session in SAO mode; leaving the CD-R appendable…");
+        eprintln!("Writing music session in SAO mode; leaving the CD appendable…");
         backend.music(&tracks, journal.speed)?;
         journal.advance(directory, Stage::MusicWritten)?;
     }
@@ -254,6 +302,9 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     let (nwa, free) = next(&observed, &manifest.plan)?;
     journal.observed = observed;
     eprintln!("Drive reports next writable LBA {nwa}, {free} free sectors");
+    backend
+        .verify_music(&tracks)
+        .context("music readback failed before data append")?;
     let cached = if journal.stage == Stage::DataReady && journal.nwa == Some(nwa) {
         Some(checked_bundle(
             &journal.actual(directory),
@@ -269,8 +320,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         let end = nwa
             .checked_add(free)
             .context("drive reported an invalid writable range")?;
-        let media_margin = project.disc.capacity_sectors.saturating_sub(end);
-        project.disc.end_margin_sectors = project.disc.end_margin_sectors.max(media_margin);
+        project.disc.limit_end(end);
         journal.attempt = journal
             .attempt
             .checked_add(1)
@@ -303,7 +353,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     );
     ensure!(
         remaining >= actual.data_sectors,
-        "remaining CD-R space is smaller than the reauthored data track"
+        "remaining CD space is smaller than the reauthored data track"
     );
     journal.observed = observed;
     journal.advance(directory, Stage::DataWriting)?;
@@ -327,11 +377,10 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
 }
 
 fn volume(project: &Project, plan: &Plan) -> Result<Volume> {
-    let start = plan.estimated_art_start_sector - plan.disc.data_reserve_sectors;
     Volume::new(
         project.files.as_deref(),
-        start,
-        plan.estimated_art_end_sector - start,
+        plan.session_start(),
+        plan.data_sectors(),
         plan.disc.data_reserve_sectors,
         &plan.title,
     )
@@ -359,39 +408,44 @@ fn check_cancel(backend: &dyn Recorder) -> Result<()> {
 }
 fn check_device(device: &Device, journal: &Journal) -> Result<()> {
     ensure!(device.id == journal.device, "recording drive changed");
-    capabilities(device)
-}
-fn capabilities(device: &Device) -> Result<()> {
-    ensure!(!device.id.is_empty(), "drive has no stable identifier");
+    let media = writable_cd(device)?;
     ensure!(
-        device
-            .capabilities
+        journal
+            .observed
+            .media
             .as_ref()
-            .is_some_and(|c| c.cdr && c.sao && c.tao),
-        "drive must support CD-R, audio SAO and data TAO"
+            .is_some_and(|m| m.kind == media.kind),
+        "CD media type changed during the recording job"
     );
     Ok(())
 }
-fn cdr(device: &Device) -> Result<&Media> {
+fn writable_cd(device: &Device) -> Result<&Media> {
+    ensure!(!device.id.is_empty(), "drive has no stable identifier");
     let media = device
         .media
         .as_ref()
-        .context("insert a CD-R; no ready media was reported")?;
+        .context("insert a CD-R or CD-RW; no ready media was reported")?;
     ensure!(
-        media.kind == "cd-r",
-        "only CD-R media is supported, found {}",
+        matches!(media.kind.as_str(), "cd-r" | "cd-rw"),
+        "only CD-R and CD-RW media are supported, found {}",
+        media.kind
+    );
+    ensure!(
+        device.capabilities.as_ref().is_some_and(|c| {
+            c.sao && c.tao && if media.kind == "cd-rw" { c.cdrw } else { c.cdr }
+        }),
+        "drive must support writing {}, audio SAO and data TAO",
         media.kind
     );
     Ok(media)
 }
 fn blank(device: &Device, reserved: bool) -> Result<u32> {
-    capabilities(device)?;
-    let media = cdr(device)?;
+    let media = writable_cd(device)?;
     ensure!(
         media.blank && !device.tracks.iter().any(|t| !t.empty),
-        "music recording requires a blank CD-R"
+        "music recording requires a blank CD-R or CD-RW"
     );
-    ensure!(!reserved || media.reserved, "CD-R reservation was lost");
+    ensure!(!reserved || media.reserved, "CD reservation was lost");
     media
         .free_sectors
         .filter(|&v| v > 0)
@@ -413,12 +467,15 @@ fn music_layout(tracks: &[&Track], plan: &Plan) -> Result<()> {
     );
     let mut start = 0u32;
     for (i, (recorded, expected)) in tracks.iter().zip(&plan.tracks).enumerate() {
+        // The SuperDrive's MMC track size excludes two readable trailing sectors.
         ensure!(
             recorded.number == i as u32 + 1
                 && recorded.session == 1
                 && recorded.audio
                 && recorded.start == Some(i64::from(start))
-                && recorded.sectors.is_none_or(|s| s >= expected.sectors),
+                && recorded
+                    .sectors
+                    .is_none_or(|s| s.saturating_add(2) >= expected.sectors),
             "recorded music layout does not match track {}",
             i + 1
         );
@@ -430,10 +487,10 @@ fn music_layout(tracks: &[&Track], plan: &Plan) -> Result<()> {
     Ok(())
 }
 fn next(device: &Device, plan: &Plan) -> Result<(u32, u32)> {
-    let media = cdr(device)?;
+    let media = writable_cd(device)?;
     ensure!(
         !media.blank && media.appendable && media.reserved,
-        "music must be on a reserved, appendable CD-R"
+        "music must be on a reserved, appendable CD"
     );
     ensure!(
         (1..=2).contains(&media.sessions),
@@ -463,7 +520,7 @@ fn next(device: &Device, plan: &Plan) -> Result<(u32, u32)> {
     Ok((nwa, free))
 }
 fn closed(device: &Device, plan: &Plan, nwa: u32, sectors: u32) -> Result<()> {
-    let media = cdr(device)?;
+    let media = writable_cd(device)?;
     ensure!(
         !media.blank && !media.appendable && media.sessions == 2,
         "drive did not report a finalized two-session disc"

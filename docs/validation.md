@@ -1,25 +1,105 @@
-# Validation — 2026-11-05
+# Validation — 2026-11-06
 
-Validation was performed locally on macOS. Remote three-OS CI, physical burning,
-consumer CD players, Blue Book conformance and photographed artwork were not tested.
+Validation was performed locally on macOS. Consumer CD players and full
+Blue Book conformance remain unverified. CI covers three operating systems;
+physical recording results below apply only to the tested combinations.
 
-## 0.4.0 recording workflow
+## 0.3.1 core review
 
-The actual macOS DiscRecording bridge was compiled and linked with warnings
-denied. Its hardware-free test constructs a system audio track from a 300-sector
-PCM WAV and reads two distinct ISO blocks through the native producer using a
-nonzero relative address. Device discovery was run on this Mac and returned no
-attached optical drive.
+Rendering now shares one drawing-source selector and one spiral geometry
+model. Pure target patterns are separate from photo/file workflows. Preparation
+limits writable extents without changing the configured reference geometry;
+mock recording verifies that the same absolute LBA retains its position after
+capacity restriction and NWA rebuild.
+
+Four fixtures captured before the refactor pin ISO, RAW, design, payload
+readback and difference hashes (20 assets). The fixtures cover disc artwork,
+strip artwork, radial bands and angular pulses. All match byte-for-byte after
+reorganization. This checks preserved software behavior, not optical accuracy.
+
+Local release checks passed: rustfmt, Clippy with warnings denied, 34 tests
+(including the new smaller-media rejection), and an optimized 0.3.1 build.
+The new binary also verified the previously burned album bundle: 15 assets,
+one ISO file extent and all 239177 Mode 1 sectors. No new physical write was
+performed for this code review.
+
+## Accepted SW80EU1 album
+
+On 2026-11-05, an LG GX40N (RQ00) wrote a Verbatim SW80EU1 CD-RW at requested
+10×, following a full erase. Independent physical readback matched all 108370
+audio sectors across six tracks and all 239177 Mode 1 data sectors. The data
+track started at measured NWA 120520; the final disc had two closed sessions
+and seven tracks, with no unreadable or mismatching data LBAs.
+
+Data ISO and physical-read SHA-256:
+
+```text
+eb9c4169b9068eff9c75e9335bf931e260e5403d9b3ad123c1efa39ec69dcf12
+```
+
+The user confirmed legible lettering. A photo-based estimate at one visible
+inner/outer reference pair found about 0.55° residual drift after angular
+correction, compared with roughly 14° before it. This does not establish
+uniform accuracy over the disc. All 38 data-write progress samples that
+reported speed showed 10.1×; discrete samples cannot exclude transients.
+The matched geometry is saved in [examples/sw80eu1.toml](../examples/sw80eu1.toml).
+The 0.3.1 reorganization is verified offline and with mocks, without another
+physical erase or burn.
+
+## CD radial calibration and CD-RW
+
+An offline CLI fixture authors a calibration target at a supplied NWA, checks
+its on/off payload and fits known radii from synthetic photo coordinates. It
+checks malformed rim geometry and a mismatched bundle, then authors verified
+bundles in both strip and disc mode using the fitted profile. The recording
+fixture checks that a used CD-RW is rejected, and a blank CD-RW with SAO and TAO
+reaches two-session completion while retaining the frozen profile through the
+measured-NWA rebuild.
+
+On a Pioneer BDR-XD05 (firmware 3.11) with CD-RW, DiscRecording verified the
+first session, and both DiscRecording and MMC track information reported LBA
+11850 for the next writable sector. The initial data producer failed. With
+DiscRecording's ISO image loader, the second attempt entered track writing but
+the CLI stayed at 0% with a pending device write until cancellation. After
+cancellation the closed Mode 1 track contained 10432 of the planned 347847
+sectors. The first marked band started beyond the written extent.
+
+An Apple SuperDrive (firmware 2.00) finalized a complete CD-RW target with
+two sessions at NWA 11850. All 347847 Mode 1 data sectors matched the authored
+ISO on raw readback. The photo fit remains unverified.
+
+## CD-RW angular artwork
+
+An LG GX40N (firmware RQ00) finalized a three-band CD-RW target. All six
+audio tracks matched their WAV files, and all 118630 Mode 1 data sectors
+matched the authored ISO. The observer saw only arcs across all three bands.
+The bands sampled different radii with local prewarps of −120, 0 and +120
+degrees per millimeter. This run produced no usable angular calibration.
+
+## Recording workflow
+
+The macOS DiscRecording bridge was compiled and linked with warnings denied.
+Its hardware-free test constructs a system audio track from a 10732-sector PCM
+WAV, opens an ISO with DiscRecording's image loader, and exercises the track
+metadata shape observed on the Pioneer BDR-XD05.
+
+On the Apple SuperDrive, DiscRecording reported an audio checksum error
+at the second track of a six-track album. Independent raw readback matched
+all six normalized WAVs byte-for-byte. The data session was appended at LBA
+120520, finalized, and all 239177 Mode 1 data sectors matched the authored
+ISO. The revised workflow makes independent PCM readback a condition of
+the data append and moves decoder length checks ahead of writing.
 
 Mock-backend tests run the real offline authoring/verification pipeline around
 both write calls. They cover a no-write dry run, immutable snapshots and empty
 directories, job locking, an observed NWA different from the planned address,
 reduced remaining space, NWA disappearance/change, resuming without replaying
 music, write interruption, final data address mismatch and rejection of modified
-snapshots/unsupported media. The job journal is checked at the moment each
+snapshots/unsupported media. They also check decoder rounding and resume after a
+PCM mismatch. The job journal is checked at the moment each
 backend write is called. These tests do not exercise a laser or certify a drive.
 
-## 0.3.0 template and strip extension
+## Templates and strip mapping
 
 The suite additionally checks actual WAV length changes updating template
 radii, an optional supplied session start, transparent protected regions,

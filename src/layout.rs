@@ -26,6 +26,11 @@ impl Plan {
     /// One preparation path for templates, previews and authored sessions.
     pub fn from_project(project: &Project, session_start: Option<u32>) -> Result<Self> {
         ensure!(
+            !(project.disc.calibration_target || project.disc.phase_target.is_some())
+                || project.artwork.is_none(),
+            "a calibration target cannot also contain artwork"
+        );
+        ensure!(
             (1..=98).contains(&project.tracks.len()),
             "expected 1–98 music tracks"
         );
@@ -47,7 +52,7 @@ impl Plan {
         Self::new(project.title.clone(), disc, tracks)
     }
 
-    pub fn new(title: String, disc: Disc, tracks: Vec<AudioTrack>) -> Result<Self> {
+    pub fn new(title: String, mut disc: Disc, tracks: Vec<AudioTrack>) -> Result<Self> {
         ensure!(
             (1..=98).contains(&tracks.len()),
             "expected 1–98 music tracks"
@@ -56,6 +61,10 @@ impl Plan {
             disc.capacity_sectors > 0 && disc.capacity_sectors <= 360_000,
             "capacity must be 1–360000 sectors; overburn is not supported"
         );
+        if let Some(profile) = &disc.calibration {
+            profile.validate()?;
+            disc.capacity_sectors = disc.capacity_sectors.min(profile.reference_sectors);
+        }
         ensure!(
             tracks.iter().all(|t| t.sectors >= 300
                 && t.sectors <= disc.capacity_sectors
@@ -100,11 +109,27 @@ impl Plan {
             capacity
         );
         let end = capacity - tail;
+        if let Some(target) = &disc.phase_target {
+            ensure!(
+                !disc.calibration_target,
+                "choose one calibration target type"
+            );
+            target.validate(start as u32..end as u32)?;
+        }
         let inner = radius_at_sector(&disc, start as u32);
         let outer = radius_at_sector(&disc, end as u32);
+        ensure!(
+            !disc.calibration_target || outer - inner >= 4.0,
+            "the calibration target needs at least 4 mm of radial drawing space"
+        );
+        let model = if disc.calibration.is_some() {
+            "constant-pitch-radial-fit-v1"
+        } else {
+            "constant-pitch-area-estimate-v1"
+        };
         Ok(Self {
             title,
-            model: "constant-pitch-area-estimate-v1".into(),
+            model: model.into(),
             burn_ready: false,
             disc,
             tracks,
@@ -117,15 +142,31 @@ impl Plan {
             artwork_outer_radius_mm: outer,
         })
     }
+
+    pub fn recording_outer_radius(&self) -> f64 {
+        radius_at_sector(&self.disc, self.disc.capacity_sectors)
+    }
+
+    pub fn session_start(&self) -> u32 {
+        self.estimated_art_start_sector - self.disc.data_reserve_sectors
+    }
+
+    pub fn data_sectors(&self) -> u32 {
+        self.estimated_art_end_sector - self.session_start()
+    }
+
+    pub fn geometry_label(&self) -> &'static str {
+        if self.disc.calibration.is_some() {
+            "Radially calibrated · constant-pitch model"
+        } else {
+            "Uncalibrated geometry estimate"
+        }
+    }
 }
 
 /// A constant-pitch spiral sweeps area approximately linearly with sector count.
-/// This is an annulus budget, not a calibrated physical byte/angle mapping.
 pub fn radius_at_sector(disc: &Disc, sector: u32) -> f64 {
-    let fraction = f64::from(sector.min(disc.capacity_sectors)) / f64::from(disc.capacity_sectors);
-    (disc.inner_radius_mm.powi(2)
-        + fraction * (disc.outer_radius_mm.powi(2) - disc.inner_radius_mm.powi(2)))
-    .sqrt()
+    crate::spiral::Spiral::new(disc).radius(f64::from(sector.min(disc.capacity_sectors)))
 }
 
 #[cfg(test)]

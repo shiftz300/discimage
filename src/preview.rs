@@ -5,9 +5,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 
 use crate::{
-    art::Sampler,
+    art::Drawing,
     layout::{Plan, radius_at_sector},
     project::Artwork,
+    spiral::Spiral,
 };
 
 /// Read the authored ISO bytes, undo the per-sector scrambler, then project
@@ -67,6 +68,8 @@ pub fn readback(
         }
     }
     let mut image = render(plan, None, size)?;
+    let inner = radius_at_sector(&plan.disc, 0);
+    let outer = plan.recording_outer_radius();
     for (x, y, pixel) in image.enumerate_pixels_mut() {
         let radius = (f64::from(x) + 0.5 - f64::from(size) / 2.0)
             .hypot(f64::from(y) + 0.5 - f64::from(size) / 2.0)
@@ -79,7 +82,7 @@ pub fn readback(
             } else {
                 *pixel = Rgba([0, 0, 0, 0]);
             }
-        } else if radius >= plan.disc.inner_radius_mm && radius < plan.disc.outer_radius_mm {
+        } else if radius >= inner && radius < outer {
             *pixel = Rgba([49, 57, 69, 255]);
         }
     }
@@ -203,12 +206,14 @@ pub fn render(plan: &Plan, artwork: Option<&Artwork>, size: u32) -> Result<RgbaI
         (256..=4096).contains(&size),
         "preview size must be 256–4096 pixels"
     );
-    let source = artwork.map(|art| Sampler::new(art, plan)).transpose()?;
+    let drawing = Drawing::new(plan, artwork)?;
     let mut output = RgbaImage::new(size, size);
     let bands = bands(plan);
     let half = f64::from(size) / 2.0;
     let scale = 63.0 / half;
-    let span = plan.disc.outer_radius_mm.powi(2) - plan.disc.inner_radius_mm.powi(2);
+    let inner = radius_at_sector(&plan.disc, 0);
+    let outer = plan.recording_outer_radius();
+    let spiral = Spiral::new(&plan.disc);
     for (x, y, pixel) in output.enumerate_pixels_mut() {
         let dx = f64::from(x) + 0.5 - half;
         let dy = f64::from(y) + 0.5 - half;
@@ -216,20 +221,18 @@ pub fn render(plan: &Plan, artwork: Option<&Artwork>, size: u32) -> Result<RgbaI
         if !(7.5..=60.0).contains(&radius) {
             continue;
         }
-        let color = if radius < plan.disc.inner_radius_mm || radius >= plan.disc.outer_radius_mm {
+        let color = if radius < inner || radius >= outer {
             [63, 71, 84, 255]
         } else {
-            let sector = ((radius.powi(2) - plan.disc.inner_radius_mm.powi(2)) / span
-                * f64::from(plan.disc.capacity_sectors)) as u32;
+            let sector = (spiral.sector(radius) as u32).min(plan.disc.capacity_sectors - 1);
             let band = &bands[bands.partition_point(|b| b.end <= sector)];
             if band.color == ART {
-                if let Some(source) = &source {
-                    let value = source.design(dx * scale, dy * scale, x, y);
+                if let Some(value) = drawing.design(dx * scale, dy * scale, sector, (x, y)) {
                     [value, value, value, 255]
                 } else {
                     ART
                 }
-            } else if source.is_some() {
+            } else if drawing.active() {
                 [49, 57, 69, 255]
             } else {
                 band.color
@@ -268,7 +271,12 @@ fn report(plan: &Plan, artwork: Option<&Artwork>, png: &[u8]) -> String {
         legend.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"12\" height=\"12\" fill=\"#{:02x}{:02x}{:02x}\"/><text x=\"{}\" y=\"{}\">{label}</text>",
             color[0], color[1], color[2], x + 22, y + 11));
     }
-    let settings = if let Some(a) = artwork {
+    let geometry = plan.geometry_label();
+    let settings = if plan.disc.calibration_target {
+        "Calibration target · three bands with six measurable edges".into()
+    } else if plan.disc.phase_target.is_some() {
+        "Phase target · contrast rings, pulse trains and reserved phase steps".into()
+    } else if let Some(a) = artwork {
         format!(
             "Mode: {:?} · tone: {:?} · fit (disc): {:?} · rotation: {:.1}° · gamma: {:.2} · brightness: {} · threshold: {} · invert: {}",
             a.mode, a.tone, a.fit, a.rotation, a.gamma, a.brightness, a.threshold, a.invert
@@ -282,7 +290,7 @@ fn report(plan: &Plan, artwork: Option<&Artwork>, png: &[u8]) -> String {
 <rect width="960" height="670" rx="16" fill="#11151c"/>
 <g fill="#edf2fa" font-family="sans-serif">
 <text x="32" y="42" font-size="24">{title}</text>
-<text x="32" y="70" font-size="13" fill="#9baabd">Geometry estimate · not calibrated · not a burn image or optical simulation</text>
+<text x="32" y="70" font-size="13" fill="#9baabd">{geometry} · no optical simulation</text>
 <text x="48" y="109" font-size="16">Sector layout</text>
 <text x="520" y="109" font-size="16">Artwork composition</text>
 <g transform="translate(248 300) scale(2.9)"><circle r="60" fill="#3f4754"/>{rings}<circle r="7.5" fill="#11151c"/></g>

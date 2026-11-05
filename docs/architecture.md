@@ -1,142 +1,101 @@
 # Architecture
 
-One crate contains a platform-independent offline pipeline and a thin CLI.
-Authoring remains free of device calls; recording is a separate workflow.
-Keep one-word filenames, direct domain functions and a small number of modules.
+One crate, with platform-independent authoring and a separate recording workflow.
+The native boundary is `device::Recorder`. Additional crates are unnecessary
+until another backend introduces substantial native dependencies.
+
+| Module | Owns |
+| --- | --- |
+| `project` | Strict TOML settings, radial profiles and relative paths |
+| `audio` | RIFF validation, sector alignment and unchanged PCM export |
+| `layout` | Track budgets, session extents and available artwork radii |
+| `spiral` | Shared sector/radius/angle mapping, independent of writable limits |
+| `target` | Pure radial bands and angular pulse patterns |
+| `art` | Disc/strip image sampling, tone and selection of the drawing source |
+| `codec` | Inverse CIRC positions, scrambler and Mode 1 EDC/ECC framing |
+| `iso` | ISO9660/Joliet allocation, absolute extents and file snapshots |
+| `author` | Bundle construction, manifest, hashes and integrity verification |
+| `preview` | Design report, ISO payload projection and difference image |
+| `template` | Editable canvases and masks derived from the album layout |
+| `calibrate` | Target export, local photo picker and radial fitting |
+| `burn` | Journaled two-session state machine, snapshots and recovery |
+| `device` | Device descriptions, discovery and the backend interface |
+| `macos` | Owned JSON FFI adapter and PCM readback |
+| `main`, `guide` | CLI commands and interactive calibration prompts |
+
+`native/macos.m` wraps DiscRecording and is built only on macOS.
+`mark.html` is the self-contained photo point picker embedded by `calibrate`.
+Pure rendering and configuration do not depend on the calibration workflow;
+`calibrate` re-exports its former public configuration types for compatibility.
+
+## Offline pipeline
 
 ```text
-src/
-  main.rs       CLI parsing and orchestration
-  project.rs    strict TOML settings, defaults and path resolution
-  audio.rs      bounded RIFF inspection and unchanged PCM export
-  layout.rs     sector budgets, geometry inputs and estimated radii
-  art.rs        shared image fitting, tone processing and physical sampling
-  codec.rs      CIRC position map, scrambler, Mode 1 framing/EDC/ECC
-  iso.rs        ISO9660/Joliet tree, absolute extents and sequential prefix
-  author.rs     audio/data bundle generation, manifest and verification
-  preview.rs    design report, sampled payload readback and difference image
-  template.rs   editable disc/strip canvases and album-specific dimensions
-  device.rs     device status, discovery and Recorder interface
-  burn.rs       journaled two-session recording policy and snapshot validation
-  macos.rs      typed Rust adapter to the native recorder
-  lib.rs        public modules and shared hexadecimal formatting
-native/
-  macos.m       DiscRecording bridge (built only for the macOS target)
-tests/
-  offline.rs    WAV, filesystem, CLI and complete-authoring integration tests
-  recording.rs  mock-device recording, recovery and safety boundaries
-docs/
-  architecture.md
-  preview.md
-  recording.md
-  validation.md
+Project + WAVs → Plan → Volume + Drawing → ISO / RAW / manifest
+                   ├→ templates
+                   └→ design preview
+                              ISO → payload readback → difference image
 ```
 
-The offline pipeline shares project, geometry and image types and has no
-platform dependencies. Recording uses a narrow trait; the small Objective-C
-bridge is the only native implementation, linked conditionally by `build.rs`.
-Keep one crate while that boundary is sufficient. A separate drive crate can
-make sense once multiple platforms bring substantial native build dependencies.
-Avoid a file per type or an empty crate per platform.
+`Plan::from_project` applies the same optional session start everywhere.
+`Plan::session_start` and `data_sectors` supply shared session boundaries.
+`Drawing` selects blank fill, an image, radial bands or angular pulse bands
+once. Both encoding and design previews use it. Pixel dithering in design
+previews remains distinct from byte-phased physical dithering.
 
-## Offline data flow
+`Spiral` owns the constant-pitch area model and its inverse. The capacity and
+radii define a **reference geometry**; available media space only limits the
+write extent by increasing the end margin. Neither preparation nor a later
+NWA rebuild should silently change the calibrated spiral.
 
-1. Parse the manifest and inspect normalized WAVs. Sector arithmetic is bounded
-   before use; track tail padding is explicit. Relative paths resolve against
-   the TOML file rather than the process's current directory.
-2. Scan real file/directory entries, reject symlinks/special files, allocate
-   primary and Joliet metadata and file extents. Use stable ordering, fixed ISO
-   timestamps and bounded directory/name limits. Native primary identifiers get
-   deterministic aliases where needed; Joliet preserves BMP names.
-3. Create a new output directory with an `incomplete` marker. Snapshot normalized
-   source artwork and copy music PCM without processing it. Failures preserve
-   the marker and cannot masquerade as completed bundles.
-4. Write ISO metadata, user file snapshots and reserved space, then generate
-   the separately allocated `ARTWORK.BIN` extent. The drawing cannot overwrite
-   source files, directories or music.
-5. Generate the corresponding raw Mode 1 sectors: sync, BCD MSF, user data,
-   EDC, zero reserved bytes and P/Q ECC. Image sectors are unscrambled; the
-   recording device must perform physical scrambling, CIRC and EFM.
-6. Export design, actual-payload readback and difference previews; hash assets
-   and ISO file extents; write the versioned manifest last and remove the marker.
+Builds snapshot inputs, allocate `ARTWORK.BIN` separately from user files,
+write the ISO and RAW, export previews and hash all assets. An `incomplete`
+marker remains until the manifest is complete. Existing output directories
+are rejected. Paths in a project resolve relative to its TOML file.
 
-`author` orchestrates this flow through music and data stages. `iso` owns the
-filesystem allocation, `codec` owns sector transformations, and `art` owns
-source sampling. Graphical exports consume the same `Plan` as encoding; the
-readback additionally reads the actual ISO rather than re-rendering its source.
+## Addressing and encoding
 
-## Session-relative streams and absolute LBAs
-
-The first music INDEX 01 is disc LBA 0. Subsequent music gaps contribute to
-session 1's program length. The first lead-out / next lead-in / data pregap are
-represented by the configured session-transition budget. Session 2 starts at
-`music_sectors + gap_sectors + session_reserve_sectors`, unless a supplied start
-changes that budget before planning.
-
-Both volume descriptors and directory/path-table extents refer to absolute
-LBAs. The session ISO stream's offset zero is session 2 INDEX 01. For any file:
+Music INDEX 01 starts at disc LBA 0. Session 2 starts after music, intertrack
+gaps and the session-transition reserve, unless an actual NWA is supplied.
+The ISO stream begins at session 2 INDEX 01, but its extents contain absolute
+LBAs:
 
 ```text
-stream offset = (absolute file LBA - session_start) * 2048
+stream offset = (file LBA - session start) × 2048
 ```
 
-A separate-write recording backend must obtain the actual NWA and reauthor
-session 2 at that start. Changing only JSON or only RAW headers is insufficient:
-filesystem extents, framing and physical artwork phase all depend on it.
-The manifest labels the start `planned` or `provided`; neither label proves
-hardware acceptance. The per-session CUE/TOC cannot convey the complete disc.
+Changing NWA requires rebuilding the filesystem, framing and artwork phase.
+The recorder never substitutes a guessed address. Separate CUE/TOC files are
+per-session descriptions, not a portable whole-disc image.
 
-The v1 bundle is an enhanced-CD layout with a Mode 1 second session, not a
-CloneCD image and not full Blue Book compliance. CD-ROM XA / CDPLUS requirements
-and hardware/player compatibility remain separate implementation milestones.
+The encoder maps each artwork payload byte through the upstream CIRC position
+model and spiral, selects `0D` or `AA`, then compensates the Mode 1 scrambler.
+File and directory bytes remain unchanged. RAW sectors include sync, MSF,
+EDC and P/Q ECC. The drive still supplies physical scrambling, CIRC and EFM;
+this is not a full channel encoder or reflectivity simulator.
 
-## Encoding model and limits
+## Recording boundary
 
-The CIRC inverse position table and pair-swap convention adapt the pinned
-DiscImageStudio implementation. A drawing payload byte is selected from the
-source at its modeled physical position, converted to `0D/AA`, then XORed with
-its Mode 1 scramble byte. File and filesystem bytes are never compensated as
-images. EDC/ECC covers the resulting valid logical sector.
+`burn` freezes source files and verifies them before each write. A job progresses
+through prepared → music writing → music written → data ready → data writing →
+complete. Write intent is persisted before a native call; uncertain writes
+cannot resume automatically. The backend must verify PCM before appending,
+use the measured NWA, verify data and report final two-session layout.
 
-The projection uses absolute disc position, a constant-pitch area approximation,
-linear velocity and start angle. Gray tone is deterministic byte-phased
-halftoning; threshold uses a hard cutoff; ordered tone uses a fixed 16-phase
-sequence. Design-pixel dithering is deliberately separate. Disc sources normalize
-to 1600 square pixels; strip sources preserve aspect ratio with their longest
-side normalized to 4096. Both composite alpha over white. `Sampler` owns inverse
-rotation, disc/strip coordinate mapping and tone, consumed by preview and
-authoring alike. Strip width maps clockwise from 12 o'clock, and height maps
-outer to inner artwork radius. Templates use these same plan radii.
+Device quirks such as system audio-decoder rounding and SuperDrive CD-RW gap
+requirements live behind `Recorder`. Offline rendering has no device branches.
+Windows CIM and Linux sysfs currently provide discovery only; implementing a
+new recorder must preserve reservation, NWA and finalization semantics.
 
-`Plan::from_project` centralizes optional session-start handling for templates,
-previews and authoring. Keep `--session-start` consistent across those operations.
-Template export does not load an artwork image, so users can design after music
-has established the available annulus. The template module owns only canvases,
-masks and dimension metadata; it does not introduce another rendering engine.
+## Validation boundaries
 
-This is not a full CIRC/EFM encoder or reflectivity simulator. Parity bytes,
-sector framing and finite-stream boundary/latency effects can reduce contrast
-or affect placement. The upstream timing audit's concerns remain relevant.
-Do not equate self-readback consistency with correct on-disc physical phase.
-See [preview.md](preview.md) and [validation.md](validation.md).
+`tests/offline.rs` checks complete bundles, image orientation, calibration and
+unchanged media bytes. `tests/encoding.json` pins pre-refactor ISO/RAW and
+preview hashes for four drawing modes. `tests/recording.rs` exercises the real
+authoring pipeline with a mock recorder, including capacity limits, changed
+NWA, interruption and immutable snapshots. macOS tests exercise framework
+producers and PCM comparison without writing a physical disc.
 
-## Recording backend boundary
-
-| OS | Current discovery | Recording route |
-| --- | --- | --- |
-| macOS | DiscRecording device and media status | Implemented Objective-C bridge; hardware acceptance pending |
-| Windows | CIM `Win32_CDROMDrive` | IMAPI2 COM via Rust Windows bindings |
-| Linux | SCSI peripheral type 5 in sysfs | Evaluate cdrdao/cdrtools or libburn |
-
-Apple's SDK `DRBurn.h`, `DRDevice.h` and `DRTrack.h` define the burn,
-media-reservation and track status APIs used in [recording.md](recording.md).
-Microsoft documents distinct writers in
-[IMAPI Interfaces](https://learn.microsoft.com/en-us/windows/win32/imapi/imapi-interfaces).
-[cdrdao](https://github.com/cdrdao/cdrdao) and the
-[cdrecord manual](https://cdrtools.sourceforge.net/private/man/cdrecord/cdrecord.1.html)
-are references for Linux mode/capacity/append behavior.
-
-Each backend must establish real blank CD-R capacity, supported writing modes,
-actual session start, ownership and finalization semantics. Do not silently
-substitute a single-session mixed-mode disc. Independently accept audio on
-players, files by hash and photographed artwork; CI cannot establish those.
+Digital integrity, photographed appearance and player compatibility are
+separate acceptance checks. See [validation](validation.md),
+[recording](recording.md) and [previews](preview.md).
