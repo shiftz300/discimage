@@ -1,0 +1,36 @@
+title = "My short album"
+# Optional folder copied into the data session. ARTWORK.BIN is reserved.
+# files = "files"
+
+# Relative to this TOML file. Ordering here is the music track ordering.
+[[tracks]]
+path = "audio/01.wav"
+
+[[tracks]]
+path = "audio/02.wav"
+
+[disc]
+# Nominal 80-minute budget; replace with the drive-reported capacity later.
+capacity_sectors = 360000
+inner_radius_mm = 25.0
+outer_radius_mm = 58.0
+intertrack_gap_sectors = 0
+# Planning allowances, NOT measured session offsets or filesystem sizes.
+session_reserve_sectors = 11400
+data_reserve_sectors = 10000
+end_margin_sectors = 150
+# Constant-pitch physical projection. Calibrate before relying on placement.
+velocity = 1200.0          # mm/s
+angle = 0.0               # clockwise degrees at the recording origin
+
+# Optional: uncomment after supplying an image, then use `discimage preview`.
+# [artwork]
+# path = "artwork.png"
+# mode = "disc"             # disc / strip (clockwise wrap, seam at 12 o'clock)
+# rotation = 0.0             # clockwise degrees
+# fit = "contain"            # contain / cover; disc mode only
+# tone = "gray"              # gray / threshold / ordered
+# threshold = 128
+# gamma = 1.0
+# brightness = 0
+# invert = false
