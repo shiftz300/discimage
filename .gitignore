@@ -1,5 +1,6 @@
 /target/
 /output/
+/calibrations/*/evidence/
 .DS_Store
 *.wav
 *.flac

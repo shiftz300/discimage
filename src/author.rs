@@ -7,6 +7,7 @@ use crate::{
     art::{self, Drawing},
     audio,
     codec::{COOKED, Codec, RAW},
+    console,
     iso::{Entry, Volume},
     layout::Plan,
     preview,
@@ -20,6 +21,7 @@ use std::{
     fs::File,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,43 +167,32 @@ fn data(plan: &Plan, volume: &Volume, drawing: &Drawing<'_>, output: &Path) -> R
     let codec = Codec::default();
     let mut iso = BufWriter::with_capacity(1024 * 1024, File::create(output.join("session2.iso"))?);
     let mut files = volume.prefix(&mut iso)?;
-    let mut drawing_hash = Sha256::new();
-    eprintln!("Encoding {} drawing sectors…", plan.artwork_sectors);
-    let progress = plan.artwork_sectors.div_ceil(10).max(1);
-    for relative in volume.drawing..volume.sectors {
-        let lba = start + relative;
-        let mut sector = [0; COOKED];
-        for (offset, byte) in sector.iter_mut().enumerate() {
-            let physical = codec.physical(lba, offset);
-            let value = drawing.palette(physical);
-            *byte = value ^ codec.scramble[offset + 4];
-        }
-        iso.write_all(&sector)?;
-        drawing_hash.update(sector);
-        if (relative - volume.drawing + 1).is_multiple_of(progress)
-            || relative + 1 == volume.sectors
-        {
-            eprintln!(
-                "Drawing: {}%",
-                (relative - volume.drawing + 1) * 100 / plan.artwork_sectors
-            );
-        }
-    }
+    let drawing_hash = encode_drawing(
+        &mut iso,
+        start + volume.drawing..start + sectors,
+        |physical| drawing.palette(physical),
+        || false,
+    )?;
     iso.flush()?;
     drop(iso);
     files.push(Entry {
         path: "ARTWORK.BIN".into(),
         lba: plan.estimated_art_start_sector,
         bytes: plan.artwork_sectors * 2048,
-        sha256: crate::hex(&drawing_hash.finalize()),
+        sha256: drawing_hash,
     });
     let mut iso = BufReader::with_capacity(1024 * 1024, File::open(output.join("session2.iso"))?);
     let mut raw = BufWriter::with_capacity(1024 * 1024, File::create(output.join("session2.bin"))?);
-    eprintln!("Generating Mode 1 headers, EDC and P/Q ECC…");
-    for lba in start..start + sectors {
+    console::phase(
+        "encode",
+        format_args!("Generating Mode 1 framing for {sectors} sectors"),
+    );
+    let mut reported = Instant::now();
+    for (index, lba) in (start..start + sectors).enumerate() {
         let mut payload = [0; COOKED];
         iso.read_exact(&mut payload)?;
         raw.write_all(&codec.sector(lba, &payload))?;
+        sector_progress("encode", index as u32 + 1, sectors, &mut reported);
     }
     raw.flush()?;
     drop(raw);
@@ -211,6 +202,39 @@ fn data(plan: &Plan, volume: &Volume, drawing: &Drawing<'_>, output: &Path) -> R
         "// SESSION 2 ONLY - requires manifest.json session_start\nCD_ROM\nTRACK MODE1\nDATAFILE \"session2.iso\"\n",
     )?;
     Ok(files)
+}
+
+pub(crate) fn encode_drawing(
+    output: &mut impl Write,
+    extent: std::ops::Range<u32>,
+    palette: impl Fn(i64) -> u8,
+    cancelled: impl Fn() -> bool,
+) -> Result<String> {
+    let codec = Codec::default();
+    let count = extent.end - extent.start;
+    let progress = count.div_ceil(10).max(1);
+    let mut hash = Sha256::new();
+    console::phase("drawing", format_args!("Encoding {count} sectors"));
+    let mut reported = Instant::now();
+    for (index, lba) in extent.enumerate() {
+        let mut sector = [0; COOKED];
+        for (offset, byte) in sector.iter_mut().enumerate() {
+            *byte = palette(codec.physical(lba, offset)) ^ codec.scramble[offset + 4];
+        }
+        output.write_all(&sector)?;
+        hash.update(sector);
+        let done = index as u32 + 1;
+        if done.is_multiple_of(256) || done.is_multiple_of(progress) || done == count {
+            ensure!(!cancelled(), "target generation cancelled");
+        }
+        if done.is_multiple_of(progress) || done == count {
+            show_sectors("drawing", done, count);
+            reported = Instant::now();
+        } else {
+            sector_progress("drawing", done, count, &mut reported);
+        }
+    }
+    Ok(crate::hex(&hash.finalize()))
 }
 
 pub fn load(directory: &Path) -> Result<Manifest> {
@@ -260,6 +284,13 @@ pub fn load(directory: &Path) -> Result<Manifest> {
 
 pub fn verify(directory: &Path) -> Result<Manifest> {
     let manifest = load(directory)?;
+    console::phase(
+        "verify",
+        format_args!(
+            "Checking local files and {} Mode 1 sectors",
+            manifest.data_sectors
+        ),
+    );
     let mut seen = std::collections::HashSet::new();
     for asset in &manifest.assets {
         ensure!(
@@ -307,7 +338,10 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
         "incorrect session image length"
     );
     let codec = Codec::default();
-    for lba in manifest.session_start..manifest.session_start + manifest.data_sectors {
+    let mut reported = Instant::now();
+    for (index, lba) in
+        (manifest.session_start..manifest.session_start + manifest.data_sectors).enumerate()
+    {
         let mut payload = [0; COOKED];
         let mut sector = [0; RAW];
         iso.read_exact(&mut payload)?;
@@ -315,6 +349,12 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
         ensure!(
             sector == codec.sector(lba, &payload),
             "Mode 1 framing/EDC/ECC mismatch at LBA {lba}"
+        );
+        sector_progress(
+            "verify",
+            index as u32 + 1,
+            manifest.data_sectors,
+            &mut reported,
         );
     }
     for entry in &manifest.files {
@@ -334,6 +374,20 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
         );
     }
     Ok(manifest)
+}
+
+fn sector_progress(label: &str, done: u32, count: u32, reported: &mut Instant) {
+    if done.is_multiple_of(256) && reported.elapsed() >= Duration::from_secs(15) {
+        show_sectors(label, done, count);
+        *reported = Instant::now();
+    }
+}
+
+fn show_sectors(label: &str, done: u32, count: u32) {
+    console::phase(
+        label,
+        format_args!("{:3}% | {done}/{count} sectors", done * 100 / count),
+    );
 }
 
 pub fn digest(path: &Path) -> Result<String> {

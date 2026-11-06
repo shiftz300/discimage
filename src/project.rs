@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -8,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Project {
     pub title: String,
     pub tracks: Vec<Track>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cd_text: Option<CdText>,
     #[serde(default)]
     pub disc: Disc,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16,10 +21,46 @@ pub struct Project {
     pub files: Option<PathBuf>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetReference {
+    file: PathBuf,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PresetCatalog {
+    profiles: BTreeMap<String, Disc>,
+}
+
+impl PresetReference {
+    fn load(&self, base: &Path) -> Result<Disc> {
+        let path = base.join(&self.file);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read disc preset catalog {}", path.display()))?;
+        let mut catalog: PresetCatalog = toml::from_str(&text)
+            .with_context(|| format!("invalid disc preset catalog {}", path.display()))?;
+        catalog.profiles.remove(&self.name).with_context(|| {
+            format!(
+                "disc preset {:?} not found in {}",
+                self.name,
+                path.display()
+            )
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Track {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdText {
+    pub artist: String,
+    pub titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -195,14 +236,41 @@ impl Project {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read project {}", path.display()))?;
-        let mut project: Self = toml::from_str(&text).context("invalid project TOML")?;
+        let base = path.parent().unwrap_or(Path::new("."));
+        let mut settings: toml::Table = toml::from_str(&text).context("invalid project TOML")?;
+        if let Some(preset) = settings.remove("preset") {
+            ensure!(
+                !settings.contains_key("disc"),
+                "use either preset or [disc] in a project"
+            );
+            let preset: PresetReference = preset.try_into().context("invalid preset reference")?;
+            settings.insert("disc".into(), toml::Value::try_from(preset.load(base)?)?);
+        }
+        let mut project: Self = toml::Value::Table(settings)
+            .try_into()
+            .context("invalid project TOML")?;
         ensure!(!project.title.trim().is_empty(), "title must not be empty");
         // 99 total tracks, reserving one for the data session.
         ensure!(
             (1..=98).contains(&project.tracks.len()),
             "expected 1–98 music tracks"
         );
-        let base = path.parent().unwrap_or(Path::new("."));
+        if let Some(cd_text) = &project.cd_text {
+            ensure!(
+                cd_text.titles.len() == project.tracks.len(),
+                "cd_text.titles must contain one title per music track, in track order"
+            );
+            for text in [&project.title, &cd_text.artist]
+                .into_iter()
+                .chain(&cd_text.titles)
+            {
+                ensure!(
+                    !text.trim().is_empty()
+                        && text.bytes().all(|byte| (0x20..=0x7e).contains(&byte)),
+                    "CD-Text fields must be nonempty printable ASCII"
+                );
+            }
+        }
         if let Some(files) = &mut project.files {
             *files = base.join(&files);
         }

@@ -10,7 +10,7 @@ fn main() {
             .flag("-Wextra")
             .flag("-Werror")
             .compile("discimage_macos");
-        for framework in ["Foundation", "DiscRecording"] {
+        for framework in ["Foundation", "DiscRecording", "IOKit"] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
         println!("cargo:rustc-link-lib=objc");

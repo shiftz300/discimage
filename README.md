@@ -1,121 +1,97 @@
 # discimage
 
+> [!WARNING]
+> **READ BEFORE RECORDING.**
+> - **START WITH `prepare` AND CONFIRM THE DRIVE AND DISC.**
+> - **`burn`, `resume` AND CALIBRATION RECORDING WRITE TO THE DISC. A WRITTEN CD-R CANNOT BE ERASED. ERASING A CD-RW DESTROYS ITS CONTENTS.**
+> - **USE A SPEED SUPPORTED BY BOTH THE DRIVE AND DISC. DO NOT RUN AS ROOT OR UNPLUG THE DRIVE DURING A WRITE. IF A WRITE FAILS, CHECK THE JOB JOURNAL BEFORE RETRYING.**
+
 [简体中文](docs/zhcn.md)
 
-A Rust CLI for music CDs with visible artwork in the remaining outer ring.
-Version **0.3.2**. Offline authoring, templates and previews work on macOS,
-Windows and Linux. Drive recording is currently available on **macOS**.
-
-Inspired by **[DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio)**
-by JiaFeiMiao-K-Cat and contributors, including its CDImage-derived CIRC mapping.
-Source revisions and adaptations are credited in [NOTICE.md](NOTICE.md).
-Licensed under [GPL-3.0-or-later](LICENSE).
+Make a music CD with artwork in the outer ring. Plan, design and build on macOS, Windows or Linux. Record directly on macOS.
 
 ## Install
 
-With current stable Rust, run from this repository:
+Download the prebuilt archive for your system from [GitHub Releases](https://github.com/shiftz300/discimage/releases/latest).
+Compare its SHA-256 with `SHA256SUMS.txt` before extracting. Use the executable inside the archive.
+
+| System | Archive suffix |
+| --- | --- |
+| macOS, Apple Silicon | `macos-arm64.tar.gz` |
+| macOS, Intel | `macos-x64.tar.gz` |
+| Linux, x86-64 | `linux-x64.tar.gz` |
+| Windows, x86-64 | `windows-x64.zip` |
+
+On macOS or Linux, open a terminal in the extracted folder and run:
 
 ```sh
-cargo install --path . --locked
+mkdir -p "$HOME/.local/bin"
+cp -p ./discimage "$HOME/.local/bin/discimage"
+export PATH="$HOME/.local/bin:$PATH"
 discimage --version
 ```
 
-Prepare one **44.1 kHz, 16-bit, stereo PCM WAV** per track (at least four seconds),
-plus a PNG or JPEG. Convert other audio with XLD or FFmpeg, for example:
+On Windows, open PowerShell in the extracted folder and run:
 
-```sh
-ffmpeg -i song.flac -ar 44100 -ac 2 -c:a pcm_s16le 01.wav
+```powershell
+$env:Path = "$((Get-Location).Path);$env:Path"
+discimage --version
 ```
 
-## Preview an album
+These commands add the executable to the current terminal's PATH. The main workflow runs directly from the executable. The optional `calibrate probe` command requires an external DiscProbe checkout and Python. macOS packages are not notarized. If Gatekeeper blocks a verified download, follow [Apple's instructions for opening a trusted app](https://support.apple.com/en-us/102445).
 
-Create `album.toml` beside your files. Track order follows the array; paths are
-relative to this TOML file.
+## Plan and preview
+
+Prepare one 44.1 kHz, 16-bit stereo PCM WAV per track (at least four seconds). Convert other formats with XLD or FFmpeg, for example `ffmpeg -i song.flac -ar 44100 -ac 2 -c:a pcm_s16le 01.wav`.
+
+Save `album.toml` beside the WAVs. Paths are relative to this file, and the array sets the play order.
 
 ```toml
 title = "My album"
 tracks = [{ path = "01.wav" }, { path = "02.wav" }]
-# files = "extras"                   # optional companion directory
 
 [artwork]
 path = "artwork.png"
-mode = "strip"                       # strip: wrap a rectangle; disc: centered disc image
-tone = "threshold"                   # threshold / gray / ordered
-threshold = 128
-rotation = 0.0                       # clockwise degrees
+mode = "strip"
 ```
 
 ```sh
+mkdir output
 discimage plan album.toml
-discimage template album.toml --output templates
-discimage preview album.toml --output preview.svg
+discimage template album.toml --output output/templates
+discimage preview album.toml --output output/preview.svg
 ```
 
-Open `preview.svg` in a browser. Templates include transparent PNG and editable
-SVG canvases sized from the album length. `template` works before the artwork
-file exists. In `strip` mode, left to right wraps clockwise, with the seam at
-12 o'clock and the top edge at the outer radius. In `disc` mode, the picture is
-centered on the disc and clipped to the available annulus; `fit = "cover"` crops
-to a square, while the default `contain` keeps the whole image.
-
-Build and inspect a complete offline bundle:
-
-```sh
-discimage build album.toml --output album
-discimage verify album
-discimage readback album --output detailed.png --samples 128 --size 1600
-```
-
-`album/` contains music, ISO/RAW data, `preview.svg`, `design.png`,
-`readback.png`, `difference.png` and a checksummed manifest. `verify` and
-`readback` inspect **local files**, not the physical disc. Output files and
-bundle directories must be new; allow several GB of free space for a burn job.
+Create the output parent directory once and use a new destination for each export. `template` works before the artwork file exists. Open the SVG in a browser. In `strip` mode the image wraps clockwise from 12 o'clock, with its top edge at the outer rim. Use `mode = "disc"` for a centered image clipped to the available ring. Images can be PNG or JPEG. For a calibrated disc, add the matching `preset` to the album before planning. See [media presets](calibrations/README.md), [artwork options](docs/preview.md) and the [full album example](examples/album.toml).
 
 ## Record on macOS
 
-Insert a blank CD-R or CD-RW. Run in Terminal to see stage, progress and speed.
-Replace `DRIVE_ID` with the exact ID from `devices`.
+Allow a few GB of free disk space, insert a blank CD-R or CD-RW, then run these commands in Terminal:
 
 ```sh
-discimage devices --json
-discimage burn album.toml --device 'DRIVE_ID' --output record --dry-run
-# Review record/planned/preview.svg, then write the prepared job:
-discimage resume record --device 'DRIVE_ID'
+discimage devices
+discimage prepare album.toml --output output/record --speed 8
+open output/record/planned/preview.svg
+# After checking the preview, start writing:
+discimage resume output/record
 ```
 
-The workflow writes music, reads it back against the WAVs, obtains the actual
-next writable address (NWA), rebuilds the data session, then writes, verifies
-and finalizes it. `record/journal.json` records progress and errors. A successful
-job ends at `complete` with two sessions. Use `devices --json` to check that the
-disc has two sessions, is no longer appendable, and contains the audio tracks
-followed by one data track. Inspect the disc separately for artwork quality.
+`prepare` uses the only eligible blank disc, saves the drive and requested speed with the job, and builds a preview without writing to the disc. If several drives qualify, pass `--device 'DRIVE_ID'` with the exact ID from `devices`. Choose a speed supported by the drive and disc. A previously written CD-RW needs a separate erase.
 
-`--speed 10` on `burn` requests 10×; the default is 8×. Choose a speed supported
-by your drive and media. Used CD-RW media need a separate erase; uncertain
-writes are never automatically retried. See [recording and recovery](docs/recording.md).
+`resume` writes the audio session, compares the recorded PCM against the prepared WAVs, then uses the drive's measured next writable address to build, write and verify the data session. Check `output/record/journal.json` for stage `complete` and run `discimage devices` again to confirm the disc is closed and reports two sessions. Inspect the disc surface for artwork quality. For interruptions, CD-Text and direct `burn`, see [recording and recovery](docs/recording.md).
 
-## Calibration and limits
+Logs show the active stage and, during drive writes, reported progress, speed and elapsed time. The macOS Terminal uses basic ANSI colors. Set `NO_COLOR=1` for plain logs. Redirected logs are plain text, and `plan --json` and `devices --json` write JSON to stdout.
 
-The CLI provides a [guided radial calibration](docs/calibration.md). Angular
-alignment also depends on the spiral model. The tested
-[SW80EU1 / GX40N settings](examples/sw80eu1.toml) are an example for that setup,
-not a universal preset. Templates, previews and recording share the same model.
-
-Experimental [read-timing calibration](docs/timing.md) reuses a data track and
-photograph. `calibrate probe` runs external discprobe-macos with live progress;
-`calibrate import` produces a separate project and interactive comparison.
-Offline import works on every platform. Candidates still need physical validation.
-
-This is a music-first, two-session Mode 1 layout. Full Blue Book CD Extra/XA
-compliance and consumer-player compatibility remain unverified. A bundle's
-session-offset ISO and separate CUE/TOC files cannot be treated as a generic
-single-image disc. See [hardware results](docs/validation.md).
-
-[All settings](examples/album.toml) · [Previews](docs/preview.md) ·
-[Architecture](docs/architecture.md)
+## Build offline
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+discimage build album.toml --output output/album
+discimage verify output/album
+discimage readback output/album --output output/readback.png
 ```
+
+The bundle contains audio, a session-offset ISO, a RAW data image, previews and a checksummed manifest. `verify` and `readback` use local files. The recording job uses the ISO at the measured address. The layout is music first, then Mode 1 data. Full Blue Book CD Extra/XA compliance and consumer player compatibility remain unverified.
+
+[Album template](projects/README.md) · [Media presets](calibrations/README.md) · [Calibration guide](docs/calibration.md) · [Experimental read-timing calibration](docs/timing.md) · [Hardware results](docs/validation.md) · [Repository layout](docs/files.md)
+
+Inspired by [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio) by JiaFeiMiao-K-Cat and contributors, including its CDImage-derived CIRC mapping. See [credits](NOTICE.md) and the [GPL-3.0-or-later license](LICENSE).

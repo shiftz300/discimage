@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{author, layout::Plan, preview, project::Project, spiral::Spiral};
+use crate::{author, console, layout::Plan, preview, project::Project, spiral::Spiral};
 
 const BITS: f64 = 57624.0;
 const FRAME: f64 = 588.0;
@@ -400,7 +400,10 @@ pub fn import(
     project.disc.limit_end(end);
     let candidate = Plan::from_project(&project, None)?;
     // Decode all images and generate previews before creating the destination.
-    eprintln!("Generating design and measured-model comparison…");
+    console::phase(
+        "preview",
+        format_args!("Building the design and measured-model comparison"),
+    );
     let design = preview::render(&candidate, project.artwork.as_ref(), size)?;
     let before = preview::projected(&original, project.artwork.as_ref(), &candidate, size)?;
     let after = preview::projected(&candidate, project.artwork.as_ref(), &candidate, size)?;
@@ -453,7 +456,7 @@ pub fn import(
     fs::copy(phase, output.join("phase.json"))?;
     fs::write(
         output.join("index.html"),
-        include_str!("timing.html")
+        include_str!("../assets/timing.html")
             .replace("@OFFSET@", &format!("{offset:.4}"))
             .replace("@RANGE@", &format!("{start}–{end}"))
             .replace("@DRIFT@", &serde_json::to_string(&changes)?),

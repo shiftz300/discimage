@@ -891,7 +891,8 @@ fn calibration_cli_binds_photo_points_to_the_written_target() {
 fn encoding_and_previews_match_the_pre_refactor_fixtures() {
     // Captured from the working encoder before the 0.3.1 reorganization.
     // This detects geometry/palette drift that self-consistent readback misses.
-    let expected: serde_json::Value = serde_json::from_str(include_str!("encoding.json")).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/encoding.json")).unwrap();
     let temp = Temp::new();
     wav(&temp.0.join("audio.wav"), 300 * 588, 44100);
     image::GrayImage::from_fn(16, 8, |x, y| image::Luma([((x * 37 + y * 19) % 256) as u8]))

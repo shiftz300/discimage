@@ -2,6 +2,7 @@
 use crate::{
     art, audio,
     author::{self, Manifest},
+    console,
     device::{Device, Media, Music, Recorder, Track},
     iso::Volume,
     layout::Plan,
@@ -96,7 +97,16 @@ pub fn start(
     ensure!((1..=64).contains(&speed), "speed must be 1–64x");
     let observed = backend.inspect()?;
     let available = blank(&observed, false)?;
+    console::phase(
+        "prepare",
+        format_args!(
+            "{} | {} | {available} writable sectors | requested {speed}x",
+            observed.name,
+            writable_cd(&observed)?.kind,
+        ),
+    );
     let mut project = Project::load(project)?;
+    check_cd_text(backend, &observed, &project)?;
     project
         .disc
         .limit_end(available.saturating_sub(project.disc.end_margin_sectors));
@@ -104,10 +114,10 @@ pub fn start(
         let requested = project.disc.intertrack_gap_sectors;
         let gap = backend.music_gap(&observed, requested);
         if gap != requested {
-            eprintln!(
-                "Adjusting gaps between music tracks from {requested} to {gap} sectors for {}",
-                observed.name
-            );
+            console::warning(format_args!(
+                "Adjusted track gaps from {requested} to {gap} sectors for {}",
+                observed.name,
+            ));
             project.disc.intertrack_gap_sectors = gap;
         }
     }
@@ -159,7 +169,10 @@ pub fn start(
         std::fs::write(&config, toml::to_string_pretty(&project)?)?;
         journal.source_sha256 = Some(fingerprint(&snapshot)?);
         check_cancel(backend)?;
-        eprintln!("Preparing music and a provisional data image before recording…");
+        console::phase(
+            "prepare",
+            format_args!("Building the provisional audio and data bundle"),
+        );
         let planned = directory.join("planned");
         author::build(&config, &planned, None)?;
         author::verify(&planned)?;
@@ -189,11 +202,11 @@ fn normalize_length(backend: &mut dyn Recorder, path: &Path, mut sectors: u32) -
         sectors = reported;
     }
     if sectors != original {
-        eprintln!(
+        console::warning(format_args!(
             "{}: added {} silent tail sector(s) to match the system decoder",
             path.display(),
             sectors - original
-        );
+        ));
     }
     Ok(())
 }
@@ -230,7 +243,7 @@ fn finish(directory: &Path, mut journal: Journal, result: Result<()>) -> Result<
     if let Err(error) = result {
         journal.error = Some(format!("{error:#}"));
         if let Err(save) = journal.save(directory) {
-            eprintln!("Could not update recording journal: {save:#}");
+            console::warning(format_args!("Could not update recording journal: {save:#}"));
         }
         return Err(error).with_context(|| {
             format!(
@@ -247,6 +260,10 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     ensure!(
         (1..=64).contains(&journal.speed),
         "invalid saved recording speed"
+    );
+    console::phase(
+        "check",
+        format_args!("Checking the saved inputs and recording bundle"),
     );
     let snapshot = directory.join("source");
     check_source(&snapshot, journal)?;
@@ -273,6 +290,8 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         .collect::<Vec<_>>();
     if journal.stage == Stage::Prepared {
         let available = blank(&journal.observed, true)?;
+        let project = Project::load(&snapshot.join("project.toml"))?;
+        check_cd_text(backend, &journal.observed, &project)?;
         ensure!(
             available >= manifest.plan.estimated_art_end_sector,
             "blank CD is smaller than the prepared plan; create a new job"
@@ -292,8 +311,21 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         }
         check_cancel(backend)?;
         journal.advance(directory, Stage::MusicWriting)?;
-        eprintln!("Writing music session in SAO mode; leaving the CD appendable…");
-        backend.music(&tracks, journal.speed)?;
+        console::phase(
+            "session 1",
+            format_args!(
+                "Writing {} audio tracks (SAO, disc stays appendable)",
+                tracks.len()
+            ),
+        );
+        backend.music(
+            &tracks,
+            journal.speed,
+            project
+                .cd_text
+                .as_ref()
+                .map(|text| (project.title.as_str(), text)),
+        )?;
         journal.advance(directory, Stage::MusicWritten)?;
     }
     check_cancel(backend)?;
@@ -301,7 +333,10 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     check_device(&observed, journal)?;
     let (nwa, free) = next(&observed, &manifest.plan)?;
     journal.observed = observed;
-    eprintln!("Drive reports next writable LBA {nwa}, {free} free sectors");
+    console::phase(
+        "session 1",
+        format_args!("Drive reports next writable LBA {nwa} and {free} free sectors"),
+    );
     backend
         .verify_music(&tracks)
         .context("music readback failed before data append")?;
@@ -329,7 +364,10 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         journal.actual_sha256 = None;
         journal.advance(directory, Stage::MusicWritten)?;
         let path = journal.actual(directory);
-        eprintln!("Rebuilding filesystem, drawing and previews at the measured NWA…");
+        console::phase(
+            "session 2",
+            format_args!("Rebuilding the data bundle at LBA {nwa}"),
+        );
         author::build_project(project, &path, Some(nwa))?;
         let actual = author::verify(&path)?;
         journal.actual_sha256 = Some(author::digest(&path.join("manifest.json"))?);
@@ -357,7 +395,13 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     );
     journal.observed = observed;
     journal.advance(directory, Stage::DataWriting)?;
-    eprintln!("Writing and verifying the Mode 1 data session; finalizing the disc…");
+    console::phase(
+        "session 2",
+        format_args!(
+            "Writing {} Mode 1 sectors, then verifying and finalizing",
+            actual.data_sectors
+        ),
+    );
     backend.data(
         &journal.actual(directory).join("session2.iso"),
         actual.session_start,
@@ -365,14 +409,33 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         journal.speed,
     )?;
     let observed = backend.inspect()?;
-    check_device(&observed, journal)?;
-    journal.observed = observed;
-    closed(
-        &journal.observed,
+    if observed.media.as_ref().is_some_and(|m| m.kind == "cd-rom") {
+        ensure!(
+            observed.id == journal.device
+                && journal
+                    .observed
+                    .media
+                    .as_ref()
+                    .is_some_and(|m| m.kind == "cd-r"),
+            "unexpected read-only medium after finalization"
+        );
+    } else {
+        check_device(&observed, journal)?;
+    }
+    let short = closed(
+        &observed,
         &manifest.plan,
         actual.session_start,
         actual.data_sectors,
     )?;
+    journal.observed = observed;
+    if short {
+        backend.verify_data_tail(
+            &journal.actual(directory).join("session2.iso"),
+            actual.session_start,
+            actual.data_sectors,
+        )?;
+    }
     journal.advance(directory, Stage::Complete)
 }
 
@@ -451,6 +514,34 @@ fn blank(device: &Device, reserved: bool) -> Result<u32> {
         .filter(|&v| v > 0)
         .context("drive did not report blank media capacity")
 }
+
+/// Pick a drive for preparation only. The write path rechecks the saved drive
+/// and media after taking the reservation.
+pub fn select_blank(drives: &[Device]) -> Result<&Device> {
+    let mut candidates = drives.iter().filter(|drive| blank(drive, false).is_ok());
+    let selected = candidates.next().context(
+        "no drive with a writable blank CD-R or CD-RW; run 'discimage devices' for details",
+    )?;
+    ensure!(
+        candidates.next().is_none(),
+        "multiple drives have writable blank discs; use 'discimage devices' and pass --device"
+    );
+    Ok(selected)
+}
+fn check_cd_text(backend: &mut dyn Recorder, device: &Device, project: &Project) -> Result<()> {
+    if let Some(text) = &project.cd_text {
+        ensure!(
+            device
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.cd_text),
+            "{} does not report CD-Text writing support",
+            device.name
+        );
+        backend.preflight_cd_text(&project.title, text)?;
+    }
+    Ok(())
+}
 fn recorded(device: &Device) -> Vec<&Track> {
     let mut tracks = device
         .tracks
@@ -519,8 +610,11 @@ fn next(device: &Device, plan: &Plan) -> Result<(u32, u32)> {
         .context("drive did not report remaining writable sectors")?;
     Ok((nwa, free))
 }
-fn closed(device: &Device, plan: &Plan, nwa: u32, sectors: u32) -> Result<()> {
-    let media = writable_cd(device)?;
+fn closed(device: &Device, plan: &Plan, nwa: u32, sectors: u32) -> Result<bool> {
+    let media = device
+        .media
+        .as_ref()
+        .context("no finalized medium reported")?;
     ensure!(
         !media.blank && !media.appendable && media.sessions == 2,
         "drive did not report a finalized two-session disc"
@@ -537,10 +631,12 @@ fn closed(device: &Device, plan: &Plan, nwa: u32, sectors: u32) -> Result<()> {
             && !data.audio
             && data.number == tracks.len() as u32
             && data.start == Some(i64::from(nwa))
-            && data.sectors.is_some_and(|length| length >= sectors),
+            && data
+                .sectors
+                .is_some_and(|length| length >= sectors || length.checked_add(2) == Some(sectors)),
         "final data track does not match the measured LBA and length"
     );
-    Ok(())
+    Ok(data.sectors.is_some_and(|length| length < sectors))
 }
 
 /// Hash names, directory markers and file contents, independent of absolute job path.

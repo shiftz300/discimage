@@ -90,7 +90,7 @@ pub fn run(options: Options) -> Result<()> {
     };
     // The page belongs to one photo and one exact target.
     let photo_digest = author::digest(&photo).context("无法读取盘片照片")?;
-    let target_digest = author::digest(&bundle.join("manifest.json"))?;
+    let target_digest = calibrate::digest(&bundle)?;
     let page = directory.join(format!(
         "points-{}-{}.html",
         &target_digest[..12],

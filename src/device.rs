@@ -1,4 +1,5 @@
 //! Device descriptions and the recording boundary shared by platform backends.
+use crate::project::CdText;
 #[cfg(not(target_os = "macos"))]
 use anyhow::bail;
 use anyhow::{Context, Result};
@@ -22,6 +23,8 @@ pub struct Capabilities {
     pub cdrw: bool,
     pub sao: bool,
     pub tao: bool,
+    #[serde(default)]
+    pub cd_text: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Media {
@@ -73,11 +76,36 @@ pub trait Recorder {
         Ok(None)
     }
     fn lock(&mut self) -> Result<()>;
-    fn music(&mut self, tracks: &[Music], speed: u32) -> Result<()>;
+    fn preflight_cd_text(&mut self, _title: &str, _text: &CdText) -> Result<()> {
+        anyhow::bail!("this recording backend does not support CD-Text")
+    }
+    fn music(
+        &mut self,
+        tracks: &[Music],
+        speed: u32,
+        cd_text: Option<(&str, &CdText)>,
+    ) -> Result<()>;
     fn verify_music(&mut self, tracks: &[Music]) -> Result<()>;
     fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: u32) -> Result<()>;
+    fn verify_data_tail(&mut self, _path: &Path, _start: u32, _sectors: u32) -> Result<()> {
+        anyhow::bail!("the recorder cannot verify unreported data tail sectors")
+    }
     fn cancelled(&self) -> bool {
         cancelled()
+    }
+}
+
+pub fn blank_cdr_recorder(id: Option<&str>, capacity: u32) -> Result<Box<dyn Recorder>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(crate::macos::Recorder::reserve_blank_cdr(
+            id, capacity,
+        )?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (id, capacity);
+        bail!("Recording is implemented for macOS only")
     }
 }
 

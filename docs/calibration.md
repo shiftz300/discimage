@@ -15,6 +15,25 @@ It reuses existing evidence and does not change the saved preset.
 
 ## Guided radial fit
 
+On macOS, a single-session Mode 1 target can serve both the radial photo fit
+and the external read-timing probe. With a blank CD-R inserted:
+
+```sh
+mkdir -p output/calibration
+discimage calibrate record --output output/calibration/record
+discimage calibrate guide --output output/calibration --bundle output/calibration/record
+```
+
+The record command selects the only eligible drive, reserves the disc and
+builds the target from its reported free capacity. If several blank CD-R
+drives qualify, use `discimage devices` and pass an explicit `--device`.
+The target is written at the fastest speed the drive permits unless
+`--speed` is supplied. A lost reservation or replaced disc stops the job
+before the write. The destination must be new.
+Use `--dry-run` to check selection and reservation without creating files or writing.
+
+The guide can also author and record the legacy two-session radial target.
+
 Use a blank 120 mm CD-R or CD-RW and repeat the same command to continue:
 
 ```sh
@@ -46,8 +65,8 @@ do not guess points or repeatedly reburn the same unmeasurable target.
 ```sh
 discimage calibrate target --output target
 discimage preview target/target.toml --output target.svg
-discimage burn target/target.toml --device 'DRIVE_ID' --output record --dry-run
-discimage resume record --device 'DRIVE_ID'
+discimage prepare target/target.toml --device 'DRIVE_ID' --output record
+discimage resume record
 discimage calibrate mark record/actual-1 photo.jpg --output points.html
 # Open points.html and save points.json.
 discimage calibrate fit record/actual-1 points.json --output calibration.toml
@@ -72,19 +91,15 @@ discimage devices --json
 
 ## Saved angular settings
 
-[examples/sw80eu1.toml](../examples/sw80eu1.toml) records the visually accepted
-Verbatim SW80EU1 / LG GX40N RQ00 combination, with requested speed 10×. Merge
-its keys into the album's `[disc]` table, keeping capacity and both radii
-together. The `velocity` value describes the modeled spiral at 1×; it is not
-`--speed` and does not command the spindle. `angle` sets model orientation;
-it does not align the picture to the printed label.
+The [preset catalog](../calibrations/README.md) lists the tested media and
+drive combinations. Use `sw80eu1` for the visually checked CD‑RW profile.
+Its `velocity` models the spiral at 1×. Select the drive and write speed when
+starting the recording. The `angle` sets artwork orientation in the model.
 
-This setup reduced a measured inner-to-outer drift from about 14° to about
-0.55° at one visible reference pair. The latter is a photo-based observation,
-not a whole-disc accuracy bound. The preset is not a radial least-squares fit
-and supplies no `[disc.calibration]` RMS. An existing radial profile takes
-precedence over the preset's radii and capacity reference. Keep the matched
-settings together and validate any combination before using it as a new preset.
+On the tested GX40N at requested 10×, the correction reduced observed
+inner-to-outer drift from about 14° to about 0.55° at one visible reference pair.
+This is a local measurement. The separate Digital Vinyl photo fit is kept
+with the catalog's measurements and is available for comparison.
 
 `[disc.phase_target]` remains available for diagnostic pulse bands. Its
 `controls` are solid intervals of absolute LBAs; each band specifies `start`,

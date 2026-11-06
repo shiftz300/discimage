@@ -1,0 +1,45 @@
+# Albums select a name under profiles. Verification and measurements are records only.
+
+# SW80EU1 baseline from CDImage PR #29 (Verbatim 43480).
+# https://github.com/arduinocelentano/cdimage/pull/29
+# Correction: -0.82 degree/mm around 40.24394 mm.
+
+[profiles.sw80eu1]
+capacity_sectors = 359847
+inner_radius_mm = 24.5
+outer_radius_mm = 57.22749180512035
+intertrack_gap_sectors = 150
+session_reserve_sectors = 11400
+data_reserve_sectors = 10000
+end_margin_sectors = 150
+velocity = 1183.177343317657
+angle = 12.9100280418
+
+[profiles.sw80eu1-timing]
+capacity_sectors = 359847
+inner_radius_mm = 24.500316327764533
+outer_radius_mm = 57.22742040838572
+intertrack_gap_sectors = 150
+session_reserve_sectors = 11400
+data_reserve_sectors = 10000
+end_margin_sectors = 3848
+velocity = 1183.177343317657
+angle = 38.19725713467556
+
+[profiles.sw80eu1-timing.timing]
+first_sector = 122001
+end_sector = 355999
+summary_sha256 = "b4054ae04b0063057474c58a412fba0add6eaff882b6841231be0e258a8c277a"
+phase_sha256 = "0c5eeebfe4421addc5232c133d9ef6bffa5c0b2c9906a2254b49ba620b538547"
+
+[verification.sw80eu1]
+media = "Verbatim SW80EU1 CD-RW"
+drive = "HL-DT-ST GX40N RQ00"
+requested_speed = 10
+status = "visually-confirmed"
+
+[verification.sw80eu1-timing]
+media = "Verbatim SW80EU1 CD-RW"
+drive = "HL-DT-ST GX40N RQ00"
+requested_speed = 10
+status = "digital-readback"

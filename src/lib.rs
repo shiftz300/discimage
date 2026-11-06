@@ -4,6 +4,7 @@ pub mod author;
 pub mod burn;
 pub mod calibrate;
 pub mod codec;
+pub mod console;
 pub mod device;
 pub mod iso;
 pub mod layout;

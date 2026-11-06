@@ -9,10 +9,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    audio, author,
+    audio, author, console,
     layout::Plan,
     project::{Disc, Project, Track},
     target::Target,
@@ -25,10 +25,93 @@ const HOLE_RADIUS: f64 = 7.5;
 pub use crate::project::Profile;
 pub use crate::target::{PhaseBand, PhaseTarget};
 
+const SINGLE_FORMAT: &str = "discimage-calibration-single-v1";
+const DRAWING_START: u32 = 300;
+const END_MARGIN: u32 = 150;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SingleTarget {
+    format: String,
+    reference_sectors: u32,
+    written_sectors: u32,
+    iso_sha256: String,
+}
+
+pub fn record_single(
+    directory: &Path,
+    device: Option<&str>,
+    speed: Option<u32>,
+    dry_run: bool,
+) -> Result<()> {
+    ensure!(
+        speed.is_none_or(|speed| (1..=64).contains(&speed)),
+        "speed must be 1–64x"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::record_calibration(directory, device, speed, dry_run)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (directory, device, speed, dry_run);
+        anyhow::bail!("Calibration recording requires macOS; photo fitting works offline")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn prepare_single(
+    directory: &Path,
+    free_sectors: u32,
+    cancelled: impl Fn() -> bool,
+) -> Result<u32> {
+    use crate::iso::Volume;
+    use std::io::BufWriter;
+    // Use the measured capacity up to the encoder's supported range.
+    let reference = free_sectors.min(360_000);
+    let written = reference.saturating_sub(END_MARGIN);
+    ensure!(
+        written > DRAWING_START + 1000,
+        "blank CD reports too little usable capacity"
+    );
+    let volume = Volume::new(None, 0, written, DRAWING_START, "CD radial calibration")?;
+    std::fs::create_dir(directory).with_context(|| {
+        format!(
+            "cannot create new calibration directory {}",
+            directory.display()
+        )
+    })?;
+    let path = directory.join("calibration.iso");
+    let mut iso = BufWriter::with_capacity(
+        1024 * 1024,
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?,
+    );
+    volume.prefix(&mut iso)?;
+    let extent = DRAWING_START..written;
+    let target = Target::for_range(extent.clone());
+    author::encode_drawing(&mut iso, extent, |p| target.palette(p), cancelled)?;
+    iso.into_inner()?.sync_all()?;
+    let receipt = SingleTarget {
+        format: SINGLE_FORMAT.into(),
+        reference_sectors: reference,
+        written_sectors: written,
+        iso_sha256: author::digest(&path)?,
+    };
+    write(
+        &directory.join("pending.json"),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    Ok(written)
+}
+
 /// Create a standalone project using the same multisession path as an album.
 pub fn create(directory: &Path, capacity: u32) -> Result<()> {
     let project = Project {
         title: "CD radial calibration".into(),
+        cd_text: None,
         tracks: vec![Track {
             path: "silence.wav".into(),
         }],
@@ -73,6 +156,28 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn bundle(directory: &Path) -> Result<(Target, u32, String)> {
+    let single = directory.join("single.json");
+    if single.try_exists()? {
+        let file = File::open(&single)?;
+        ensure!(
+            file.metadata()?.len() <= 4096,
+            "calibration receipt is too large"
+        );
+        let receipt: SingleTarget = serde_json::from_reader(file)?;
+        ensure!(
+            receipt.format == SINGLE_FORMAT
+                && receipt.reference_sectors <= 360_000
+                && receipt.reference_sectors.checked_sub(END_MARGIN)
+                    == Some(receipt.written_sectors)
+                && receipt.written_sectors > DRAWING_START + 1000,
+            "invalid single-session calibration receipt"
+        );
+        return Ok((
+            Target::for_range(DRAWING_START..receipt.written_sectors),
+            receipt.reference_sectors,
+            author::digest(&single)?,
+        ));
+    }
     let manifest = author::load(directory)?;
     ensure!(
         manifest.plan.disc.calibration_target,
@@ -108,6 +213,10 @@ fn bundle(directory: &Path) -> Result<(Target, u32, String)> {
     ))
 }
 
+pub fn digest(directory: &Path) -> Result<String> {
+    Ok(bundle(directory)?.2)
+}
+
 /// Produce a self-contained local page for taking points without a GUI dependency.
 pub fn mark(directory: &Path, photo: &Path, output: &Path) -> Result<()> {
     let (_, _, digest) = bundle(directory)?;
@@ -124,7 +233,7 @@ pub fn mark(directory: &Path, photo: &Path, output: &Path) -> Result<()> {
     let photo = reader.decode()?.thumbnail(3072, 3072);
     let mut bytes = Cursor::new(Vec::new());
     photo.write_to(&mut bytes, ImageFormat::Png)?;
-    let page = include_str!("mark.html")
+    let page = include_str!("../assets/mark.html")
         .replace("@BUNDLE@", &digest)
         .replace("@PHOTO@", &STANDARD.encode(bytes.into_inner()));
     write(output, page.as_bytes())
@@ -286,6 +395,39 @@ pub fn fit(directory: &Path, points: &Path, output: &Path) -> Result<Profile> {
     let mut settings = String::from("[disc.calibration]\n");
     settings.push_str(&toml::to_string_pretty(&profile)?);
     write(output, settings.as_bytes())?;
-    eprintln!("Band residuals (fitted − observed, mm): {errors:+.3?}");
+    console::phase(
+        "fit",
+        format_args!("Band residuals (fitted minus observed, mm): {errors:+.3?}"),
+    );
     Ok(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn single_target_uses_reported_capacity_and_requires_a_completed_receipt() {
+        let root = std::env::temp_dir().join(format!("discimage-single-{}", std::process::id()));
+        let result = (|| -> Result<()> {
+            let sectors = prepare_single(&root, 2000, || false)?;
+            assert_eq!(sectors, 1850);
+            let mut iso = File::open(root.join("calibration.iso"))?;
+            assert_eq!(iso.metadata()?.len(), u64::from(sectors) * 2048);
+            iso.seek(SeekFrom::Start(16 * 2048))?;
+            let mut header = [0; 84];
+            iso.read_exact(&mut header)?;
+            assert_eq!(&header[..7], b"\x01CD001\x01");
+            assert_eq!(u32::from_le_bytes(header[80..84].try_into()?), sectors);
+            assert!(bundle(&root).is_err());
+            std::fs::rename(root.join("pending.json"), root.join("single.json"))?;
+            let (target, reference, _) = bundle(&root)?;
+            assert_eq!(reference, 2000);
+            assert_eq!(target.edges(), [377, 563, 796, 1090, 1369, 1757]);
+            Ok(())
+        })();
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
 }

@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, ensure};
+use clap::{Args, Parser, Subcommand};
 use discimage::{
-    author, burn, calibrate, device,
+    author, burn, calibrate, console, device,
     layout::Plan,
     preview,
     project::{Artwork, Project},
@@ -15,7 +15,8 @@ mod guide;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Music-first enhanced CD authoring, previews and macOS recording"
+    about = "Music-first enhanced CD authoring, previews and macOS recording",
+    after_help = "Offline: plan -> template / preview -> build -> verify\nRecord on macOS: devices -> prepare -> resume"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,25 +25,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Prepare and record a music-first disc on a blank CD-R or CD-RW (macOS).
+    /// Prepare a recording job from a blank CD without reserving or writing it (macOS).
+    Prepare(Recording),
+    /// Prepare and immediately write a blank CD (macOS).
     Burn {
-        project: PathBuf,
-        #[arg(long)]
-        device: String,
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Requested CD speed multiplier.
-        #[arg(long, default_value_t = 8)]
-        speed: u32,
-        /// Probe and prepare the complete job without reserving or writing the disc.
+        #[command(flatten)]
+        recording: Recording,
+        /// Reserve a blank CD-R of this exact capacity, selecting the drive automatically.
+        #[arg(long, conflicts_with = "dry_run", value_parser = clap::value_parser!(u32).range(1..=360_000))]
+        blank_cdr: Option<u32>,
+        /// Prepare only; equivalent to the prepare command.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Continue a prepared job or append after a confirmed music write.
+    /// Write or continue a job using its saved drive and speed (macOS).
     Resume {
         directory: PathBuf,
+        /// Assert the drive ID; it must match the one saved in the job.
         #[arg(long)]
-        device: String,
+        device: Option<String>,
     },
     /// Export disc/strip artwork templates from the album's actual WAV lengths.
     Template {
@@ -109,8 +110,36 @@ enum Commands {
     Calibrate(Calibration),
 }
 
+#[derive(Args)]
+struct Recording {
+    project: PathBuf,
+    /// Exact ID from devices; prepare can select the only eligible drive.
+    #[arg(long, value_name = "DRIVE_ID")]
+    device: Option<String>,
+    /// New directory for the prepared bundle and recording journal.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Requested CD speed multiplier, saved with the job.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
+    speed: u32,
+}
+
 #[derive(Subcommand)]
 enum Calibration {
+    /// Record a finalized single-session Mode 1 calibration target on a blank CD-R.
+    Record {
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Select a drive when more than one blank CD-R is eligible.
+        #[arg(long)]
+        device: Option<String>,
+        /// Requested write speed. By default, let the drive choose its supported maximum.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+        speed: Option<u32>,
+        /// Verify selection and reservation without creating files or writing the disc.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run an external discprobe-macos checkout with live read-only progress.
     Probe {
         #[arg(long)]
@@ -170,7 +199,7 @@ fn main() -> std::process::ExitCode {
     match run(Cli::parse()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error:#}");
+            console::error(format_args!("{error:#}"));
             std::process::ExitCode::FAILURE
         }
     }
@@ -179,6 +208,14 @@ fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Calibrate(command) => match command {
+            Calibration::Record {
+                output,
+                device,
+                speed,
+                dry_run,
+            } => {
+                calibrate::record_single(&output, device.as_deref(), speed, dry_run)?;
+            }
             Calibration::Probe {
                 probe_dir,
                 python,
@@ -236,39 +273,32 @@ fn run(cli: Cli) -> Result<()> {
                 );
             }
         },
+        Commands::Prepare(recording) => record(recording, None, true)?,
         Commands::Burn {
-            project,
-            device: id,
-            output,
-            speed,
+            recording,
+            blank_cdr,
             dry_run,
-        } => {
-            let mut recorder = device::recorder(&id)?;
-            device::install_cancel_handler()?;
-            let result = burn::start(&mut *recorder, &project, &output, speed, dry_run)?;
-            if dry_run {
-                println!(
-                    "Prepared {} without writing media. Review planned/ and journal.json before resume.",
-                    output.display()
-                );
-            } else {
-                println!(
-                    "Two sessions finalized and data verified. Artwork appearance requires visual inspection. Measured session bundle: {}",
-                    result.actual(&output).display()
-                );
-            }
-        }
+        } => record(recording, blank_cdr, dry_run)?,
         Commands::Resume {
             directory,
             device: id,
         } => {
-            let mut recorder = device::recorder(&id)?;
-            device::install_cancel_handler()?;
-            let result = burn::resume(&mut *recorder, &directory)?;
-            println!(
-                "Two sessions finalized and data verified. Artwork appearance requires visual inspection. Measured session bundle: {}",
-                result.actual(&directory).display()
+            let saved = burn::Journal::load(&directory).with_context(|| {
+                format!("cannot read {}", directory.join("journal.json").display())
+            })?;
+            ensure!(
+                id.as_deref().is_none_or(|id| id == saved.device),
+                "--device does not match the recording job's saved drive: {}",
+                saved.device
             );
+            let mut recorder = device::recorder(&saved.device)?;
+            device::install_cancel_handler()?;
+            console::phase(
+                "resume",
+                format_args!("{} | requested {}x", directory.display(), saved.speed),
+            );
+            let result = burn::resume(&mut *recorder, &directory)?;
+            recording_complete(&result, &directory);
         }
         Commands::Template {
             project,
@@ -331,14 +361,26 @@ fn run(cli: Cli) -> Result<()> {
                     println!("{} [{}]\n  id: {}", drive.name, drive.backend, drive.id);
                     if let Some(c) = drive.capabilities {
                         println!(
-                            "  CD-R: {} · CD-RW: {} · SAO: {} · TAO: {}",
-                            c.cdr, c.cdrw, c.sao, c.tao
+                            "  CD-R: {} · CD-RW: {} · SAO: {} · TAO: {} · CD-Text: {}",
+                            c.cdr, c.cdrw, c.sao, c.tao, c.cd_text
                         );
                     }
                     if let Some(m) = drive.media {
+                        let state = if m.blank {
+                            "blank"
+                        } else if m.appendable {
+                            "appendable"
+                        } else {
+                            "closed"
+                        };
                         println!(
-                            "  Media: {} · blank: {} · appendable: {} · free sectors: {:?} · NWA: {:?}",
-                            m.kind, m.blank, m.appendable, m.free_sectors, m.nwa
+                            "  Media: {} ({state}) | {} sessions, {} tracks",
+                            m.kind, m.sessions, m.tracks
+                        );
+                        println!(
+                            "  Writable sectors: {} | Next writable LBA: {}",
+                            m.free_sectors.map_or_else(|| "-".into(), |n| n.to_string()),
+                            m.nwa.map_or_else(|| "-".into(), |n| n.to_string())
                         );
                     } else if drive.backend == "macos-discrecording" {
                         println!("  No ready media");
@@ -392,6 +434,56 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn record(recording: Recording, blank_cdr: Option<u32>, dry_run: bool) -> Result<()> {
+    let Recording {
+        project,
+        device: id,
+        output,
+        speed,
+    } = recording;
+    device::install_cancel_handler()?;
+    let mut recorder = match (blank_cdr, id.as_deref()) {
+        (Some(capacity), id) => device::blank_cdr_recorder(id, capacity)?,
+        (None, id) => {
+            let drives;
+            let id = match id {
+                Some(id) => id,
+                None if dry_run => {
+                    ensure!(
+                        cfg!(target_os = "macos"),
+                        "Recording is implemented for macOS only"
+                    );
+                    drives = device::list()?;
+                    &burn::select_blank(&drives)?.id
+                }
+                None => anyhow::bail!(
+                    "direct recording requires --device or --blank-cdr; use 'discimage prepare' to review the job first"
+                ),
+            };
+            device::recorder(id)?
+        }
+    };
+    let result = burn::start(&mut *recorder, &project, &output, speed, dry_run)?;
+    if dry_run {
+        console::success(format_args!(
+            "Prepared {} without writing the disc",
+            output.display()
+        ));
+        println!("Preview: {}", output.join("planned/preview.svg").display());
+        println!("To write the job, pass this directory to discimage resume.");
+    } else {
+        recording_complete(&result, &output);
+    }
+    Ok(())
+}
+
+fn recording_complete(journal: &burn::Journal, directory: &Path) {
+    console::success(format_args!(
+        "Audio and data verified; both sessions are finalized"
+    ));
+    println!("Recorded bundle: {}", journal.actual(directory).display());
 }
 
 fn prepare(path: &Path, session_start: Option<u32>) -> Result<(Plan, Option<Artwork>)> {

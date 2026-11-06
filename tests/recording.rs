@@ -3,6 +3,7 @@ use discimage::{
     author,
     burn::{self, Journal, Stage},
     device::{Capabilities, Device, Media, Music, Recorder, Track},
+    project::CdText,
 };
 use std::{
     fs::File,
@@ -60,6 +61,7 @@ enum Fault {
     MissingNwa,
     MovingNwa,
     Close,
+    ReadOnlyWithShortTail,
 }
 struct Drive {
     job: PathBuf,
@@ -67,6 +69,7 @@ struct Drive {
     calls: Vec<&'static str>,
     fault: Fault,
     adjust_audio: bool,
+    written_cd_text: Option<(String, String, Vec<String>)>,
 }
 impl Drive {
     fn new(work: &Work, fault: Fault) -> Self {
@@ -75,6 +78,7 @@ impl Drive {
             calls: Vec::new(),
             fault,
             adjust_audio: false,
+            written_cd_text: None,
             status: Device {
                 id: "fixture-drive".into(),
                 name: "Fixture".into(),
@@ -84,6 +88,7 @@ impl Drive {
                     cdrw: false,
                     sao: true,
                     tao: true,
+                    cd_text: false,
                 }),
                 media: Some(Media {
                     kind: "cd-r".into(),
@@ -131,7 +136,17 @@ impl Recorder for Drive {
             Ok(None)
         }
     }
-    fn music(&mut self, tracks: &[Music], speed: u32) -> Result<()> {
+    fn preflight_cd_text(&mut self, _title: &str, _text: &CdText) -> Result<()> {
+        Ok(())
+    }
+    fn music(
+        &mut self,
+        tracks: &[Music],
+        speed: u32,
+        cd_text: Option<(&str, &CdText)>,
+    ) -> Result<()> {
+        self.written_cd_text = cd_text
+            .map(|(title, text)| (title.to_owned(), text.artist.clone(), text.titles.clone()));
         assert_eq!(Journal::load(&self.job)?.stage, Stage::MusicWriting);
         assert_eq!(
             tracks
@@ -206,6 +221,12 @@ impl Recorder for Drive {
         media.nwa = None;
         media.sessions = 2;
         media.tracks = 3;
+        let length = if self.fault == Fault::ReadOnlyWithShortTail {
+            self.media().kind = "cd-rom".into();
+            sectors - 2
+        } else {
+            sectors
+        };
         let observed = if self.fault == Fault::Close {
             start + 150
         } else {
@@ -213,7 +234,17 @@ impl Recorder for Drive {
         };
         self.status
             .tracks
-            .push(track(3, 2, i64::from(observed), sectors, false));
+            .push(track(3, 2, i64::from(observed), length, false));
+        Ok(())
+    }
+    fn verify_data_tail(&mut self, path: &Path, start: u32, sectors: u32) -> Result<()> {
+        assert!(self.fault == Fault::ReadOnlyWithShortTail);
+        let manifest = author::load(path.parent().unwrap())?;
+        assert_eq!(
+            (start, sectors),
+            (manifest.session_start, manifest.data_sectors)
+        );
+        self.calls.push("verify_data_tail");
         Ok(())
     }
 }
@@ -231,11 +262,64 @@ fn track(number: u32, session: u32, start: i64, sectors: u32, audio: bool) -> Tr
 }
 
 #[test]
+fn finalized_cdr_can_be_reported_as_read_only_with_two_unreported_sectors() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::ReadOnlyWithShortTail);
+    let complete = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap();
+    assert_eq!(complete.stage, Stage::Complete);
+    assert_eq!(drive.calls.last(), Some(&"verify_data_tail"));
+}
+
+#[test]
+fn automatic_preparation_requires_one_eligible_blank_drive() {
+    let work = Work::new();
+    let blank = Drive::new(&work, Fault::None).status;
+    let mut used = blank.clone();
+    used.id = "used".into();
+    used.media.as_mut().unwrap().blank = false;
+    let mut incompatible = blank.clone();
+    incompatible.id = "incompatible".into();
+    incompatible.capabilities.as_mut().unwrap().tao = false;
+    assert!(burn::select_blank(&[used.clone(), incompatible.clone()]).is_err());
+    assert_eq!(
+        burn::select_blank(&[used, incompatible, blank.clone()])
+            .unwrap()
+            .id,
+        blank.id
+    );
+    let mut another = blank.clone();
+    another.id = "another".into();
+    assert!(burn::select_blank(&[blank, another]).is_err());
+}
+
+#[test]
 fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     let work = Work::new();
+    let catalog = work.root.join("presets.toml");
+    std::fs::write(
+        &catalog,
+        "[profiles.fixture]\ndata_reserve_sectors=300\nintertrack_gap_sectors=75\nangle=12.5\n\
+         [verification.fixture]\ndrive='Another drive'\nrequested_speed=24\n",
+    )
+    .unwrap();
+    let album = std::fs::read_to_string(&work.project).unwrap();
+    let (album, _) = album.split_once("[disc]").unwrap();
+    let album = format!("{album}preset={{file='presets.toml', name='fixture'}}\n");
+    std::fs::write(&work.project, &album).unwrap();
     let mut drive = Drive::new(&work, Fault::None);
     let prepared = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
     assert_eq!(prepared.stage, Stage::Prepared);
+    let wrong_drive = std::process::Command::new(env!("CARGO_BIN_EXE_discimage"))
+        .arg("resume")
+        .arg(&work.job)
+        .args(["--device", "wrong-drive"])
+        .output()
+        .unwrap();
+    assert!(!wrong_drive.status.success());
+    let stderr = String::from_utf8(wrong_drive.stderr).unwrap();
+    assert!(stderr.contains("does not match the recording job's saved drive"));
+    assert!(!stderr.contains('\x1b'));
+    assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::Prepared);
     assert!(drive.calls.is_empty());
     assert!(work.job.join("source/files/empty").is_dir());
     let planned = author::load(&work.job.join("planned")).unwrap();
@@ -243,9 +327,11 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     assert_eq!(planned.plan.disc.capacity_sectors, 360000);
     assert_eq!(planned.plan.estimated_art_end_sector, 13350);
     let original = discimage::project::Project::load(&work.project).unwrap();
+    assert_eq!(original.disc.angle, 12.5);
     assert_eq!(planned.plan.disc.geometry(), original.disc.geometry());
     assert_eq!(planned.session_start, 12085);
     // Existing source files may change without changing the already-prepared job.
+    std::fs::remove_file(catalog).unwrap();
     std::fs::write(work.root.join("one.wav"), b"original later edited").unwrap();
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -264,6 +350,7 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     assert_eq!(actual.data_sectors, 1100);
     assert_eq!(actual.plan.estimated_art_end_sector, 13250);
     assert_eq!(actual.plan.disc.geometry(), original.disc.geometry());
+    assert_eq!(actual.plan.disc.angle, original.disc.angle);
     for lba in [0, 12085, 12385, 13249] {
         let byte = i64::from(lba) * 2352;
         assert_eq!(
@@ -287,6 +374,37 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     );
     assert!(burn::resume(&mut drive, &work.job).is_err());
     assert_eq!(drive.writes(), 2);
+}
+
+#[test]
+fn cd_text_requires_drive_support_and_survives_preparation() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    let config = std::fs::read_to_string(&work.project).unwrap();
+    std::fs::write(
+        &work.project,
+        format!("{config}\n[cd_text]\nartist='Artist'\ntitles=['First','Second']\n"),
+    )
+    .unwrap();
+    let error = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap_err();
+    assert!(format!("{error:#}").contains("does not report CD-Text writing support"));
+    assert!(!work.job.exists());
+
+    drive.status.capabilities.as_mut().unwrap().cd_text = true;
+    let prepared = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    assert_eq!(prepared.stage, Stage::Prepared);
+    assert_eq!(drive.writes(), 0);
+    std::fs::write(&work.project, config).unwrap();
+    let complete = burn::resume(&mut drive, &work.job).unwrap();
+    assert_eq!(complete.stage, Stage::Complete);
+    assert_eq!(
+        drive.written_cd_text,
+        Some((
+            "EP".into(),
+            "Artist".into(),
+            vec!["First".into(), "Second".into()]
+        ))
+    );
 }
 
 #[test]

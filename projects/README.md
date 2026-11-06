@@ -10,14 +10,15 @@ mkdir -p projects/my-album/audio
 ```
 
 放入 44.1 kHz、16 位、双声道 PCM WAV，按顺序编辑 `album.toml` 的
-`[[tracks]]`。路径以 TOML 所在目录为基准。加图后取消注释 `[artwork]`。
+`[[tracks]]`。路径以 TOML 所在目录为基准。加图后取消注释 `[artwork]`。已有标定时可在专辑顶层[引用预设](../calibrations/README.md)。
 
 ```sh
+mkdir -p output/my-album
 discimage plan projects/my-album/album.toml
-discimage template projects/my-album/album.toml --output projects/my-album/templates
-discimage preview projects/my-album/album.toml --output projects/my-album/preview.svg
+discimage template projects/my-album/album.toml --output output/my-album/templates
+discimage preview projects/my-album/album.toml --output output/my-album/preview.svg
 ```
 
 把模板目录里的 `layout.json` 导入网页编辑器。需要离线构建或刻录时，
-使用新输出目录，例如 `projects/my-album/build` 或 `projects/my-album/record`。
-[完整参数示例](../examples/album.toml) · [刻录流程](../docs/recording.md)
+使用新输出目录，例如 `output/my-album/build` 或 `output/my-album/record`。
+[完整参数示例](../examples/album.toml) · [标定配置](../calibrations/README.md) · [刻录流程](../docs/recording.md)

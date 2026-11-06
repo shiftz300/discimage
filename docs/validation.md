@@ -1,4 +1,4 @@
-# Validation — 2026-11-06
+# Validation
 
 Validation was performed locally on macOS. Consumer CD players and full
 Blue Book conformance remain unverified. CI covers three operating systems;
@@ -42,7 +42,7 @@ inner/outer reference pair found about 0.55° residual drift after angular
 correction, compared with roughly 14° before it. This does not establish
 uniform accuracy over the disc. All 38 data-write progress samples that
 reported speed showed 10.1×; discrete samples cannot exclude transients.
-The matched geometry is saved in [examples/sw80eu1.toml](../examples/sw80eu1.toml).
+The matched geometry is saved in the `sw80eu1` [preset](../calibrations/sw80eu1/disc.toml).
 The 0.3.1 reorganization is verified offline and with mocks, without another
 physical erase or burn.
 
@@ -75,6 +75,19 @@ audio tracks matched their WAV files, and all 118630 Mode 1 data sectors
 matched the authored ISO. The observer saw only arcs across all three bands.
 The bands sampled different radii with local prewarps of −120, 0 and +120
 degrees per millimeter. This run produced no usable angular calibration.
+
+## Digital Vinyl AZO CD-R
+
+On 2026-11-07, an Apple SuperDrive (firmware 2.00) recorded and verified a
+single-session Verbatim Digital Vinyl AZO CD-R target. The 36-point read-timing
+fit had a residual RMS of 0.185°. Four photos yielded a radial fit of
+25.05–57.97 mm at 359,846 sectors, with a residual RMS of 0.077 mm.
+
+A second disc from the batch was recorded at requested 24× with six audio tracks
+and 238,887 Mode 1 data sectors starting at LBA 120520. PCM, data and CD-Text
+passed digital verification. The user confirmed the artwork alignment on the
+finished disc. The geometry used for that burn and the photo fit are stored
+in separate tables in the [Digital Vinyl configuration](../calibrations/digital-vinyl/disc.toml).
 
 ## Recording workflow
 

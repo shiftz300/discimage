@@ -1,20 +1,48 @@
 # Recording on macOS
 
-`devices --json` reports a stable IORegistry path as `id`, write capabilities,
-media state and available track details. No optical hardware returns `[]`.
-Use the exact `id` with `burn` or `resume`. A new job requires blank CD-R or CD-RW, the corresponding write capability,
-and both SAO and TAO. The default requested speed is 8×. For CD-RW, request a
-speed supported by the drive and disc. A previously written CD-RW needs a
-separate erase. See the [calibration walkthrough](calibration.md#reusing-cd-rw).
+`devices` shows the drive ID, write capabilities and the current disc state.
+Use `devices --json` for the same data plus per-track details. A new job
+requires a blank CD-R or CD-RW and a drive that supports writing that medium
+with both SAO and TAO. The default requested speed is 8×. Choose a speed
+supported by your drive and disc. A used CD-RW needs a separate erase.
+See the [calibration walkthrough](calibration.md#reusing-cd-rw).
 
 ```sh
-discimage burn album.toml --device 'IORegistry id' --output record --dry-run
-discimage resume record --device 'IORegistry id'
+discimage devices
+discimage prepare album.toml --output record --speed 8
+open record/planned/preview.svg
+discimage resume record
 ```
 
-`burn` without `--dry-run` proceeds to recording after preparation. Dry run
-reads drive status, snapshots inputs, builds and verifies the provisional bundle,
-then stops. It neither reserves nor sends a write command to the drive.
+`prepare` selects the only eligible drive, snapshots inputs, and builds and
+verifies the provisional bundle without reserving or writing the disc. Use
+`--device 'DRIVE_ID'` if several drives qualify. `resume` uses the saved drive
+ID and speed. An optional `--device` must match that saved ID.
+
+For a single command that prepares and writes immediately, use
+`discimage burn album.toml --device 'DRIVE_ID' --output record`.
+`burn --dry-run` is equivalent to `prepare`.
+
+For a matching CD-R preset, `burn --blank-cdr CAPACITY_SECTORS` selects and
+reserves the only eligible blank drive at that exact reported capacity. Use the
+capacity from the preset as the expected value. With multiple eligible drives,
+also pass `--device`. The disc is checked again before writing audio.
+
+## CD-Text
+
+Set the optional block below to write the project's `title`, the performer,
+and the track titles in the first audio session.
+
+```toml
+[cd_text]
+artist = "Artist"
+titles = ["First track", "Second track"]
+```
+
+Use printable ASCII and list one title per WAV in track order. Preparation
+checks drive support and rejects text that DiscRecording would alter or
+truncate. After recording, use `drutil cdtext` with a drive that can read
+CD-Text to confirm the fields on the disc.
 
 ## Transaction
 
@@ -81,10 +109,13 @@ Ctrl+C requests DiscRecording abort during a write. During music readback and
 offline preparation it stops before the next write. If a write was started,
 inspect the media and the journal before any further operation. There is no
 erase or overburn path.
-The CLI logs stage changes and reports every 15 seconds during long stages.
-Percentage and speed come from DiscRecording when available. The elapsed
-time and time since the last change also appear when the system reports no
-new progress.
+The CLI writes diagnostics and progress to stderr. On Terminal.app, labels
+use basic ANSI colors. Redirect stderr to save a plain-text log, or set
+`NO_COLOR=1` to keep plain text in an interactive terminal. During writing,
+the drive status updates on phase changes, on progress milestones and at
+least every 15 seconds while DiscRecording continues reporting. Percentage
+and speed are shown when available. Elapsed time and time since the last
+change help distinguish a slow stage from one that is progressing.
 
 ## Backend and acceptance
 

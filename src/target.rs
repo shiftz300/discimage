@@ -147,9 +147,13 @@ pub(crate) struct Target {
 
 impl Target {
     pub fn new(plan: &Plan) -> Self {
+        Self::for_range(plan.estimated_art_start_sector..plan.estimated_art_end_sector)
+    }
+
+    pub(crate) fn for_range(range: Range<u32>) -> Self {
         // Keep clear space before, between and after the marks. Integer LBAs
         // bind each boundary to the bytes actually sent to the drive.
-        let edge = |percent| plan.estimated_art_start_sector + plan.artwork_sectors * percent / 100;
+        let edge = |percent| range.start + (range.end - range.start) * percent / 100;
         Self {
             format: "discimage-target-v1".into(),
             bands: [

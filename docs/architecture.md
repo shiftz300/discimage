@@ -25,13 +25,13 @@ until another backend introduces substantial native dependencies.
 | `main`, `guide` | CLI commands and interactive calibration prompts |
 
 `native/macos.m` wraps DiscRecording and is built only on macOS.
-`mark.html` is the self-contained photo point picker embedded by `calibrate`.
+`assets/mark.html` is the self-contained photo point picker embedded by `calibrate`.
 `tools/phase.py` is a separate, standard-library Python experiment for comparing
 external CD timing geometry with photo curves. `timing` consumes its report and
 the probe's numeric measurements, converts the model to ordinary `Disc` geometry,
 and exports a separate candidate. `disc.timing` carries evidence hashes and the
 valid encoding range; `layout` enforces that range, including after an NWA rebuild.
-No new spiral or native drive implementation is introduced. `timing.html` compares
+No new spiral or native drive implementation is introduced. `assets/timing.html` compares
 old and candidate designs projected into the measured model; it is not an optical
 simulation or independent validation. Probe acquisition stays in external Python.
 Pure rendering and configuration do not depend on the calibration workflow;
@@ -99,7 +99,7 @@ new recorder must preserve reservation, NWA and finalization semantics.
 ## Validation boundaries
 
 `tests/offline.rs` checks complete bundles, image orientation, calibration and
-unchanged media bytes. `tests/encoding.json` pins pre-refactor ISO/RAW and
+unchanged media bytes. `tests/fixtures/encoding.json` pins pre-refactor ISO/RAW and
 preview hashes for four drawing modes. `tests/recording.rs` exercises the real
 authoring pipeline with a mock recorder, including capacity limits, changed
 NWA, interruption and immutable snapshots. macOS tests exercise framework

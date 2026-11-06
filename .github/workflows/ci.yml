@@ -1,6 +1,9 @@
 name: CI
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     strategy:
@@ -9,6 +12,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -16,3 +21,82 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked -- --help
+
+  package:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos-x64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux-x64
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows-x64
+            rustflags: -C target-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      PACKAGE: discimage-${{ github.ref_name }}-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and check version
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          cargo build --release --locked --target "$TARGET"
+          binary=discimage
+          if [[ "$RUNNER_OS" == Windows ]]; then binary=discimage.exe; fi
+          mkdir -p "bundle/$PACKAGE" dist
+          cp "target/$TARGET/release/$binary" LICENSE NOTICE.md "bundle/$PACKAGE/"
+          [[ "$("bundle/$PACKAGE/$binary" --version)" == "discimage ${GITHUB_REF_NAME#v}" ]]
+          "bundle/$PACKAGE/$binary" --help
+      - name: Archive executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "dist/$PACKAGE.tar.gz" -C bundle "$PACKAGE"
+      - name: Archive executable on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "bundle/$env:PACKAGE" -DestinationPath "dist/$env:PACKAGE.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish archives and checksums
+        working-directory: dist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prefix="discimage-$GITHUB_REF_NAME"
+          archives=("$prefix-macos-arm64.tar.gz" "$prefix-macos-x64.tar.gz"
+                    "$prefix-linux-x64.tar.gz" "$prefix-windows-x64.zip")
+          sha256sum "${archives[@]}" > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" "${archives[@]}" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
