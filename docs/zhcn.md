@@ -13,7 +13,7 @@
 ## 安装
 
 从 [GitHub Releases](https://github.com/shiftz300/discimage/releases/latest) 下载适合自己系统的预编译包。
-解压前用 `SHA256SUMS.txt` 核对压缩包的 SHA-256，解压后即可使用里面的可执行文件。
+解压前对照 `SHA256SUMS.txt` 核对压缩包。macOS 用 `shasum -a 256 <压缩包>`，Linux 用 `sha256sum <压缩包>`，Windows PowerShell 用 `Get-FileHash <压缩包>`。把 `<压缩包>` 换成下载的文件名。
 
 | 系统 | 压缩包后缀 |
 | --- | --- |

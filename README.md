@@ -13,7 +13,7 @@ Make a music CD with artwork in the outer ring. Plan, design and build on macOS,
 ## Install
 
 Download the prebuilt archive for your system from [GitHub Releases](https://github.com/shiftz300/discimage/releases/latest).
-Compare its SHA-256 with `SHA256SUMS.txt` before extracting. Use the executable inside the archive.
+Before extracting, compare the archive's hash with `SHA256SUMS.txt`. Use `shasum -a 256 <archive>` on macOS, `sha256sum <archive>` on Linux, or `Get-FileHash <archive>` in PowerShell. Replace `<archive>` with the downloaded filename.
 
 | System | Archive suffix |
 | --- | --- |

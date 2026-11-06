@@ -312,9 +312,11 @@ fn verify_pcm(disc: &File, tracks: &[Music]) -> Result<()> {
             wav.read_exact(&mut expected[..len])?;
             disc.read_exact_at(&mut actual[..len], u64::from(lba) * SECTOR_BYTES as u64)
                 .with_context(|| format!("cannot read track {number} at LBA {lba}"))?;
-            if let Some(offset) = actual[..len]
-                .chunks_exact(SECTOR_BYTES)
-                .zip(expected[..len].chunks_exact(SECTOR_BYTES))
+            let (actual_sectors, _) = actual[..len].as_chunks::<SECTOR_BYTES>();
+            let (expected_sectors, _) = expected[..len].as_chunks::<SECTOR_BYTES>();
+            if let Some(offset) = actual_sectors
+                .iter()
+                .zip(expected_sectors)
                 .position(|(a, b)| a != b)
             {
                 anyhow::bail!(
