@@ -7,7 +7,7 @@ use discimage::{
     layout::Plan,
     preview,
     project::{Artwork, Project},
-    template,
+    template, timing,
 };
 
 mod guide;
@@ -111,6 +111,36 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum Calibration {
+    /// Run an external discprobe-macos checkout with live read-only progress.
+    Probe {
+        #[arg(long)]
+        probe_dir: PathBuf,
+        #[arg(long, default_value = "python3")]
+        python: PathBuf,
+        #[arg(long)]
+        device: String,
+        /// Absolute LBA interval, end exclusive; use a recorded Mode 1 data track.
+        #[arg(long)]
+        first: u32,
+        #[arg(long)]
+        end: u32,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Import external CD timing and a photo phase report into a separate candidate.
+    Import {
+        project: PathBuf,
+        #[arg(long)]
+        timing: PathBuf,
+        #[arg(long)]
+        phase: PathBuf,
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        size: u32,
+    },
     /// Walk through target recording, photo measurements and fitting in one directory.
     Guide(guide::Options),
     /// Generate a standalone three-band calibration project with a silent music track.
@@ -149,6 +179,31 @@ fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Calibrate(command) => match command {
+            Calibration::Probe {
+                probe_dir,
+                python,
+                device,
+                first,
+                end,
+                output,
+            } => {
+                timing::probe(&probe_dir, &python, &device, first, end, &output)?;
+            }
+            Calibration::Import {
+                project,
+                timing: summary,
+                phase,
+                bundle,
+                output,
+                size,
+            } => {
+                timing::import(&project, &summary, &phase, &bundle, &output, size)?;
+                println!(
+                    "Open {}. Separate candidate: {}. No disc accessed; physical validation pending.",
+                    output.join("index.html").display(),
+                    output.join("candidate.toml").display()
+                );
+            }
             Calibration::Guide(options) => guide::run(options)?,
             Calibration::Target {
                 output,

@@ -137,6 +137,9 @@ pub struct Disc {
     pub phase_target: Option<crate::target::PhaseTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration: Option<Profile>,
+    /// Evidence and valid encoding range for an experimental timing candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<crate::timing::Evidence>,
 }
 
 impl Default for Disc {
@@ -154,6 +157,7 @@ impl Default for Disc {
             calibration_target: false,
             phase_target: None,
             calibration: None,
+            timing: None,
         }
     }
 }

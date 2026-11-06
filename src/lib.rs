@@ -14,6 +14,7 @@ pub mod project;
 mod spiral;
 pub mod target;
 pub mod template;
+pub mod timing;
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

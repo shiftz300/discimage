@@ -2,7 +2,7 @@
 
 [English](../README.md)
 
-用 Rust 编写的音乐光盘与外圈绘图 CLI，当前版本 **0.3.1**。
+用 Rust 编写的音乐光盘与外圈绘图 CLI，当前版本 **0.3.2**。
 按专辑实际长度分配音乐区和外圈图案，支持圆盘图、长条环绕、模板及完整预览。
 macOS、Windows、Linux 均可离线制作，**目前只有 macOS 支持直接刻录**。
 
@@ -94,6 +94,10 @@ discimage resume record --device 'DRIVE_ID'
 步骤见 [校准说明](calibration.md)。角向对齐还需要合适的螺旋参数。
 [SW80EU1 / GX40N 配置](../examples/sw80eu1.toml) 保留了实测组合的参数，
 其他盘片和设备需要单独验证。模板、预览和刻录使用相同模型。
+
+实验性的 [读取计时校准](timing.md) 可复用现有数据轨和照片，减少标定重刻。
+`calibrate probe` 调用外置 discprobe-macos，实时显示进度；`calibrate import`
+在全平台离线生成独立候选配置及可缩放的对比页。原配置保留，候选仍需实物验证。
 
 当前实现音乐在前、Mode 1 数据在后的双会话布局；完整 Blue Book CD Extra/XA 合规及
 消费级播放器兼容性仍未验收。带会话偏移的 ISO 和分开的 CUE/TOC 不能直接当作通用整盘镜像。

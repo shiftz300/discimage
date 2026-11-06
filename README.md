@@ -3,7 +3,7 @@
 [简体中文](docs/zhcn.md)
 
 A Rust CLI for music CDs with visible artwork in the remaining outer ring.
-Version **0.3.1**. Offline authoring, templates and previews work on macOS,
+Version **0.3.2**. Offline authoring, templates and previews work on macOS,
 Windows and Linux. Drive recording is currently available on **macOS**.
 
 Inspired by **[DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio)**
@@ -100,6 +100,11 @@ The CLI provides a [guided radial calibration](docs/calibration.md). Angular
 alignment also depends on the spiral model. The tested
 [SW80EU1 / GX40N settings](examples/sw80eu1.toml) are an example for that setup,
 not a universal preset. Templates, previews and recording share the same model.
+
+Experimental [read-timing calibration](docs/timing.md) reuses a data track and
+photograph. `calibrate probe` runs external discprobe-macos with live progress;
+`calibrate import` produces a separate project and interactive comparison.
+Offline import works on every platform. Candidates still need physical validation.
 
 This is a music-first, two-session Mode 1 layout. Full Blue Book CD Extra/XA
 compliance and consumer-player compatibility remain unverified. A bundle's

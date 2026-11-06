@@ -109,6 +109,13 @@ impl Plan {
             capacity
         );
         let end = capacity - tail;
+        if let Some(timing) = &disc.timing {
+            timing.validate()?;
+            ensure!(
+                start >= u64::from(timing.first_sector) + 2 && end <= u64::from(timing.end_sector),
+                "artwork exceeds the measured timing range (including CIRC guard); adjust reserves or measure a wider range"
+            );
+        }
         if let Some(target) = &disc.phase_target {
             ensure!(
                 !disc.calibration_target,
@@ -122,7 +129,9 @@ impl Plan {
             !disc.calibration_target || outer - inner >= 4.0,
             "the calibration target needs at least 4 mm of radial drawing space"
         );
-        let model = if disc.calibration.is_some() {
+        let model = if disc.timing.is_some() {
+            "constant-pitch-timing-candidate-v1"
+        } else if disc.calibration.is_some() {
             "constant-pitch-radial-fit-v1"
         } else {
             "constant-pitch-area-estimate-v1"
@@ -156,7 +165,9 @@ impl Plan {
     }
 
     pub fn geometry_label(&self) -> &'static str {
-        if self.disc.calibration.is_some() {
+        if self.disc.timing.is_some() {
+            "Timing candidate · assumed radial scale · physical validation pending"
+        } else if self.disc.calibration.is_some() {
             "Radially calibrated · constant-pitch model"
         } else {
             "Uncalibrated geometry estimate"

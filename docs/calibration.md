@@ -9,6 +9,10 @@ English. Calibration has two separate parts:
 - **Angular:** `disc.velocity` and `disc.angle` control the spiral mapping.
   A radial fit alone cannot straighten bent lettering or guarantee contrast.
 
+For a readable disc with visible artwork, try the experimental
+[read-timing/photo comparison](timing.md) before recording another target.
+It reuses existing evidence and does not change the saved preset.
+
 ## Guided radial fit
 
 Use a blank 120 mm CD-R or CD-RW and repeat the same command to continue:

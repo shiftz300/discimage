@@ -155,4 +155,26 @@ mod tests {
         }
         assert_eq!(residues.len(), 24);
     }
+
+    #[test]
+    fn inverse_origin_is_111_frames_before_forward_circ() {
+        // Independent forward path, ECMA-130 figure C.4. This checks the
+        // coordinate convention used when comparing artwork with drive timing;
+        // 111 is NOT a measured firmware/read-completion delay.
+        let codec = Codec::default();
+        let words = [0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11];
+        for lba in [0, 120520, 359000] {
+            for offset in 0..COOKED {
+                let swapped = (i64::from(lba) * RAW as i64 + 16 + offset as i64) ^ 1;
+                let input = swapped.rem_euclid(24);
+                let word = words.iter().position(|&w| w == input / 2).unwrap() as i64;
+                let packed = word * 2 + input % 2;
+                let slot = packed + if packed >= 12 { 4 } else { 0 };
+                let delay =
+                    slot * 4 + if slot < 12 { 2 } else { 0 } + if slot % 2 == 0 { 1 } else { 0 };
+                let forward = swapped.div_euclid(24) + delay;
+                assert_eq!(forward - codec.physical(lba, offset).div_euclid(24), 111);
+            }
+        }
+    }
 }

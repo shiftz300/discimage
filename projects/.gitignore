@@ -1,0 +1,6 @@
+/*
+!/.gitignore
+!/README.md
+!/template/
+/template/*
+!/template/album.toml

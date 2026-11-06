@@ -118,6 +118,42 @@ pub(crate) fn png(image: &RgbaImage, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Predict the spatial placement of a design encoded by `source` when its
+/// sectors lie on `measured`. Both models share an angle anchor. This compares
+/// geometric mappings only; it is not a simulated readback or optical response.
+pub(crate) fn projected(
+    source: &Plan,
+    artwork: Option<&Artwork>,
+    measured: &Plan,
+    size: u32,
+) -> Result<RgbaImage> {
+    let drawing = Drawing::new(source, artwork)?;
+    let from = Spiral::new(&source.disc);
+    let to = Spiral::new(&measured.disc);
+    let mut image = render(measured, None, size)?;
+    let half = f64::from(size) / 2.0;
+    let scale = 126.0 / f64::from(size);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let dx = (f64::from(x) + 0.5 - half) * scale;
+        let dy = (f64::from(y) + 0.5 - half) * scale;
+        let radius = dx.hypot(dy);
+        let sector = to.sector(radius);
+        if sector >= f64::from(measured.estimated_art_start_sector)
+            && sector < f64::from(measured.estimated_art_end_sector)
+            && sector >= f64::from(source.estimated_art_start_sector)
+            && sector < f64::from(source.estimated_art_end_sector)
+        {
+            let r = from.radius(sector);
+            let angle = dy.atan2(dx) + from.angle(r) - to.angle(radius);
+            if let Some(v) = drawing.design(r * angle.cos(), r * angle.sin(), sector as u32, (x, y))
+            {
+                *pixel = Rgba([v, v, v, 255]);
+            }
+        }
+    }
+    Ok(image)
+}
+
 const MUSIC: [u8; 4] = [105, 157, 211, 255];
 const GAP: [u8; 4] = [226, 117, 127, 255];
 const SESSION: [u8; 4] = [216, 164, 92, 255];
@@ -348,5 +384,53 @@ mod tests {
             escape("<EP & \"friends\">"),
             "&lt;EP &amp; &quot;friends&quot;&gt;"
         );
+    }
+
+    #[test]
+    fn measured_projection_has_the_correct_rotation_for_both_image_modes() {
+        use crate::{
+            audio::AudioTrack,
+            project::{Disc, Mode},
+        };
+        let path =
+            std::env::temp_dir().join(format!("discimage-projection-{}.png", std::process::id()));
+        let source = RgbaImage::from_fn(80, 80, |x, _| {
+            if x < 40 {
+                Rgba([0, 0, 0, 255])
+            } else {
+                Rgba([255; 4])
+            }
+        });
+        source.save(&path).unwrap();
+        let plan = Plan::new(
+            "rotation".into(),
+            Disc::default(),
+            vec![AudioTrack {
+                path: "unused.wav".into(),
+                sample_frames: 176400,
+                sectors: 300,
+                padding_sample_frames: 0,
+                data_offset: 44,
+            }],
+        )
+        .unwrap();
+        let mut measured = plan.clone();
+        measured.disc.angle = 90.0;
+        for mode in [Mode::Disc, Mode::Strip] {
+            let art = Artwork {
+                path: path.clone(),
+                mode,
+                ..Artwork::default()
+            };
+            let reference = render(&plan, Some(&art), 256).unwrap();
+            let rotated = projected(&plan, Some(&art), &measured, 256).unwrap();
+            // Image coordinates increase clockwise. A +90° placement means
+            // sampling design at (dy,-dx); this expectation is independent of
+            // the projection's angle arithmetic.
+            for (x, y) in [(210, 150), (150, 210), (45, 105), (105, 45)] {
+                assert_eq!(rotated.get_pixel(x, y), reference.get_pixel(y, 255 - x));
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -14,6 +14,200 @@ use discimage::{
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn timing_import_roundtrips_candidate_and_rejects_changed_evidence() {
+    use serde_json::json;
+    let temp = Temp::new();
+    wav(&temp.0.join("track.wav"), 300 * 588, 44100);
+    let image = image::RgbaImage::from_fn(160, 80, |x, y| {
+        let value = if (x / 20 + y / 10) % 2 == 0 { 0 } else { 255 };
+        image::Rgba([value, value, value, 255])
+    });
+    image.save(temp.0.join("art.png")).unwrap();
+    let settings = "title='timing test'\n[[tracks]]\npath='track.wav'\n[disc]\ncapacity_sectors=14000\ninner_radius_mm=25\nouter_radius_mm=25.5\ndata_reserve_sectors=300\n[artwork]\npath='art.png'\nmode='strip'\n";
+    let project = temp.0.join("project.toml");
+    std::fs::write(&project, settings).unwrap();
+    let bundle = temp.0.join("bundle");
+    author::build(&project, &bundle, None).unwrap();
+    let bit: f64 = 1200.0 / (75.0 * 57624.0);
+    let v = (25.5f64.powi(2) - 25.0f64.powi(2)) * std::f64::consts::PI
+        / (bit * bit * 57624.0 * 14000.0);
+    let shift = 92.0;
+    let u = (25.0f64.powi(2) / (bit * bit) - v * shift * 588.0 / std::f64::consts::PI).sqrt();
+    let summary = json!({"fit": {"u":u,"v":v,"media":"cd","sector_bits":57624,
+        "read_tail_frames":108,"residual_rms_deg":0.05,"angle_sigma_measured_span_deg":0.1,
+        "reference_lba":12500},"cache":{"strategy":"fua","fua_reads_media":true},
+        "setup":{"readable_lba_range":[0,14000]}});
+    let timing = temp.0.join("summary.json");
+    std::fs::write(&timing, summary.to_string()).unwrap();
+    let targets = temp.0.join("targets.csv");
+    let mut csv = "lba,n_bits,used,period_ms\n".to_string();
+    for s in [11800u32, 12000, 12300, 12800, 13200, 13500, 13800, 13900] {
+        csv.push_str(&format!(
+            "{s},{},32,29\n",
+            (u64::from(s) + 1) * 57624 + 108 * 588
+        ));
+    }
+    std::fs::write(&targets, &csv).unwrap();
+    let phase = temp.0.join("phase.json");
+    let report = json!({"format":"discimage-phase-report-v1","origin_frames":111,
+        "joint":{"shift_frames":shift,"forward_offset_frames":19,"rms_deg":0.05},
+        "curves":{"a":{},"b":{}},
+        "holdouts":[{"rms_deg":0.1,"max_deg":0.2},{"rms_deg":0.1,"max_deg":0.2}],
+        "sources":{"timing_sha256":author::digest(&timing).unwrap(),
+            "targets_sha256":author::digest(&targets).unwrap(),
+            "manifest_sha256":author::digest(&bundle.join("manifest.json")).unwrap(),
+            "evidence_hash_verified":true}});
+    std::fs::write(&phase, report.to_string()).unwrap();
+    let output = temp.0.join("candidate");
+    let run = Command::new(env!("CARGO_BIN_EXE_discimage"))
+        .args(["calibrate", "import"])
+        .arg(&project)
+        .arg("--timing")
+        .arg(&timing)
+        .arg("--phase")
+        .arg(&phase)
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--output")
+        .arg(&output)
+        .args(["--size", "256"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let candidate = Project::load(&output.join("candidate.toml")).unwrap();
+    assert!(candidate.tracks[0].path.is_absolute());
+    assert_eq!(std::fs::read_to_string(&project).unwrap(), settings);
+    assert!(!output.join("incomplete").exists());
+    assert!(candidate.disc.timing.is_some());
+    assert!((candidate.disc.inner_radius_mm - 25.0).abs() < 1e-10);
+    assert_eq!(candidate.disc.timing.as_ref().unwrap().end_sector, 13901);
+    let plan = Plan::from_project(&candidate, None).unwrap();
+    let evidence = candidate.disc.timing.as_ref().unwrap();
+    let codec = discimage::codec::Codec::default();
+    for sector in [
+        plan.estimated_art_start_sector,
+        plan.estimated_art_end_sector - 1,
+    ] {
+        for offset in 0..2048 {
+            let physical = codec.physical(sector, offset) as f64 / 2352.0;
+            assert!(
+                physical >= f64::from(evidence.first_sector)
+                    && physical < f64::from(evidence.end_sector)
+            );
+        }
+    }
+    let converted = temp.0.join("converted");
+    author::build(&output.join("candidate.toml"), &converted, None).unwrap();
+    author::verify(&converted).unwrap();
+    // Independent bundle hashes prove that the same geometry reaches encoding.
+    assert_eq!(
+        author::digest(&bundle.join("session2.iso")).unwrap(),
+        author::digest(&converted.join("session2.iso")).unwrap()
+    );
+    for mode in [Mode::Disc, Mode::Strip] {
+        let mut p = Project::load(&output.join("candidate.toml")).unwrap();
+        p.artwork.as_mut().unwrap().mode = mode;
+        let plan = Plan::from_project(&p, None).unwrap();
+        preview::save(
+            &plan,
+            p.artwork.as_ref(),
+            &temp.0.join(format!("{mode:?}.png")),
+            256,
+        )
+        .unwrap();
+    }
+    let hash = author::digest(&output.join("candidate.toml")).unwrap();
+    assert!(discimage::timing::import(&project, &timing, &phase, &bundle, &output, 256).is_err());
+    assert_eq!(
+        hash,
+        author::digest(&output.join("candidate.toml")).unwrap()
+    );
+    // A changed targets file cannot silently broaden trusted coverage.
+    std::fs::write(&targets, csv.replace("13900,", "13950,")).unwrap();
+    let rejected = temp.0.join("rejected");
+    assert!(discimage::timing::import(&project, &timing, &phase, &bundle, &rejected, 256).is_err());
+    assert!(!rejected.exists());
+    std::fs::write(&targets, &csv).unwrap();
+    for (key, value) in [
+        ("media", json!("dvd")),
+        ("read_tail_frames", json!(111)),
+        ("residual_rms_deg", json!(0.5)),
+    ] {
+        let mut invalid = summary.clone();
+        invalid["fit"][key] = value;
+        std::fs::write(&timing, invalid.to_string()).unwrap();
+        assert!(
+            discimage::timing::import(&project, &timing, &phase, &bundle, &rejected, 256).is_err()
+        );
+        assert!(!rejected.exists());
+    }
+    std::fs::write(&timing, summary.to_string()).unwrap();
+    std::fs::write(temp.0.join("status.json"), r#"{"completed":false}"#).unwrap();
+    assert!(discimage::timing::import(&project, &timing, &phase, &bundle, &rejected, 256).is_err());
+    // A later NWA/layout change cannot move drawing outside the measured span.
+    let mut p = Project::load(&output.join("candidate.toml")).unwrap();
+    p.disc.end_margin_sectors = 0;
+    assert!(Plan::from_project(&p, None).is_err());
+    p.disc.end_margin_sectors = 150;
+    p.disc.timing.as_mut().unwrap().first_sector = 12500;
+    assert!(Plan::from_project(&p, None).is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn external_probe_streams_output_and_rejects_a_swallowed_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = Temp::new();
+    let checkout = temp.0.join("checkout");
+    std::fs::create_dir_all(checkout.join("discprobe")).unwrap();
+    std::fs::write(checkout.join("discprobe/__main__.py"), "").unwrap();
+    let python = temp.0.join("python");
+    std::fs::write(
+        &python,
+        r#"#!/usr/bin/env python3
+import json, pathlib, sys
+if '--help' in sys.argv:
+    print('--ranges')
+elif '-c' in sys.argv:
+    pass
+else:
+    assert sys.argv[1:7] == ['-u', '-m', 'discprobe', 'geo', '--drive', 'test drive']
+    assert sys.argv[7:10] == ['--ranges', '12000-14000', '--out']
+    output = pathlib.Path(sys.argv[-1])
+    if output.name == 'failed':
+        print('stopped: synthetic failure', flush=True)
+    else:
+        (output / 'geo-test').mkdir()
+        (output / 'geo-test/summary.json').write_text(json.dumps({'fit': {'media': 'cd'}}))
+        print('measured target 1', flush=True)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let success = temp.0.join("success");
+    discimage::timing::probe(&checkout, &python, "test drive", 12000, 14000, &success).unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(success.join("probe.json")).unwrap()).unwrap();
+    assert_eq!(receipt["completed"], true);
+    assert!(
+        std::fs::read_to_string(success.join("progress.log"))
+            .unwrap()
+            .contains("measured target 1")
+    );
+    let failed = temp.0.join("failed");
+    assert!(
+        discimage::timing::probe(&checkout, &python, "test drive", 12000, 14000, &failed).is_err()
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(failed.join("probe.json")).unwrap()).unwrap();
+    assert_eq!(receipt["completed"], false);
+}
+
 struct Temp(PathBuf);
 
 impl Temp {

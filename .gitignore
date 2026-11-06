@@ -5,3 +5,4 @@
 *.flac
 *.bin
 *.iso
+__pycache__/

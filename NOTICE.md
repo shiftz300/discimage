@@ -30,3 +30,11 @@ DiscImageStudio's LICENSE; it is the standard GNU GPL v3 text.
 
 Rust dependencies retain their own licenses. Audio, artwork, standards and
 other user-provided resources retain their original rights.
+
+The experimental timing importer and phase comparison use the CD `u/v` model
+and read-end conventions documented by
+[Ashley-QwQ/disc-probe](https://github.com/Ashley-QwQ/disc-probe)
+(`934bb784202dfadc420aa39355a0f31ac08e7614`). The external macOS acquisition tool is
+[NaiveTomcat/discprobe-macos](https://github.com/NaiveTomcat/discprobe-macos),
+also GPL-3.0-or-later. Its Python engine and native helper remain external;
+discimage adds result validation, coordinate conversion and candidate previews.

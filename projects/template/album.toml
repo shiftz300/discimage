@@ -1,0 +1,13 @@
+title = "My album"
+
+# 按播放顺序添加或删除曲目；路径相对本文件。
+[[tracks]]
+path = "audio/01.wav"
+
+# 导出模板、完成构图后，可用网页生成的 [artwork] 段替换下面的示例。
+# [artwork]
+# path = "artwork.png"
+# mode = "disc"   # disc：方图裁切；strip：长条环绕
+# rotation = 0.0
+
+# 校准完成后，再按需要添加 [disc] 设置。省略时使用 CLI 默认值。

@@ -18,6 +18,7 @@ until another backend introduces substantial native dependencies.
 | `preview` | Design report, ISO payload projection and difference image |
 | `template` | Editable canvases and masks derived from the album layout |
 | `calibrate` | Target export, local photo picker and radial fitting |
+| `timing` | External probe invocation, measured-coverage import and candidate conversion |
 | `burn` | Journaled two-session state machine, snapshots and recovery |
 | `device` | Device descriptions, discovery and the backend interface |
 | `macos` | Owned JSON FFI adapter and PCM readback |
@@ -25,6 +26,14 @@ until another backend introduces substantial native dependencies.
 
 `native/macos.m` wraps DiscRecording and is built only on macOS.
 `mark.html` is the self-contained photo point picker embedded by `calibrate`.
+`tools/phase.py` is a separate, standard-library Python experiment for comparing
+external CD timing geometry with photo curves. `timing` consumes its report and
+the probe's numeric measurements, converts the model to ordinary `Disc` geometry,
+and exports a separate candidate. `disc.timing` carries evidence hashes and the
+valid encoding range; `layout` enforces that range, including after an NWA rebuild.
+No new spiral or native drive implementation is introduced. `timing.html` compares
+old and candidate designs projected into the measured model; it is not an optical
+simulation or independent validation. Probe acquisition stays in external Python.
 Pure rendering and configuration do not depend on the calibration workflow;
 `calibrate` re-exports its former public configuration types for compatibility.
 
