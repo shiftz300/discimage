@@ -1,14 +1,33 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    ops::Range,
     path::Path,
 };
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::codec::RAW;
+
 pub const SAMPLES_PER_SECTOR: u32 = 588;
 pub const SECTORS_PER_SECOND: u32 = 75;
+
+pub(crate) fn track_path(index: usize) -> String {
+    format!("audio/{:02}.wav", index + 1)
+}
+
+/// Compute INDEX 01 ranges from (track sectors, pregap sectors).
+/// The first pregap is before disc LBA 0.
+pub(crate) fn track_ranges(
+    tracks: impl Iterator<Item = (u32, u32)>,
+) -> impl Iterator<Item = Range<u32>> {
+    tracks.enumerate().scan(0, |end, (index, (sectors, gap))| {
+        let start = *end + if index == 0 { 0 } else { gap };
+        *end = start + sectors;
+        Some(start..*end)
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioTrack {
@@ -116,7 +135,7 @@ pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
     input.seek(SeekFrom::Start(track.data_offset))?;
     let mut output =
         std::io::BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path)?);
-    let bytes = track.sectors * 2352;
+    let bytes = track.sectors * RAW as u32;
     header(&mut output, bytes)?;
     let expected = u64::from(track.sample_frames) * 4;
     ensure!(
@@ -130,7 +149,7 @@ pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
 
 pub(crate) fn silence(path: &Path) -> Result<()> {
     let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let bytes = 300 * 2352;
+    let bytes = 300 * RAW as u32;
     header(&mut output, bytes)?;
     output.set_len(44 + u64::from(bytes))?;
     Ok(())
@@ -142,12 +161,12 @@ pub(crate) fn extend_normalized(path: &Path, sectors: u32) -> Result<()> {
     ensure!(
         track.data_offset == 44
             && track.padding_sample_frames == 0
-            && wav.metadata()?.len() == 44 + u64::from(track.sectors) * 2352
+            && wav.metadata()?.len() == 44 + u64::from(track.sectors) * RAW as u64
             && sectors == track.sectors + 1,
         "expected a normalized WAV and one additional sector"
     );
     let bytes = sectors
-        .checked_mul(2352)
+        .checked_mul(RAW as u32)
         .filter(|&size| size <= u32::MAX - 36)
         .context("padded WAV exceeds the RIFF size limit")?;
     wav.set_len(44 + u64::from(bytes))?;

@@ -2,8 +2,8 @@
 
 > [!WARNING]
 > **SAFETY WARNING · 刻录前必读**
-> - **先用 `prepare` 预演，并确认选中的光驱和盘片。**
-> - **`burn`、`resume` 和标定刻录都会写盘。CD‑R 刻后无法擦除，擦除 CD‑RW 会清空盘内数据。**
+> - **先用 `burn --dry-run` 预演，并确认选中的光驱和盘片。**
+> - **`burn` 和标定刻录都会写盘。CD‑R 刻后无法擦除，擦除 CD‑RW 会清空盘内数据。**
 > - **只用光驱和盘片都支持的速度。请勿以管理员权限运行，写入期间请勿拔掉光驱。写入失败先看作业日志，再决定是否重试。**
 
 [English](../README.md)
@@ -38,7 +38,17 @@ $env:Path = "$((Get-Location).Path);$env:Path"
 discimage --version
 ```
 
-上述命令把可执行文件加入当前终端的 PATH。主要功能直接运行即可。可选的 `calibrate probe` 需要外置 DiscProbe 和 Python。macOS 发布包未经 Apple 公证。如果系统拦截已核对的下载，请按 [Apple 的说明打开受信任的程序](https://support.apple.com/zh-cn/102445)。
+上述命令把可执行文件加入当前终端的 PATH。可执行文件包含 macOS 和 Windows 的 CD 读取计时探测，以及离线照片相位比较。macOS 发布包未经 Apple 公证。如果系统拦截已核对的下载，请按 [Apple 的说明打开受信任的程序](https://support.apple.com/zh-cn/102445)。
+
+可选：在当前 zsh 窗口启用 Tab 补全。
+
+```sh
+autoload -Uz compinit && compinit
+source <(discimage completions zsh)
+```
+
+把这两行放到 `~/.zshrc` 中 PATH／别名设置之后，可在新窗口自动加载。
+也支持 `bash`、`fish`、`powershell` 和 `elvish`；生成脚本不访问光驱。
 
 ## 规划与预览
 
@@ -55,14 +65,44 @@ path = "artwork.png"
 mode = "strip"
 ```
 
+在 `album.toml` 所在的专辑目录运行。
+
 ```sh
-mkdir output
 discimage plan album.toml
+mkdir -p output
 discimage template album.toml --output output/templates
 discimage preview album.toml --output output/preview.svg
 ```
 
 输出的父目录只需创建一次，每次导出使用新路径。图片还没做完时也可以先生成模板。用浏览器打开 SVG。`strip` 从 12 点顺时针环绕，长条上边对应外缘。`mode = "disc"` 将图片居中并裁到可绘制的圆环。支持 PNG 和 JPEG。已有盘片标定时，先在专辑中引用对应的 `preset`，再规划和预览。见[盘片预设](../calibrations/README.md)、[图案选项](preview.md)及[完整专辑示例](../examples/album.toml)。
+
+`discimage devices` 显示由标准光驱厂商、型号、序列号生成的 12 位十六进制硬件 ID，不带前缀。
+只要光驱向系统提供相同序列号，macOS、Windows、Linux 得到的 ID 就相同；不包含端口、盘符或固件版本。
+检测只读取设备元数据。读不到可靠序列号时显示 `local-xxxxxxxxxx`，它只代表当前系统连接。
+`devices --json` 保留硬件字段、`hardware_id`、`connection_selector`、首选 `selector` 和完整系统 `id`。
+用 `--device GX40N` 选择唯一型号，或复制显示的标识；列表序号不能用于选择。
+标识不存在、匹配多台或硬件 ID 重复时停止操作。已有作业仍绑定原始系统 ID，换连接后应重新准备作业。
+
+两种写法任选其一：
+
+```sh
+# 先保存默认光驱，再准备作业。
+discimage select GX40N
+discimage burn album.toml -o record --dry-run
+```
+
+```sh
+# 或者一次写全，明确指定本次光驱。
+discimage burn album.toml -o record --dry-run --device GX40N
+```
+
+`select` 单独运行可查看默认值，`select --clear` 清除默认值。
+`--device` 只覆盖本次操作，不修改默认值。
+默认选择用于 `erase`、新刻录作业和需要光驱的标定命令；指定光驱断开或匹配不唯一时停止，不改选其他设备。
+已有作业继续使用保存的光驱，显式 `--device` 必须与其一致；离线命令不读取默认选择。
+`select` 只保存 ID，不占用或写入盘片。
+设置以 `device = "ID"` 存在用户目录下的 `discimage/config.toml` 中：macOS 位于
+`~/Library/Application Support`，Windows 位于 `%APPDATA%`，Linux 位于 `$XDG_CONFIG_HOME`（默认 `~/.config`）。
 
 ## 在 macOS 刻录
 
@@ -70,27 +110,31 @@ discimage preview album.toml --output output/preview.svg
 
 ```sh
 discimage devices
-discimage prepare album.toml --output output/record --speed 8
+mkdir -p output
+discimage burn album.toml --output output/record --dry-run
 open output/record/planned/preview.svg
 # 确认预览后再开始写盘
-discimage resume output/record
+discimage burn output/record
 ```
 
-`prepare` 会选择唯一符合条件的空白盘，保存光驱和请求速度并生成预览，不写盘。有多个光驱符合条件时，添加 `--device 'DRIVE_ID'`，填入 `devices` 显示的完整 ID。选择光驱和盘片都支持的速度。用过的 CD-RW 需单独擦除。
+`burn --dry-run` 会选择唯一符合条件的空白盘，保存光驱和请求速度并生成预览，不写盘。有多个光驱符合条件时，用 `--device` 指定 `devices` 显示的短标识或唯一型号。省略 `--speed` 时，由光驱按盘片选择支持的最高速度；需要固定倍速时使用 `--speed N`。已有作业恢复时沿用保存的速度。每次重新刻录都使用新的输出目录，已完成的作业不能再次准备。用过的 CD-RW 先运行 `discimage erase`：自动选择唯一可用的 CD-RW，确认后完整擦除并检查空盘状态。`erase --dry-run` 只检查选择，`erase --quick` 仅快速清除盘片目录。
 
-`resume` 先写音乐会话并逐字节读回 PCM，再按光驱报告的下一可写地址重建、写入并校验数据会话。完成后，`output/record/journal.json` 应显示 `complete`，再次运行 `discimage devices` 可确认盘片已封盘且显示两个会话。盘面图案需要实物观察。中断恢复、CD-Text 和直接 `burn` 见[刻录说明](recording.md)。
+`burn JOB` 先写音乐会话并逐字节读回 PCM，再按光驱报告的下一可写地址重建、写入并校验数据会话。完成后，`output/record/journal.json` 应显示 `complete`，再次运行 `discimage devices` 可确认盘片已封盘且显示两个会话。盘面图案需要实物观察。若希望一次完成准备和刻录，使用 `discimage burn album.toml -o output/new-job`。中断恢复和 CD-Text 见[刻录说明](recording.md)。
+
+旧的 `prepare`、`resume`、`readback` 保留为隐藏兼容入口；新流程分别使用 `burn PROJECT --dry-run`、`burn JOB`、`verify BUNDLE -o FILE`。
 
 日志显示当前阶段。写盘时还会显示光驱报告的进度、速度和用时。macOS 自带终端使用基础 ANSI 配色，设置 `NO_COLOR=1` 可关闭颜色。重定向的日志使用纯文本，`plan --json` 和 `devices --json` 将 JSON 写到标准输出。
 
 ## 离线制作
 
 ```sh
+mkdir -p output
 discimage build album.toml --output output/album
 discimage verify output/album
-discimage readback output/album --output output/readback.png
+discimage verify output/album --output output/readback.png
 ```
 
-制品包含音频、带会话偏移的 ISO、RAW 数据镜像、预览和校验清单。`verify` 和 `readback` 检查本地文件。实际刻录按实测地址使用 ISO。布局为音乐在前、Mode 1 数据在后。完整 Blue Book CD Extra/XA 合规性及消费级播放器兼容性仍待验证。
+制品包含音频、带会话偏移的 ISO、RAW 数据镜像、预览和校验清单。`verify` 检查本地文件。实际刻录按实测地址使用 ISO。布局为音乐在前、Mode 1 数据在后。完整 Blue Book CD Extra/XA 合规性及消费级播放器兼容性仍待验证。
 
 [专辑模板](../projects/README.md) · [盘片标定配置](../calibrations/README.md) · [校准指南](calibration.md) · [读取计时实验](timing.md) · [实机结果](validation.md) · [目录结构](files.md)
 

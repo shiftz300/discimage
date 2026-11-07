@@ -76,10 +76,10 @@ matched the authored ISO. The observer saw only arcs across all three bands.
 The bands sampled different radii with local prewarps of −120, 0 and +120
 degrees per millimeter. This run produced no usable angular calibration.
 
-## Digital Vinyl AZO CD-R
+## AZO Gold Vinyl
 
 On 2026-11-07, an Apple SuperDrive (firmware 2.00) recorded and verified a
-single-session Verbatim Digital Vinyl AZO CD-R target. The 36-point read-timing
+single-session AZO Gold Vinyl CD-R target. The 36-point read-timing
 fit had a residual RMS of 0.185°. Four photos yielded a radial fit of
 25.05–57.97 mm at 359,846 sectors, with a residual RMS of 0.077 mm.
 
@@ -87,7 +87,7 @@ A second disc from the batch was recorded at requested 24× with six audio track
 and 238,887 Mode 1 data sectors starting at LBA 120520. PCM, data and CD-Text
 passed digital verification. The user confirmed the artwork alignment on the
 finished disc. The geometry used for that burn and the photo fit are stored
-in separate tables in the [Digital Vinyl configuration](../calibrations/digital-vinyl/disc.toml).
+in separate tables in the [AZO Gold Vinyl configuration](../calibrations/azo-gold-vinyl/disc.toml).
 
 ## Recording workflow
 

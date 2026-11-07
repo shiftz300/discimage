@@ -1,5 +1,35 @@
 //! Shared constant-pitch geometry. Writable limits do not define the spiral.
-use crate::{codec::RAW, project::Disc};
+use std::f64::consts::PI;
+
+use crate::{audio::SECTORS_PER_SECOND, codec::RAW, project::Disc};
+
+pub(crate) const FRAME_BITS: u32 = 588;
+pub(crate) const FRAMES_PER_SECTOR: u32 = 98;
+pub(crate) const SECTOR_BITS: u32 = FRAMES_PER_SECTOR * FRAME_BITS;
+pub(crate) const READ_TAIL_FRAMES: u32 = 108;
+
+pub(crate) fn read_end_bits(lba: u32) -> u64 {
+    (u64::from(lba) + 1) * u64::from(SECTOR_BITS) + u64::from(READ_TAIL_FRAMES * FRAME_BITS)
+}
+
+/// The same constant-pitch spiral, measured in channel bits instead of millimetres.
+#[derive(Clone, Copy, serde::Deserialize)]
+pub(crate) struct ChannelSpiral {
+    pub u: f64,
+    pub v: f64,
+}
+
+impl ChannelSpiral {
+    pub(crate) fn radius_squared(self, bits: f64) -> f64 {
+        self.u * self.u + self.v * bits / PI
+    }
+
+    pub(crate) fn angle_between(self, first: f64, last: f64) -> f64 {
+        // Rationalized difference avoids subtracting two large cumulative angles.
+        2.0 * (last - first)
+            / (self.radius_squared(last).sqrt() + self.radius_squared(first).sqrt())
+    }
+}
 
 pub(crate) struct Spiral {
     inner: f64,
@@ -30,7 +60,14 @@ impl Spiral {
     }
 
     pub(crate) fn angle(&self, radius: f64) -> f64 {
-        self.angle + 2.0 * self.velocity * (self.sectors / 75.0) / self.span * (radius - self.inner)
+        self.angle
+            + 2.0 * self.velocity * (self.sectors / f64::from(SECTORS_PER_SECOND)) / self.span
+                * (radius - self.inner)
+    }
+
+    pub(crate) fn angle_between(&self, first: f64, last: f64) -> f64 {
+        2.0 * self.velocity / f64::from(SECTORS_PER_SECOND) * (last - first)
+            / (self.radius(last) + self.radius(first))
     }
 
     pub(crate) fn point(&self, byte: i64) -> (f64, f64) {

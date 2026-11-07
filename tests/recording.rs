@@ -69,6 +69,7 @@ struct Drive {
     calls: Vec<&'static str>,
     fault: Fault,
     adjust_audio: bool,
+    expected_speed: Option<u32>,
     written_cd_text: Option<(String, String, Vec<String>)>,
 }
 impl Drive {
@@ -78,8 +79,10 @@ impl Drive {
             calls: Vec::new(),
             fault,
             adjust_audio: false,
+            expected_speed: Some(8),
             written_cd_text: None,
             status: Device {
+                hardware: None,
                 id: "fixture-drive".into(),
                 name: "Fixture".into(),
                 backend: "test".into(),
@@ -142,7 +145,7 @@ impl Recorder for Drive {
     fn music(
         &mut self,
         tracks: &[Music],
-        speed: u32,
+        speed: Option<u32>,
         cd_text: Option<(&str, &CdText)>,
     ) -> Result<()> {
         self.written_cd_text = cd_text
@@ -155,7 +158,7 @@ impl Recorder for Drive {
                 .collect::<Vec<_>>(),
             [(300, 150), (310, 75)]
         );
-        assert_eq!(speed, 8);
+        assert_eq!(speed, self.expected_speed);
         assert!(
             tracks
                 .iter()
@@ -196,11 +199,11 @@ impl Recorder for Drive {
         }
         Ok(())
     }
-    fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: u32) -> Result<()> {
+    fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: Option<u32>) -> Result<()> {
         let job = Journal::load(&self.job)?;
         assert_eq!(job.stage, Stage::DataWriting);
         assert_eq!(job.nwa, Some(start));
-        assert_eq!(speed, 8);
+        assert_eq!(speed, self.expected_speed);
         let actual = author::load(path.parent().unwrap())?;
         assert_eq!(actual.session_start, start);
         assert_eq!(actual.data_sectors, sectors);
@@ -262,12 +265,79 @@ fn track(number: u32, session: u32, start: i64, sectors: u32, audio: bool) -> Tr
 }
 
 #[test]
+fn automatic_speed_survives_preparation_and_resume_for_both_sessions() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    drive.expected_speed = None;
+    let prepared = burn::start(&mut drive, &work.project, &work.job, None, true).unwrap();
+    assert_eq!(prepared.speed, None);
+    assert_eq!(drive.writes(), 0);
+    assert_eq!(Journal::load(&work.job).unwrap().speed, None);
+    let complete = burn::resume(&mut drive, &work.job).unwrap();
+    assert_eq!(complete.speed, None);
+    assert_eq!(complete.stage, Stage::Complete);
+    assert_eq!(drive.writes(), 2);
+}
+
+#[test]
+fn invalid_explicit_speed_does_not_create_a_job_or_write() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    for speed in [0, 65, u32::MAX] {
+        assert!(burn::start(&mut drive, &work.project, &work.job, Some(speed), false).is_err());
+    }
+    assert!(!work.job.exists());
+    assert_eq!(drive.writes(), 0);
+}
+
+#[test]
 fn finalized_cdr_can_be_reported_as_read_only_with_two_unreported_sectors() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::ReadOnlyWithShortTail);
-    let complete = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap();
+    let complete = burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap();
     assert_eq!(complete.stage, Stage::Complete);
+    // Numeric speeds in existing v1 journals retain their meaning.
+    assert_eq!(Journal::load(&work.job).unwrap().speed, Some(8));
     assert_eq!(drive.calls.last(), Some(&"verify_data_tail"));
+}
+
+#[test]
+fn completed_jobs_are_not_prepared_again_or_overwritten() {
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap();
+    let before = std::fs::read(work.job.join("journal.json")).unwrap();
+    let calls = drive.calls.len();
+    let error = burn::start(&mut drive, &work.project, &work.job, None, true).unwrap_err();
+    assert!(error.to_string().contains("already complete"));
+    assert!(error.to_string().contains("new --output"));
+    assert_eq!(calls, drive.calls.len());
+    assert_eq!(
+        before,
+        std::fs::read(work.job.join("journal.json")).unwrap()
+    );
+}
+
+#[test]
+fn used_rewritable_discs_explain_the_explicit_erase_step() {
+    let work = Work::new();
+    let mut used = Drive::new(&work, Fault::None).status;
+    let media = used.media.as_mut().unwrap();
+    media.kind = "cd-rw".into();
+    media.blank = false;
+    media.appendable = false;
+    media.sessions = 2;
+    media.tracks = 5;
+    used.capabilities.as_mut().unwrap().cdrw = true;
+    let error = burn::select_blank(std::slice::from_ref(&used))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("2 sessions, 5 tracks"));
+    assert!(error.contains("discimage erase"));
+    used.media.as_mut().unwrap().kind = "cd-r".into();
+    let error = burn::select_blank(&[used]).unwrap_err().to_string();
+    assert!(error.contains("new blank CD-R"));
+    assert!(!error.contains("'discimage erase'"));
 }
 
 #[test]
@@ -307,7 +377,7 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     let album = format!("{album}preset={{file='presets.toml', name='fixture'}}\n");
     std::fs::write(&work.project, &album).unwrap();
     let mut drive = Drive::new(&work, Fault::None);
-    let prepared = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    let prepared = burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
     assert_eq!(prepared.stage, Stage::Prepared);
     let wrong_drive = std::process::Command::new(env!("CARGO_BIN_EXE_discimage"))
         .arg("resume")
@@ -386,12 +456,12 @@ fn cd_text_requires_drive_support_and_survives_preparation() {
         format!("{config}\n[cd_text]\nartist='Artist'\ntitles=['First','Second']\n"),
     )
     .unwrap();
-    let error = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap_err();
+    let error = burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap_err();
     assert!(format!("{error:#}").contains("does not report CD-Text writing support"));
     assert!(!work.job.exists());
 
     drive.status.capabilities.as_mut().unwrap().cd_text = true;
-    let prepared = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    let prepared = burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
     assert_eq!(prepared.stage, Stage::Prepared);
     assert_eq!(drive.writes(), 0);
     std::fs::write(&work.project, config).unwrap();
@@ -411,7 +481,7 @@ fn cd_text_requires_drive_support_and_survives_preparation() {
 fn smaller_replacement_media_is_rejected_before_music() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::None);
-    burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
     let planned = author::load(&work.job.join("planned")).unwrap();
     drive.media().free_sectors = Some(planned.plan.estimated_art_end_sector - 1);
     let error = burn::resume(&mut drive, &work.job).unwrap_err();
@@ -424,7 +494,7 @@ fn smaller_replacement_media_is_rejected_before_music() {
 fn missing_nwa_stops_after_music_and_resume_does_not_rewrite_music() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::MissingNwa);
-    let error = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap_err();
+    let error = burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap_err();
     assert!(format!("{error:#}").contains("next writable LBA"));
     assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::MusicWritten);
     assert_eq!(drive.calls, ["lock", "music"]);
@@ -441,7 +511,7 @@ fn missing_nwa_stops_after_music_and_resume_does_not_rewrite_music() {
 fn pcm_mismatch_blocks_data_and_resume_rechecks_without_writing_music_again() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::AudioReadback);
-    let error = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap_err();
+    let error = burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap_err();
     assert!(format!("{error:#}").contains("simulated PCM mismatch"));
     assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::MusicWritten);
     assert_eq!(drive.calls, ["lock", "music", "verify_music"]);
@@ -466,7 +536,7 @@ fn preparation_stabilizes_decoder_length_before_any_write() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::None);
     drive.adjust_audio = true;
-    let prepared = burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    let prepared = burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
     assert_eq!(prepared.stage, Stage::Prepared);
     assert!(drive.calls.is_empty());
     let original = std::fs::read(work.root.join("two.wav")).unwrap();
@@ -482,7 +552,7 @@ fn preparation_stabilizes_decoder_length_before_any_write() {
 fn changing_nwa_blocks_data_and_resume_reauthors_at_the_new_address() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::MovingNwa);
-    let error = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap_err();
+    let error = burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap_err();
     assert!(format!("{error:#}").contains("NWA changed before data write"));
     assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::DataReady);
     assert_eq!(drive.writes(), 1);
@@ -503,7 +573,7 @@ fn interrupted_write_and_incorrect_final_track_are_never_retried() {
     ] {
         let work = Work::new();
         let mut drive = Drive::new(&work, fault);
-        assert!(burn::start(&mut drive, &work.project, &work.job, 8, false).is_err());
+        assert!(burn::start(&mut drive, &work.project, &work.job, Some(8), false).is_err());
         let journal = Journal::load(&work.job).unwrap();
         assert_eq!(journal.stage, stage);
         assert!(journal.error.is_some());
@@ -517,18 +587,18 @@ fn rejects_unsafe_media_and_modified_snapshot_before_writing() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::None);
     drive.media().kind = "cd-rw".into();
-    assert!(burn::start(&mut drive, &work.project, &work.job, 8, false).is_err());
+    assert!(burn::start(&mut drive, &work.project, &work.job, Some(8), false).is_err());
     assert!(!work.job.exists());
     drive.media().kind = "cd-r".into();
     drive.media().blank = false;
-    assert!(burn::start(&mut drive, &work.project, &work.job, 8, false).is_err());
+    assert!(burn::start(&mut drive, &work.project, &work.job, Some(8), false).is_err());
     assert!(!work.job.exists());
     drive.media().blank = true;
     drive.status.capabilities.as_mut().unwrap().tao = false;
-    assert!(burn::start(&mut drive, &work.project, &work.job, 8, false).is_err());
+    assert!(burn::start(&mut drive, &work.project, &work.job, Some(8), false).is_err());
     assert!(!work.job.exists());
     drive.status.capabilities.as_mut().unwrap().tao = true;
-    burn::start(&mut drive, &work.project, &work.job, 8, true).unwrap();
+    burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
     std::fs::write(work.job.join("source/files/note.txt"), "changed").unwrap();
     assert!(burn::resume(&mut drive, &work.job).is_err());
     assert!(drive.calls.is_empty());
@@ -548,11 +618,11 @@ fn blank_cdrw_uses_the_same_measured_nwa_and_frozen_calibration() {
     capabilities.cdrw = true;
     drive.media().kind = "cd-rw".into();
     drive.media().blank = false;
-    assert!(burn::start(&mut drive, &work.project, &work.job, 8, false).is_err());
+    assert!(burn::start(&mut drive, &work.project, &work.job, Some(8), false).is_err());
     assert!(!work.job.exists() && drive.calls.is_empty());
     drive.media().blank = true;
 
-    let complete = burn::start(&mut drive, &work.project, &work.job, 8, false).unwrap();
+    let complete = burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap();
     assert_eq!(complete.stage, Stage::Complete);
     assert_eq!(complete.observed.media.unwrap().kind, "cd-rw");
     assert_eq!(drive.calls, ["lock", "music", "verify_music", "data"]);

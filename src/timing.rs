@@ -1,4 +1,4 @@
-//! External CD read-timing import. The converted candidate uses the existing
+//! CD read-timing import. The converted candidate uses the existing
 //! constant-pitch encoder, not a second rendering model.
 //! u/v and read-end conventions: Ashley-QwQ/disc-probe, CD_PHYSICAL_MODEL.md;
 //! macOS transport and numeric CSV: NaiveTomcat/discprobe-macos.
@@ -8,138 +8,19 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{author, console, layout::Plan, preview, project::Project, spiral::Spiral};
-
-const BITS: f64 = 57624.0;
-const FRAME: f64 = 588.0;
-
-/// The probe stays an external dependency. No shell, erasure, recording, or
-/// automatic unmounting is involved. -u streams Python progress immediately.
-pub fn probe(
-    directory: &Path,
-    python: &Path,
-    device: &str,
-    first: u32,
-    end: u32,
-    output: &Path,
-) -> Result<()> {
-    use std::{
-        io::{BufRead, BufReader, Write},
-        process::{Command, Stdio},
-    };
-    ensure!(
-        cfg!(target_os = "macos"),
-        "discprobe-macos acquisition requires macOS; import works offline on all platforms"
-    );
-    ensure!(
-        end <= 360_000 && end.checked_sub(first).is_some_and(|n| n > 1000),
-        "invalid CD measurement range"
-    );
-    ensure!(
-        !device.is_empty() && !device.starts_with('-'),
-        "invalid device identifier"
-    );
-    let directory = fs::canonicalize(directory)?;
-    ensure!(
-        directory.join("discprobe/__main__.py").is_file(),
-        "expected a discprobe-macos checkout"
-    );
-    let python = if python.components().count() > 1 {
-        fs::canonicalize(python)?
-    } else {
-        python.to_path_buf()
-    };
-    let help = Command::new(&python)
-        .current_dir(&directory)
-        .args(["-m", "discprobe", "geo", "--help"])
-        .output()
-        .context("cannot start external Python probe")?;
-    ensure!(
-        help.status.success() && String::from_utf8_lossy(&help.stdout).contains("--ranges"),
-        "external probe does not expose the expected geo interface"
-    );
-    let supported = Command::new(&python).current_dir(&directory).args(["-c",
-        "from discprobe.geo import CD_READ_TAIL_FRAMES, CD_SECTOR_BITS; assert (CD_READ_TAIL_FRAMES, CD_SECTOR_BITS) == (108, 57624)"]).output()?;
-    ensure!(
-        supported.status.success(),
-        "install the CD-capable discprobe-macos branch first"
-    );
-    let revision = Command::new("git")
-        .current_dir(&directory)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|r| r.status.success())
-        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_owned());
-    fs::create_dir(output).context("use a new probe output directory")?;
-    let output = fs::canonicalize(output)?;
-    fs::write(
-        output.join("probe.json"),
-        serde_json::to_vec_pretty(&json!({
-            "checkout": directory, "revision": revision, "device": device,
-            "requested_range": [first, end], "python": python,
-            "command": "geo", "completed": false,
-        }))?,
-    )?;
-    println!(
-        "[1/2] Read-only probe: {device}, LBA {first}..{end}. Ctrl-C stops acquisition.\nThe external CD backend requires a finalized single-session Mode 1 disc.\nLive output follows; no automatic unmount or write operations."
-    );
-    let mut log = fs::File::create(output.join("progress.log"))?;
-    let mut child = Command::new(&python)
-        .current_dir(&directory)
-        .args([
-            "-u",
-            "-m",
-            "discprobe",
-            "geo",
-            "--drive",
-            device,
-            "--ranges",
-            &format!("{first}-{end}"),
-            "--out",
-        ])
-        .arg(&output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let mut stopped = false;
-    for line in BufReader::new(child.stdout.take().context("missing probe stdout")?).lines() {
-        let line = line?;
-        stopped |= line.trim_start().starts_with("stopped:");
-        println!("{line}");
-        writeln!(log, "{line}")?;
-    }
-    ensure!(
-        child.wait()?.success() && !stopped,
-        "probe stopped; inspect progress.log and terminal errors; no candidate created"
-    );
-    let summaries: Vec<_> = fs::read_dir(&output)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path().join("summary.json"))
-        .filter(|path| path.is_file())
-        .collect();
-    ensure!(
-        summaries.len() == 1,
-        "probe did not produce exactly one geometry summary"
-    );
-    let measured = read(&summaries[0])?;
-    ensure!(
-        measured["fit"]["media"] == "cd",
-        "probe returned no CD geometry; use the CD-capable branch"
-    );
-    let mut receipt = read(&output.join("probe.json"))?;
-    receipt["completed"] = json!(true);
-    receipt["summary_sha256"] = json!(author::digest(&summaries[0])?);
-    fs::write(
-        output.join("probe.json"),
-        serde_json::to_vec_pretty(&receipt)?,
-    )?;
-    println!(
-        "[2/2] Saved {}. Next: photo phase comparison, then calibrate import. No preset applied.",
-        summaries[0].display()
-    );
-    Ok(())
-}
+use crate::{
+    audio::SECTORS_PER_SECOND,
+    author,
+    codec::CIRC_ORIGIN_FRAMES,
+    console,
+    layout::Plan,
+    preview,
+    project::Project,
+    spiral::{
+        ChannelSpiral, FRAME_BITS, FRAMES_PER_SECTOR, READ_TAIL_FRAMES, SECTOR_BITS, Spiral,
+        read_end_bits,
+    },
+};
 
 /// This metadata follows the candidate into manifests and recording snapshots.
 /// Bounds are encoding coordinates, end exclusive, not readable track bounds.
@@ -173,20 +54,77 @@ struct Fit {
     media: String,
     sector_bits: u32,
     read_tail_frames: u32,
-    u: f64,
-    v: f64,
+    #[serde(flatten)]
+    geometry: ChannelSpiral,
     residual_rms_deg: f64,
     angle_sigma_measured_span_deg: f64,
     reference_lba: u32,
 }
 
-fn read(path: &Path) -> Result<Value> {
+pub(crate) fn read(path: &Path) -> Result<Value> {
     ensure!(
         fs::metadata(path)?.len() <= 8 * 1024 * 1024,
         "report is too large"
     );
     serde_json::from_slice(&fs::read(path)?)
         .with_context(|| format!("invalid JSON: {}", path.display()))
+}
+
+struct Measurement {
+    summary: Value,
+    fit: Fit,
+    targets: std::path::PathBuf,
+    bounds: [u32; 2],
+}
+
+fn measurement(path: &Path) -> Result<Measurement> {
+    let summary = read(path)?;
+    let fit: Fit =
+        serde_json::from_value(summary["fit"].clone()).context("missing CD geometry fit")?;
+    ensure!(
+        fit.media == "cd"
+            && fit.sector_bits == SECTOR_BITS
+            && fit.read_tail_frames == READ_TAIL_FRAMES,
+        "unsupported media or read-end convention; expected CD/57624 bits/108 frames"
+    );
+    ensure!(
+        fit.geometry.u.is_finite()
+            && fit.geometry.u > 0.0
+            && fit.geometry.v.is_finite()
+            && fit.geometry.v > 0.0
+            && fit.reference_lba < 360_000,
+        "invalid CD timing geometry"
+    );
+    let targets = path.with_file_name("targets.csv");
+    let status = path.with_file_name("status.json");
+    if status.try_exists()? {
+        let receipt = read(&status)?;
+        ensure!(receipt["completed"] == true, "measurement is incomplete");
+        if let Some(hash) = receipt["summary_sha256"].as_str() {
+            ensure!(
+                author::digest(path)? == hash,
+                "timing summary changed after acquisition"
+            );
+        }
+        if let Some(hash) = receipt["targets_sha256"].as_str() {
+            ensure!(
+                author::digest(&targets)? == hash,
+                "timing targets changed after acquisition"
+            );
+        }
+    }
+    let bounds = coverage(&targets, &fit, &summary)?;
+    Ok(Measurement {
+        summary,
+        fit,
+        targets,
+        bounds,
+    })
+}
+
+pub(crate) fn phase_geometry(path: &Path) -> Result<(ChannelSpiral, [u32; 2])> {
+    let m = measurement(path)?;
+    Ok((m.fit.geometry, m.bounds))
 }
 
 fn number(value: &Value) -> Result<f64> {
@@ -233,7 +171,7 @@ fn coverage(path: &Path, fit: &Fit, summary: &Value) -> Result<[u32; 2]> {
             "invalid timing sample"
         );
         ensure!(
-            (n - ((f64::from(sector) + 1.0) * BITS + 108.0 * FRAME)).abs() < 0.5,
+            (n - read_end_bits(sector) as f64).abs() < 0.5,
             "targets use a different CD read-end coordinate convention"
         );
         points.push(sector);
@@ -272,9 +210,11 @@ fn coverage(path: &Path, fit: &Fit, summary: &Value) -> Result<[u32; 2]> {
 /// r=b*S and span=b²*v*57624*N/π reproduce Theta differences exactly.
 fn convert(old: &crate::project::Disc, fit: &Fit, shift: f64, anchor: f64) -> crate::project::Disc {
     let mut disc = old.clone();
-    let bit = old.velocity / (75.0 * BITS);
-    let inner2 = bit.powi(2) * (fit.u.powi(2) + fit.v * shift * FRAME / std::f64::consts::PI);
-    let span = bit.powi(2) * fit.v * BITS * f64::from(old.capacity_sectors) / std::f64::consts::PI;
+    let bit = old.velocity / f64::from(SECTORS_PER_SECOND * SECTOR_BITS);
+    let inner2 = bit.powi(2) * fit.geometry.radius_squared(shift * f64::from(FRAME_BITS));
+    let span =
+        bit.powi(2) * fit.geometry.v * f64::from(SECTOR_BITS) * f64::from(old.capacity_sectors)
+            / std::f64::consts::PI;
     disc.inner_radius_mm = inner2.sqrt();
     disc.outer_radius_mm = (inner2 + span).sqrt();
     disc.calibration = None; // The inherited radial fit's residual is not this fit's error.
@@ -306,50 +246,35 @@ pub fn import(
         "start from the original project, not another timing candidate"
     );
     let original = Plan::from_project(&project, None)?;
-    let measurement = read(summary)?;
-    let fit: Fit =
-        serde_json::from_value(measurement["fit"].clone()).context("missing CD geometry fit")?;
+    let Measurement {
+        summary: measured,
+        fit,
+        targets,
+        bounds,
+    } = measurement(summary)?;
     ensure!(
-        fit.media == "cd" && fit.sector_bits == 57624 && fit.read_tail_frames == 108,
-        "unsupported media or read-end convention; expected CD/57624 bits/108 frames"
-    );
-    ensure!(
-        fit.u.is_finite()
-            && fit.u > 0.0
-            && fit.v.is_finite()
-            && fit.v > 0.0
-            && (0.0..=0.3).contains(&fit.residual_rms_deg)
+        (0.0..=0.3).contains(&fit.residual_rms_deg)
             && (0.0..=0.5).contains(&fit.angle_sigma_measured_span_deg),
         "timing fit exceeds candidate quality limits (RMS 0.3°, span sigma 0.5°)"
     );
-    let cache = &measurement["cache"];
+    let cache = &measured["cache"];
     ensure!(
         (cache["strategy"] == "fua" && cache["fua_reads_media"] == true)
             || (cache["strategy"] == "plain" && cache["plain_served_from_cache"] == false),
         "media reads not established: require verified FUA or uncached plain reads"
     );
-    let parent = summary
-        .parent()
-        .context("summary needs a parent directory")?;
-    let status = parent.join("status.json");
-    if status.exists() {
-        ensure!(
-            read(&status)?["completed"] == true,
-            "measurement is incomplete"
-        );
-    }
-    let targets = parent.join("targets.csv");
-    let bounds = coverage(&targets, &fit, &measurement)?;
     let report = read(phase)?;
     ensure!(
-        report["format"] == "discimage-phase-report-v1" && report["origin_frames"] == 111,
+        report["format"] == "discimage-phase-report-v1"
+            && report["origin_frames"] == CIRC_ORIGIN_FRAMES,
         "unsupported photo phase report"
     );
     let summary_hash = author::digest(summary)?;
+    let targets_hash = author::digest(&targets)?;
     let manifest_hash = author::digest(&bundle.join("manifest.json"))?;
     ensure!(
         report["sources"]["timing_sha256"] == summary_hash
-            && report["sources"]["targets_sha256"] == author::digest(&targets)?
+            && report["sources"]["targets_sha256"] == targets_hash
             && report["sources"]["manifest_sha256"] == manifest_hash
             && report["sources"]["evidence_hash_verified"] == true,
         "phase report must match this timing/bundle and have verified photo evidence"
@@ -365,7 +290,7 @@ pub fn import(
     let offset = number(&report["joint"]["forward_offset_frames"])?;
     ensure!(
         (-1024.0..=1024.0).contains(&shift)
-            && (111.0 - shift - offset).abs() < 1e-7
+            && (f64::from(CIRC_ORIGIN_FRAMES) - shift - offset).abs() < 1e-7
             && (0.0..=0.3).contains(&number(&report["joint"]["rms_deg"])?),
         "inconsistent or poor phase fit"
     );
@@ -387,15 +312,17 @@ pub fn import(
         );
     }
     // Convert read-end coverage into encoder coordinates, then round inward.
-    let start = (f64::from(bounds[0]) + 1.0 + (108.0 - shift) / 98.0).ceil() as u32;
-    let end = (f64::from(bounds[1]) + 1.0 + (108.0 - shift) / 98.0).floor() as u32;
+    let sector_shift = (f64::from(READ_TAIL_FRAMES) - shift) / f64::from(FRAMES_PER_SECTOR);
+    let start = (f64::from(bounds[0]) + 1.0 + sector_shift).ceil() as u32;
+    let end = (f64::from(bounds[1]) + 1.0 + sector_shift).floor() as u32;
     let anchor = (f64::from(start) + f64::from(end)) / 2.0;
     project.disc = convert(a, &fit, shift, anchor);
+    let phase_hash = author::digest(phase)?;
     project.disc.timing = Some(Evidence {
         first_sector: start,
         end_sector: end,
         summary_sha256: summary_hash.clone(),
-        phase_sha256: author::digest(phase)?,
+        phase_sha256: phase_hash.clone(),
     });
     project.disc.limit_end(end);
     let candidate = Plan::from_project(&project, None)?;
@@ -411,7 +338,7 @@ pub fn import(
     let new_spiral = Spiral::new(&candidate.disc);
     let drift = |sector: f64| {
         // Anchor-relative differences, avoiding an arbitrary whole-disc rotation.
-        let delta = |s: &Spiral| s.angle(s.radius(sector)) - s.angle(s.radius(anchor));
+        let delta = |s: &Spiral| s.angle_between(anchor, sector);
         (delta(&new_spiral) - delta(&old_spiral)).to_degrees()
     };
     let changes: Vec<_> = (0..=100)
@@ -427,9 +354,9 @@ pub fn import(
         "shift_frames": shift, "forward_offset_frames": offset, "anchor_sector": anchor,
         "measured_target_lbas": bounds, "encoding_range": [start, end],
         "original": original, "candidate": candidate, "drift": changes,
-        "sources": {"summary_sha256": summary_hash, "targets_sha256": author::digest(&targets)?,
-            "phase_sha256": author::digest(phase)?, "manifest_sha256": manifest_hash},
-        "timing": measurement, "phase": report,
+        "sources": {"summary_sha256": summary_hash, "targets_sha256": targets_hash,
+            "phase_sha256": phase_hash, "manifest_sha256": manifest_hash},
+        "timing": measured, "phase": report,
     });
     let settings = toml::to_string_pretty(&project)?;
     fs::create_dir(output)
@@ -454,13 +381,6 @@ pub fn import(
     fs::copy(summary, output.join("summary.json"))?;
     fs::copy(targets, output.join("targets.csv"))?;
     fs::copy(phase, output.join("phase.json"))?;
-    fs::write(
-        output.join("index.html"),
-        include_str!("../assets/timing.html")
-            .replace("@OFFSET@", &format!("{offset:.4}"))
-            .replace("@RANGE@", &format!("{start}–{end}"))
-            .replace("@DRIFT@", &serde_json::to_string(&changes)?),
-    )?;
     fs::remove_file(output.join("incomplete"))?;
     Ok(())
 }
@@ -476,8 +396,10 @@ mod tests {
             media: "cd".into(),
             sector_bits: 57624,
             read_tail_frames: 108,
-            u: 89491.85907555123,
-            v: 5.406737380826635,
+            geometry: ChannelSpiral {
+                u: 89491.85907555123,
+                v: 5.406737380826635,
+            },
             residual_rms_deg: 0.1,
             angle_sigma_measured_span_deg: 0.11,
             reference_lba: 239000,
@@ -499,10 +421,10 @@ mod tests {
             let mut disc = convert(&old, &fit, shift, anchor);
             let converted = Spiral::new(&disc);
             let theta = |s: f64| {
-                std::f64::consts::TAU / fit.v
-                    * ((fit.u * fit.u + fit.v * (s * BITS + shift * FRAME) / std::f64::consts::PI)
-                        .sqrt()
-                        - fit.u)
+                let ChannelSpiral { u, v } = fit.geometry;
+                std::f64::consts::TAU / v
+                    * ((u * u + v * (s * 57624.0 + shift * 588.0) / std::f64::consts::PI).sqrt()
+                        - u)
             };
             let rotation =
                 converted.angle(converted.radius(anchor)) - previous.angle(previous.radius(anchor));

@@ -49,16 +49,55 @@ fn timing_import_roundtrips_candidate_and_rejects_changed_evidence() {
         ));
     }
     std::fs::write(&targets, &csv).unwrap();
-    let phase = temp.0.join("phase.json");
-    let report = json!({"format":"discimage-phase-report-v1","origin_frames":111,
-        "joint":{"shift_frames":shift,"forward_offset_frames":19,"rms_deg":0.05},
-        "curves":{"a":{},"b":{}},
-        "holdouts":[{"rms_deg":0.1,"max_deg":0.2},{"rms_deg":0.1,"max_deg":0.2}],
-        "sources":{"timing_sha256":author::digest(&timing).unwrap(),
-            "targets_sha256":author::digest(&targets).unwrap(),
-            "manifest_sha256":author::digest(&bundle.join("manifest.json")).unwrap(),
-            "evidence_hash_verified":true}});
-    std::fs::write(&phase, report.to_string()).unwrap();
+    let comparison = temp.0.join("comparison");
+    let phase = comparison.join("report.json");
+    let photo = temp.0.join("rectified.bin");
+    let offset = temp.0.join("offset.json");
+    let points = temp.0.join("points.json");
+    std::fs::write(&photo, b"synthetic rectified evidence").unwrap();
+    std::fs::write(&offset, br#"{"forward_offset_frames":19}"#).unwrap();
+    let manifest = author::load(&bundle).unwrap();
+    let first = f64::from(manifest.plan.estimated_art_start_sector.max(12000));
+    let last = f64::from((manifest.plan.estimated_art_end_sector - 1).min(13900));
+    assert!(last - first >= 1000.0);
+    // At the known shift the synthetic timing model is identical to the
+    // generating model, leaving only independent rotations of the two curves.
+    let samples: Vec<_> = [("a", 3.0), ("b", -25.0)].into_iter().flat_map(|(curve, rotation)| {
+        (0..16).map(move |i| json!({
+            "curve": curve, "sector": first + f64::from(i) * (last - first) / 15.0, "phase_deg": rotation,
+        }))
+    }).collect();
+    std::fs::write(
+        &points,
+        json!({
+            "format":"discimage-phase-v1", "convention":"photo-minus-design-clockwise",
+            "bundle_sha256":author::digest(&bundle.join("manifest.json")).unwrap(),
+            "evidence_sha256":author::digest(&photo).unwrap(), "samples":samples,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_discimage"))
+        .args(["calibrate", "phase", "--timing"])
+        .arg(&timing)
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--points")
+        .arg(&points)
+        .arg("--evidence")
+        .arg(&photo)
+        .args(["--offset-frames", "19", "--offset-evidence"])
+        .arg(&offset)
+        .arg("--output")
+        .arg(&comparison)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(comparison.join("index.html").is_file());
     let output = temp.0.join("candidate");
     let run = Command::new(env!("CARGO_BIN_EXE_discimage"))
         .args(["calibrate", "import"])
@@ -80,6 +119,16 @@ fn timing_import_roundtrips_candidate_and_rejects_changed_evidence() {
         String::from_utf8_lossy(&run.stderr)
     );
     let candidate = Project::load(&output.join("candidate.toml")).unwrap();
+    for file in [
+        "report.json",
+        "design.png",
+        "before.png",
+        "after.png",
+        "difference.png",
+    ] {
+        assert!(output.join(file).is_file(), "{file}");
+    }
+    assert!(!output.join("index.html").exists());
     assert!(candidate.tracks[0].path.is_absolute());
     assert_eq!(std::fs::read_to_string(&project).unwrap(), settings);
     assert!(!output.join("incomplete").exists());
@@ -156,56 +205,6 @@ fn timing_import_roundtrips_candidate_and_rejects_changed_evidence() {
     p.disc.end_margin_sectors = 150;
     p.disc.timing.as_mut().unwrap().first_sector = 12500;
     assert!(Plan::from_project(&p, None).is_err());
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn external_probe_streams_output_and_rejects_a_swallowed_failure() {
-    use std::os::unix::fs::PermissionsExt;
-    let temp = Temp::new();
-    let checkout = temp.0.join("checkout");
-    std::fs::create_dir_all(checkout.join("discprobe")).unwrap();
-    std::fs::write(checkout.join("discprobe/__main__.py"), "").unwrap();
-    let python = temp.0.join("python");
-    std::fs::write(
-        &python,
-        r#"#!/usr/bin/env python3
-import json, pathlib, sys
-if '--help' in sys.argv:
-    print('--ranges')
-elif '-c' in sys.argv:
-    pass
-else:
-    assert sys.argv[1:7] == ['-u', '-m', 'discprobe', 'geo', '--drive', 'test drive']
-    assert sys.argv[7:10] == ['--ranges', '12000-14000', '--out']
-    output = pathlib.Path(sys.argv[-1])
-    if output.name == 'failed':
-        print('stopped: synthetic failure', flush=True)
-    else:
-        (output / 'geo-test').mkdir()
-        (output / 'geo-test/summary.json').write_text(json.dumps({'fit': {'media': 'cd'}}))
-        print('measured target 1', flush=True)
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let success = temp.0.join("success");
-    discimage::timing::probe(&checkout, &python, "test drive", 12000, 14000, &success).unwrap();
-    let receipt: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(success.join("probe.json")).unwrap()).unwrap();
-    assert_eq!(receipt["completed"], true);
-    assert!(
-        std::fs::read_to_string(success.join("progress.log"))
-            .unwrap()
-            .contains("measured target 1")
-    );
-    let failed = temp.0.join("failed");
-    assert!(
-        discimage::timing::probe(&checkout, &python, "test drive", 12000, 14000, &failed).is_err()
-    );
-    let receipt: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(failed.join("probe.json")).unwrap()).unwrap();
-    assert_eq!(receipt["completed"], false);
 }
 
 struct Temp(PathBuf);
@@ -409,6 +408,22 @@ fn complete_bundle_is_reproducible_preserves_pcm_and_detects_corruption() {
     let copied = audio::inspect(&a.join("audio/01.wav")).unwrap();
     assert_eq!(copied.sample_frames, 301 * 588);
     assert!(a.join("readback.png").exists() && a.join("difference.png").exists());
+    let projected = temp.0.join("verified.png");
+    let result = Command::new(env!("CARGO_BIN_EXE_discimage"))
+        .arg("verify")
+        .arg(&a)
+        .arg("--output")
+        .arg(&projected)
+        .args(["--size", "256", "--samples", "64"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(image::image_dimensions(&projected).unwrap(), (256, 256));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("local ISO"));
     assert!(!a.join("incomplete").exists());
     assert!(author::build(&manifest, &a, None).is_err());
     let rebuilt = author::build(&manifest, &b, None).unwrap();
@@ -663,7 +678,7 @@ fn strip_build_encodes_the_same_clockwise_mapping_and_keeps_its_aspect_ratio() {
     assert_eq!(verified.artwork.as_ref().unwrap().mode, Mode::Strip);
     assert_eq!(
         image::image_dimensions(directory.join("source.png")).unwrap(),
-        (4096, 256)
+        (512, 32)
     );
     let mut file = std::fs::File::open(directory.join("session2.iso")).unwrap();
     let codec = discimage::codec::Codec::default();
@@ -792,16 +807,11 @@ fn calibration_cli_binds_photo_points_to_the_written_target() {
     image::GrayImage::new(1024, 1024)
         .save(temp.0.join("photo.png"))
         .unwrap();
-    cli(&[
-        "calibrate",
-        "mark",
-        "written",
-        "photo.png",
-        "--output",
-        "points.html",
-    ]);
-    let page = std::fs::read_to_string(temp.0.join("points.html")).unwrap();
-    assert!(page.contains(&digest) && page.contains("data:image/png;base64,"));
+    cli(&["calibrate", "mark", "written", "--output", "mark.json"]);
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.0.join("mark.json")).unwrap()).unwrap();
+    assert_eq!(descriptor["format"], "discimage-mark-v1");
+    assert_eq!(descriptor["bundle_sha256"], digest);
     cli(&[
         "calibrate",
         "fit",
@@ -822,6 +832,11 @@ fn calibration_cli_binds_photo_points_to_the_written_target() {
     cli(&[guided.as_slice(), &["--photo", "photo.png"]].concat());
     let workspace = temp.0.join("guide");
     assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 1);
+    assert!(
+        workspace
+            .join(format!("mark-{}.json", &digest[..12]))
+            .is_file()
+    );
     assert!(!workspace.join("record").exists());
     std::fs::copy(temp.0.join("points.json"), workspace.join("points.json")).unwrap();
     cli(&guided);
@@ -916,6 +931,16 @@ fn encoding_and_previews_match_the_pre_refactor_fixtures() {
             "[disc.phase_target]\ncontrols=[[12000,12080],[13750,13830]]\nbands=[{start=12200,check=13000,end=13500,velocity=1183.177343317657}]\n",
         ),
     ] {
+        if name == "strip" {
+            // The legacy encoder enlarged strips before sampling. Supply that
+            // same grid explicitly so this remains an independent geometry and
+            // palette regression, while new jobs retain their source pixels.
+            image::open(temp.0.join("source.png"))
+                .unwrap()
+                .resize(4096, 4096, image::imageops::FilterType::Lanczos3)
+                .save(temp.0.join("source.png"))
+                .unwrap();
+        }
         let project = temp.0.join(format!("{name}.toml"));
         std::fs::write(&project, format!(
             "title='Regression'\ntracks=[{{path='audio.wav'}}]\n[disc]\ncapacity_sectors={capacity}\ndata_reserve_sectors=300\n{settings}"

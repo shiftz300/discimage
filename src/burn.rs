@@ -4,7 +4,6 @@ use crate::{
     author::{self, Manifest},
     console,
     device::{Device, Media, Music, Recorder, Track},
-    iso::Volume,
     layout::Plan,
     project::{Project, Track as Input},
 };
@@ -35,7 +34,7 @@ pub struct Journal {
     pub format: String,
     pub stage: Stage,
     pub device: String,
-    pub speed: u32,
+    pub speed: Option<u32>,
     pub source_sha256: Option<String>,
     pub planned_sha256: Option<String>,
     pub actual_sha256: Option<String>,
@@ -91,18 +90,23 @@ pub fn start(
     backend: &mut dyn Recorder,
     project: &Path,
     directory: &Path,
-    speed: u32,
+    speed: Option<u32>,
     dry_run: bool,
 ) -> Result<Journal> {
-    ensure!((1..=64).contains(&speed), "speed must be 1–64x");
+    ensure!(
+        speed.is_none_or(|speed| (1..=64).contains(&speed)),
+        "speed must be 1–64x"
+    );
+    check_destination(directory)?;
     let observed = backend.inspect()?;
     let available = blank(&observed, false)?;
     console::phase(
         "prepare",
         format_args!(
-            "{} | {} | {available} writable sectors | requested {speed}x",
+            "{} | {} | {available} writable sectors | {}",
             observed.name,
             writable_cd(&observed)?.kind,
+            console::speed(speed),
         ),
     );
     let mut project = Project::load(project)?;
@@ -123,7 +127,7 @@ pub fn start(
     }
     let plan = Plan::from_project(&project, None)?;
     project.disc.capacity_sectors = plan.disc.capacity_sectors;
-    let volume = volume(&project, &plan)?;
+    let volume = author::volume(&project, &plan)?;
     let source = project.artwork.as_ref().map(art::load).transpose()?;
     check_cancel(backend)?;
     std::fs::create_dir(directory)
@@ -151,7 +155,7 @@ pub fn start(
         project.tracks.clear();
         for (i, track) in plan.tracks.iter().enumerate() {
             check_cancel(backend)?;
-            let path = PathBuf::from(format!("audio/{:02}.wav", i + 1));
+            let path = PathBuf::from(audio::track_path(i));
             let frozen = snapshot.join(&path);
             audio::export(track, &frozen)?;
             normalize_length(backend, &frozen, track.sectors)?;
@@ -258,7 +262,7 @@ fn finish(directory: &Path, mut journal: Journal, result: Result<()>) -> Result<
 
 fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> Result<()> {
     ensure!(
-        (1..=64).contains(&journal.speed),
+        journal.speed.is_none_or(|speed| (1..=64).contains(&speed)),
         "invalid saved recording speed"
     );
     console::phase(
@@ -269,13 +273,10 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     check_source(&snapshot, journal)?;
     let planned = directory.join("planned");
     let manifest = checked_bundle(&planned, journal.planned_sha256.as_deref())?;
-    let observed = backend.inspect()?;
-    check_device(&observed, journal)?;
+    inspect_job(backend, journal)?;
     check_cancel(backend)?;
     backend.lock()?;
-    let observed = backend.inspect()?;
-    check_device(&observed, journal)?;
-    journal.observed = observed;
+    journal.observed = inspect_job(backend, journal)?;
     let gap = manifest.plan.disc.intertrack_gap_sectors;
     let tracks = manifest
         .plan
@@ -283,7 +284,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         .iter()
         .enumerate()
         .map(|(i, t)| Music {
-            path: planned.join(format!("audio/{:02}.wav", i + 1)),
+            path: planned.join(audio::track_path(i)),
             sectors: t.sectors,
             gap: if i == 0 { 150 } else { gap },
         })
@@ -329,8 +330,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         journal.advance(directory, Stage::MusicWritten)?;
     }
     check_cancel(backend)?;
-    let observed = backend.inspect()?;
-    check_device(&observed, journal)?;
+    let observed = inspect_job(backend, journal)?;
     let (nwa, free) = next(&observed, &manifest.plan)?;
     journal.observed = observed;
     console::phase(
@@ -382,8 +382,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     );
     check_source(&snapshot, journal)?;
     check_cancel(backend)?;
-    let observed = backend.inspect()?;
-    check_device(&observed, journal)?;
+    let observed = inspect_job(backend, journal)?;
     let (current, remaining) = next(&observed, &manifest.plan)?;
     ensure!(
         current == actual.session_start,
@@ -402,8 +401,9 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
             actual.data_sectors
         ),
     );
+    let iso = journal.actual(directory).join("session2.iso");
     backend.data(
-        &journal.actual(directory).join("session2.iso"),
+        &iso,
         actual.session_start,
         actual.data_sectors,
         journal.speed,
@@ -430,24 +430,11 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     )?;
     journal.observed = observed;
     if short {
-        backend.verify_data_tail(
-            &journal.actual(directory).join("session2.iso"),
-            actual.session_start,
-            actual.data_sectors,
-        )?;
+        backend.verify_data_tail(&iso, actual.session_start, actual.data_sectors)?;
     }
     journal.advance(directory, Stage::Complete)
 }
 
-fn volume(project: &Project, plan: &Plan) -> Result<Volume> {
-    Volume::new(
-        project.files.as_deref(),
-        plan.session_start(),
-        plan.data_sectors(),
-        plan.disc.data_reserve_sectors,
-        &plan.title,
-    )
-}
 fn checked_bundle(path: &Path, expected: Option<&str>) -> Result<Manifest> {
     ensure!(
         expected == Some(author::digest(&path.join("manifest.json"))?.as_str()),
@@ -469,6 +456,12 @@ fn check_cancel(backend: &dyn Recorder) -> Result<()> {
     );
     Ok(())
 }
+fn inspect_job(backend: &mut dyn Recorder, journal: &Journal) -> Result<Device> {
+    let observed = backend.inspect()?;
+    check_device(&observed, journal)?;
+    Ok(observed)
+}
+
 fn check_device(device: &Device, journal: &Journal) -> Result<()> {
     ensure!(device.id == journal.device, "recording drive changed");
     let media = writable_cd(device)?;
@@ -506,7 +499,15 @@ fn blank(device: &Device, reserved: bool) -> Result<u32> {
     let media = writable_cd(device)?;
     ensure!(
         media.blank && !device.tracks.iter().any(|t| !t.empty),
-        "music recording requires a blank CD-R or CD-RW"
+        "used {} ({} sessions, {} tracks); music recording requires a blank disc. {}",
+        media.kind,
+        media.sessions,
+        media.tracks,
+        if media.kind == "cd-rw" {
+            "To replace its contents, explicitly run 'discimage erase' first."
+        } else {
+            "Insert a new blank CD-R; a used CD-R cannot be erased."
+        }
     );
     ensure!(!reserved || media.reserved, "CD reservation was lost");
     media
@@ -519,14 +520,52 @@ fn blank(device: &Device, reserved: bool) -> Result<u32> {
 /// and media after taking the reservation.
 pub fn select_blank(drives: &[Device]) -> Result<&Device> {
     let mut candidates = drives.iter().filter(|drive| blank(drive, false).is_ok());
-    let selected = candidates.next().context(
-        "no drive with a writable blank CD-R or CD-RW; run 'discimage devices' for details",
-    )?;
+    let selected = candidates.next().with_context(|| {
+        if drives.is_empty() {
+            return "no optical drives reported; connect a drive and insert a blank CD-R or CD-RW"
+                .into();
+        }
+        let reasons = drives
+            .iter()
+            .filter_map(|drive| {
+                blank(drive, false)
+                    .err()
+                    .map(|error| format!("  {}: {error}", drive.name))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("no writable blank CD-R or CD-RW:\n{reasons}")
+    })?;
     ensure!(
         candidates.next().is_none(),
         "multiple drives have writable blank discs; use 'discimage devices' and pass --device"
     );
     Ok(selected)
+}
+
+/// Reject reused output directories before selecting or reserving any drive.
+pub fn check_destination(directory: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("cannot inspect recording output path"),
+        Ok(_) => {
+            let next = match Journal::load(directory).map(|j| j.stage) {
+                Ok(Stage::Complete) => {
+                    "This job is already complete. For another recording, use a new --output directory."
+                }
+                Ok(Stage::Prepared | Stage::MusicWritten | Stage::DataReady) => {
+                    "To continue this job, use 'discimage burn' with this directory. For a new job, choose a new --output directory."
+                }
+                _ => {
+                    "Choose a new --output directory. If this is an interrupted job, inspect its journal before continuing."
+                }
+            };
+            anyhow::bail!(
+                "recording output already exists: {}. {next}",
+                directory.display()
+            );
+        }
+    }
 }
 fn check_cd_text(backend: &mut dyn Recorder, device: &Device, project: &Project) -> Result<()> {
     if let Some(text) = &project.cd_text {
@@ -556,24 +595,19 @@ fn music_layout(tracks: &[&Track], plan: &Plan) -> Result<()> {
         tracks.len() >= plan.tracks.len(),
         "recorded music track count is incomplete"
     );
-    let mut start = 0u32;
-    for (i, (recorded, expected)) in tracks.iter().zip(&plan.tracks).enumerate() {
+    for (i, (recorded, expected)) in tracks.iter().zip(plan.music_ranges()).enumerate() {
         // The SuperDrive's MMC track size excludes two readable trailing sectors.
         ensure!(
             recorded.number == i as u32 + 1
                 && recorded.session == 1
                 && recorded.audio
-                && recorded.start == Some(i64::from(start))
+                && recorded.start == Some(i64::from(expected.start))
                 && recorded
                     .sectors
-                    .is_none_or(|s| s.saturating_add(2) >= expected.sectors),
+                    .is_none_or(|s| s.saturating_add(2) >= expected.end - expected.start),
             "recorded music layout does not match track {}",
             i + 1
         );
-        start += expected.sectors;
-        if i + 1 < plan.tracks.len() {
-            start += plan.disc.intertrack_gap_sectors;
-        }
     }
     Ok(())
 }

@@ -171,15 +171,14 @@ pub(crate) fn load(art: &Artwork) -> Result<RgbaImage> {
     reader.limits(limits);
     let source = reader.decode().context("cannot decode artwork")?;
     if art.mode == Mode::Strip {
-        // Preserve strip aspect ratio, including in the portable bundle snapshot.
-        let fitted = source
-            .resize(4096, 4096, imageops::FilterType::Lanczos3)
-            .to_rgba8();
+        // Preserve the original pixel grid and edges, including in job snapshots.
+        // Decoder limits already bound the input to 8192 pixels on each side.
+        let fitted = source.to_rgba8();
         let mut canvas = RgbaImage::from_pixel(fitted.width(), fitted.height(), Rgba([255; 4]));
         imageops::overlay(&mut canvas, &fitted, 0, 0);
         return Ok(canvas);
     }
-    let size = 1600;
+    let size = source.width().max(source.height()).clamp(1600, 4096);
     let fitted = match art.fit {
         Fit::Contain => source.resize(size, size, imageops::FilterType::Lanczos3),
         Fit::Cover => source.resize_to_fill(size, size, imageops::FilterType::Lanczos3),
@@ -228,5 +227,33 @@ fn levels(value: f64, art: &Artwork, x: u32, y: u32) -> u8 {
                 0
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_ink_edges_survive_full_resolution_strip_loading_and_snapshots() {
+        let path = std::env::temp_dir().join(format!("discimage-edges-{}.png", std::process::id()));
+        let source = RgbaImage::from_fn(8192, 8, |x, _| {
+            if x % 5 == 0 {
+                Rgba([0, 0, 0, 255])
+            } else {
+                Rgba([255; 4])
+            }
+        });
+        source.save(&path).unwrap();
+        let art = Artwork {
+            path: path.clone(),
+            mode: Mode::Strip,
+            ..Artwork::default()
+        };
+        let first = load(&art).unwrap();
+        assert_eq!(first, source);
+        first.save(&path).unwrap();
+        assert_eq!(load(&art).unwrap(), source);
+        std::fs::remove_file(path).unwrap();
     }
 }

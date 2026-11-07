@@ -1,32 +1,74 @@
 # Recording on macOS
 
-`devices` shows the drive ID, write capabilities and the current disc state.
-Use `devices --json` for the same data plus per-track details. A new job
+`devices` groups the disc state, write capabilities, per-track details,
+selector and full device ID. Use `--device GX40N` for a unique model or
+copy its 12-character hardware ID (`local-xxxxxxxxxx` when a reliable
+drive serial is unavailable). Long native IDs remain available in
+`devices --json`. Missing values are shown
+as unknown, separately from zero or unsupported capabilities. A new job
 requires a blank CD-R or CD-RW and a drive that supports writing that medium
-with both SAO and TAO. The default requested speed is 8×. Choose a speed
-supported by your drive and disc. A used CD-RW needs a separate erase.
+with both SAO and TAO. By default, no fixed speed is requested: DiscRecording lets the drive use its
+supported maximum for the inserted medium. Use `--speed N` to request a specific
+CD speed multiplier (1–64×). A used CD-RW needs `discimage erase` before preparation.
 See the [calibration walkthrough](calibration.md#reusing-cd-rw).
+
+Use `discimage select ID` once to save a default, or pass `--device ID` to each
+command. Explicit flags override the default without updating it. A saved job
+keeps its own drive binding and ignores the default. `discimage select` shows
+the setting; `discimage select --clear` removes it. An unavailable default stops
+selection rather than falling back to another drive.
 
 ```sh
 discimage devices
-discimage prepare album.toml --output record --speed 8
+discimage burn album.toml --output record --dry-run
 open record/planned/preview.svg
-discimage resume record
+discimage burn record
 ```
 
-`prepare` selects the only eligible drive, snapshots inputs, and builds and
+`burn --dry-run` selects the only eligible drive, snapshots inputs, and builds and
 verifies the provisional bundle without reserving or writing the disc. Use
-`--device 'DRIVE_ID'` if several drives qualify. `resume` uses the saved drive
-ID and speed. An optional `--device` must match that saved ID.
+`--device` with a short selector or unique model if several drives qualify. `burn JOB` uses the saved drive
+ID and speed policy for both sessions. Automatic speed is saved as `null` in
+`journal.json`; numeric speeds from older jobs remain fixed when resumed. An
+optional `--device` must resolve to that saved native ID.
 
 For a single command that prepares and writes immediately, use
-`discimage burn album.toml --device 'DRIVE_ID' --output record`.
-`burn --dry-run` is equivalent to `prepare`.
+`discimage burn album.toml --output record`. Add `--device` when more than one blank drive qualifies.
+Pass an existing job directory to `burn` to start or continue its recording.
 
 For a matching CD-R preset, `burn --blank-cdr CAPACITY_SECTORS` selects and
 reserves the only eligible blank drive at that exact reported capacity. Use the
 capacity from the preset as the expected value. With multiple eligible drives,
 also pass `--device`. The disc is checked again before writing audio.
+
+A closed disc with music tracks in session 1 and a data track in session 2 is
+already recorded. `burn --dry-run` requires blank media and never erases it implicitly.
+For another recording on that CD-RW, run `discimage erase` and prepare into a
+new output directory. Existing job directories are rejected before selecting or
+reserving a drive; use `burn JOB` only for a resumable existing job.
+
+## Erasing CD-RW
+
+```sh
+discimage erase --dry-run
+discimage erase
+```
+
+`erase` selects the only available CD-RW, reserves and identifies that media,
+shows its contents and asks you to type `ERASE`. Multiple eligible drives require
+a `--device` selector from `devices`. CD-R and other media are rejected.
+The default is a complete erase, including the previous artwork; `--quick`
+only resets the disc metadata and can leave previous marks visible. `--yes`
+explicitly approves erasure without the prompt. `--dry-run` checks selection
+without reserving or erasing the media.
+
+The native DiscRecording erase reports state changes, available percentages and
+elapsed time, with a heartbeat every 15 seconds. DRErase has no abort operation:
+Ctrl+C before starting cancels; after starting, the CLI waits for completion and
+keeps reporting progress. Keep the drive connected. Success requires terminal
+framework success followed by a blank CD-RW with zero sessions/tracks and
+positive writable capacity. This confirms the drive state, not a byte-for-byte
+blank-surface scan. Erasing does not start recording automatically.
 
 ## CD-Text
 
@@ -97,7 +139,7 @@ these APIs. Keep the same disc in the drive throughout the job.
 An OS file lock prevents concurrent processes from using the same job. Final
 snapshots report the state last observed by the backend, not a prediction.
 
-| Stage | `resume` behavior |
+| Stage | `burn JOB` behavior |
 | --- | --- |
 | `prepared` | Revalidate inputs, acquire the selected drive, and start music on a blank CD-R or CD-RW |
 | `music_written` | Confirm the music session, verify its PCM, and generate data at the measured NWA |
@@ -107,8 +149,8 @@ snapshots report the state last observed by the backend, not a prediction.
 
 Ctrl+C requests DiscRecording abort during a write. During music readback and
 offline preparation it stops before the next write. If a write was started,
-inspect the media and the journal before any further operation. There is no
-erase or overburn path.
+inspect the media and the journal before any further operation. The recording transaction never erases or overwrites media. Erasing is a separate
+explicit command; there is no overburn path.
 The CLI writes diagnostics and progress to stderr. On Terminal.app, labels
 use basic ANSI colors. Redirect stderr to save a plain-text log, or set
 `NO_COLOR=1` to keep plain text in an interactive terminal. During writing,
@@ -122,8 +164,9 @@ change help distinguish a slow stage from one that is progressing.
 `device::Recorder` abstracts status, reservation, appendable music write,
 PCM readback and finalizing data write. `burn` uses only this interface. The Rust macOS adapter
 uses owned JSON and one opaque session handle to call `native/macos.m`;
-`build.rs` links DiscRecording/Foundation only on macOS. Linux/Windows retain
-read-only discovery and the same offline tools, with no recording backend yet.
+`build.rs` links DiscRecording/Foundation only on macOS. Linux and Windows
+share the offline tools. Windows also has a separate read-only CD timing
+probe. Disc writing uses the macOS backend.
 
 Primary interface references are the installed macOS SDK headers:
 `DRDevice.h` (media status/capabilities/reservation), `DRTrack.h` (NWA, pregap,

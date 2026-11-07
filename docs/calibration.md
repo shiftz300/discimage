@@ -16,12 +16,12 @@ It reuses existing evidence and does not change the saved preset.
 ## Guided radial fit
 
 On macOS, a single-session Mode 1 target can serve both the radial photo fit
-and the external read-timing probe. With a blank CD-R inserted:
+and the read-timing probe. With a blank CD-R inserted:
 
 ```sh
-mkdir -p output/calibration
-discimage calibrate record --output output/calibration/record
-discimage calibrate guide --output output/calibration --bundle output/calibration/record
+mkdir -p calibrations/work
+discimage calibrate record --output calibrations/work/record
+discimage calibrate guide --output calibrations/work --bundle calibrations/work/record
 ```
 
 The record command selects the only eligible drive, reserves the disc and
@@ -44,9 +44,10 @@ discimage calibrate guide --output calibration
    before recording. Review the target before confirming.
 2. After recording, photograph the entire recording side straight on, including
    the disc rim and center hole. Save it as `calibration/photo.jpg` and rerun.
-3. Open the generated local HTML page, mark four rim points, four hole points
-   and six band edges along the same ray. Save the downloaded `points.json`
-   into `calibration/` and rerun.
+3. Open **标定取点** in [discimage-website](https://discimage.kasetry.cn/).
+   Import the target JSON and photo. Mark four rim points, four hole points
+   and six band edges along the same ray. Save `points.json` in the working
+   directory and rerun the guide.
 4. Copy the generated `[disc.calibration]` section into `album.toml`. Rebuild
    the template, preview and recording job in new directories.
 
@@ -65,28 +66,27 @@ do not guess points or repeatedly reburn the same unmeasurable target.
 ```sh
 discimage calibrate target --output target
 discimage preview target/target.toml --output target.svg
-discimage prepare target/target.toml --device 'DRIVE_ID' --output record
-discimage resume record
-discimage calibrate mark record/actual-1 photo.jpg --output points.html
-# Open points.html and save points.json.
+discimage burn target/target.toml --device GX40N --output record --dry-run
+discimage burn record
+discimage calibrate mark record/actual-1 --output mark.json
+# Import mark.json and photo.jpg in the website's photo point picker.
 discimage calibrate fit record/actual-1 points.json --output calibration.toml
 ```
 
 For offline authoring use `build target/target.toml --output bundle
 --session-start LBA`, with the actual recording start. The current CLI has no
-standalone physical-disc readback command; `readback` renders a local ISO.
+standalone physical-disc readback command; `verify -o` renders a local ISO.
 
 ## Reusing CD-RW
 
-Preserve the last job, photos and measurements first. The following macOS
-commands **erase the selected disc completely**. Identify the correct drive
-with `drutil list`; replace `1` as needed. Wait for completion, then confirm
-`blank: true` using `discimage devices --json` before starting a new job.
+Preserve the last job, photos and measurements first. `discimage erase` selects
+and confirms the CD-RW, completely erases it, and verifies the blank media state.
+If more than one drive qualifies, pass a short `--device` selector from `discimage devices`.
 
 ```sh
-drutil list
-drutil -drive 1 erase full
-discimage devices --json
+discimage erase --dry-run
+discimage erase
+discimage devices
 ```
 
 ## Saved angular settings
@@ -98,7 +98,7 @@ starting the recording. The `angle` sets artwork orientation in the model.
 
 On the tested GX40N at requested 10×, the correction reduced observed
 inner-to-outer drift from about 14° to about 0.55° at one visible reference pair.
-This is a local measurement. The separate Digital Vinyl photo fit is kept
+This is a local measurement. The separate AZO Gold Vinyl photo fit is kept
 with the catalog's measurements and is available for comparison.
 
 `[disc.phase_target]` remains available for diagnostic pulse bands. Its

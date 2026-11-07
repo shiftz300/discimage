@@ -1,5 +1,9 @@
 /target/
 /output/
+/archive/
+/discimage-archive.tar.zst
+/.discimage-archive.tar.zst.partial
+/calibrations/work/
 /calibrations/*/evidence/
 .DS_Store
 *.wav

@@ -10,7 +10,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const BLOCK: u32 = 2048;
+pub const BLOCK: u32 = crate::codec::COOKED as u32;
+
+/// Convert an absolute LBA to a file offset if the entire extent fits the session.
+/// An empty extent may begin at EOF.
+pub(crate) fn extent_offset(base: u32, sectors: u32, lba: u32, bytes: u64) -> Option<u64> {
+    let offset = u64::from(lba.checked_sub(base)?) * u64::from(BLOCK);
+    let remaining = (u64::from(sectors) * u64::from(BLOCK)).checked_sub(offset)?;
+    (bytes <= remaining).then_some(offset)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -499,4 +507,22 @@ fn record(lba: u32, bytes: u32, directory: bool, name: &[u8]) -> Vec<u8> {
     result[32] = name.len() as u8;
     result[33..33 + name.len()].copy_from_slice(name);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extent_offset;
+
+    #[test]
+    fn absolute_extents_respect_both_session_boundaries() {
+        let offset = |lba, bytes| extent_offset(12_300, 8, lba, bytes);
+        assert_eq!(offset(12_300, 16_384), Some(0));
+        assert_eq!(offset(12_307, 2048), Some(14_336));
+        assert_eq!(offset(12_308, 0), Some(16_384));
+        assert_eq!(offset(12_299, 0), None);
+        assert_eq!(offset(12_307, 2049), None);
+        assert_eq!(offset(12_308, 1), None);
+        assert_eq!(offset(12_309, 0), None);
+        assert_eq!(offset(12_301, u64::MAX), None);
+    }
 }

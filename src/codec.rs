@@ -10,6 +10,8 @@ use crate::project::Disc;
 
 pub const COOKED: usize = 2048;
 pub const RAW: usize = 2352;
+pub(crate) const MODE1_PAYLOAD: std::ops::Range<usize> = 16..16 + COOKED;
+pub(crate) const CIRC_ORIGIN_FRAMES: u32 = 111;
 
 pub struct Codec {
     pub scramble: [u8; RAW - 12],
@@ -45,7 +47,8 @@ impl Default for Codec {
                     + [4, 12, 20, 6, 14, 22][(lane as usize - 12) / 2]
             };
             let column = delay.rem_euclid(24);
-            let displacement = 24 * 111 - (column - delay) + column - lane;
+            let displacement =
+                24 * i64::from(CIRC_ORIGIN_FRAMES) - (column - delay) + column - lane;
             result.inverse[(lane + displacement).rem_euclid(24) as usize] = -displacement;
         }
         for i in 0..256 {
@@ -66,7 +69,7 @@ impl Codec {
     /// Upstream logical-byte convention, including pair swap and inverse CIRC delay.
     /// This models payload positions only, not the parity bytes or complete optical waveform.
     pub fn physical(&self, lba: u32, offset: usize) -> i64 {
-        let byte = (i64::from(lba) * RAW as i64 + 16 + offset as i64) ^ 1;
+        let byte = (i64::from(lba) * RAW as i64 + MODE1_PAYLOAD.start as i64 + offset as i64) ^ 1;
         byte + self.inverse[byte as usize % 24]
     }
 
@@ -77,8 +80,8 @@ impl Codec {
         let time = lba + 150;
         let bcd = |v: u32| ((v / 10) * 16 + v % 10) as u8;
         raw[12..16].copy_from_slice(&[bcd(time / 4500), bcd(time / 75 % 60), bcd(time % 75), 1]);
-        raw[16..2064].copy_from_slice(payload);
-        let crc = raw[..2064].iter().fold(0, |crc, b| {
+        raw[MODE1_PAYLOAD].copy_from_slice(payload);
+        let crc = raw[..MODE1_PAYLOAD.end].iter().fold(0, |crc, b| {
             (crc >> 8) ^ self.edc[((crc ^ u32::from(*b)) & 255) as usize]
         });
         raw[2064..2068].copy_from_slice(&crc.to_le_bytes());

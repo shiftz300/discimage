@@ -41,11 +41,10 @@ impl Plan {
             .collect::<Result<Vec<_>>>()?;
         let mut disc = project.disc.clone();
         if let Some(start) = session_start {
-            let music: u64 = tracks.iter().map(|t| u64::from(t.sectors)).sum();
-            let end = music + (tracks.len() as u64 - 1) * u64::from(disc.intertrack_gap_sectors);
+            let (music, gaps) = music_budget(&tracks, disc.intertrack_gap_sectors);
             disc.session_reserve_sectors = u32::try_from(
                 u64::from(start)
-                    .checked_sub(end)
+                    .checked_sub(music + gaps)
                     .context("session start precedes music end")?,
             )?;
         }
@@ -68,8 +67,9 @@ impl Plan {
         ensure!(
             tracks.iter().all(|t| t.sectors >= 300
                 && t.sectors <= disc.capacity_sectors
-                && t.sectors == t.sample_frames.div_ceil(588)
-                && t.padding_sample_frames == t.sectors * 588 - t.sample_frames),
+                && t.sectors == t.sample_frames.div_ceil(audio::SAMPLES_PER_SECTOR)
+                && t.padding_sample_frames
+                    == t.sectors * audio::SAMPLES_PER_SECTOR - t.sample_frames),
             "invalid audio sector length or padding"
         );
         ensure!(
@@ -94,8 +94,7 @@ impl Plan {
             disc.data_reserve_sectors >= 300,
             "reserve at least 300 sectors for filesystem/content (estimate only)"
         );
-        let music: u64 = tracks.iter().map(|t| u64::from(t.sectors)).sum();
-        let gaps = (tracks.len() as u64 - 1) * u64::from(disc.intertrack_gap_sectors);
+        let (music, gaps) = music_budget(&tracks, disc.intertrack_gap_sectors);
         let start = music
             + gaps
             + u64::from(disc.session_reserve_sectors)
@@ -164,6 +163,11 @@ impl Plan {
         self.estimated_art_end_sector - self.session_start()
     }
 
+    pub(crate) fn music_ranges(&self) -> impl Iterator<Item = std::ops::Range<u32>> + '_ {
+        let gap = self.disc.intertrack_gap_sectors;
+        audio::track_ranges(self.tracks.iter().map(move |track| (track.sectors, gap)))
+    }
+
     pub fn geometry_label(&self) -> &'static str {
         if self.disc.timing.is_some() {
             "Timing candidate · assumed radial scale · physical validation pending"
@@ -173,6 +177,12 @@ impl Plan {
             "Uncalibrated geometry estimate"
         }
     }
+}
+
+fn music_budget(tracks: &[AudioTrack], gap: u32) -> (u64, u64) {
+    let music = tracks.iter().map(|track| u64::from(track.sectors)).sum();
+    let gaps = (tracks.len() as u64 - 1) * u64::from(gap);
+    (music, gaps)
 }
 
 /// A constant-pitch spiral sweeps area approximately linearly with sector count.

@@ -6,6 +6,8 @@ use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 
 use crate::{
     art::Drawing,
+    codec::{COOKED, Codec, RAW},
+    iso::extent_offset,
     layout::{Plan, radius_at_sector},
     project::Artwork,
     spiral::Spiral,
@@ -23,32 +25,43 @@ pub fn readback(
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     ensure!(
-        (256..=4096).contains(&size) && (1..=2048).contains(&samples),
+        (256..=4096).contains(&size) && (1..=COOKED as u32).contains(&samples),
         "readback size must be 256–4096, samples per sector 1–2048"
     );
     let plan = &manifest.plan;
-    let codec = crate::codec::Codec::default();
+    let extent = plan.estimated_art_start_sector..plan.estimated_art_end_sector;
+    let sectors = extent
+        .end
+        .checked_sub(extent.start)
+        .context("invalid artwork extent")?;
+    let offset = extent_offset(
+        manifest.session_start,
+        manifest.data_sectors,
+        extent.start,
+        u64::from(sectors) * COOKED as u64,
+    )
+    .context("artwork extent outside session")?;
+    let codec = Codec::default();
     let mut input = std::io::BufReader::with_capacity(
         1024 * 1024,
         std::fs::File::open(directory.join("session2.iso"))?,
     );
     ensure!(
-        input.get_ref().metadata()?.len() == u64::from(manifest.data_sectors) * 2048,
+        input.get_ref().metadata()?.len() == u64::from(manifest.data_sectors) * COOKED as u64,
         "incorrect ISO length"
     );
-    input.seek(SeekFrom::Start(
-        u64::from(plan.estimated_art_start_sector - manifest.session_start) * 2048,
-    ))?;
+    input.seek(SeekFrom::Start(offset))?;
     let mut sums = vec![0u64; (size * size) as usize];
     let mut counts = vec![0u32; (size * size) as usize];
     let scale = f64::from(size) / 126.0;
-    for lba in plan.estimated_art_start_sector..plan.estimated_art_end_sector {
-        let mut sector = [0; 2048];
+    let art_start = i64::from(extent.start) * RAW as i64;
+    for lba in extent {
+        let mut sector = [0; COOKED];
         input.read_exact(&mut sector)?;
         for sample in 0..samples {
-            let offset = (sample * 2048 / samples) as usize;
+            let offset = (sample * COOKED as u32 / samples) as usize;
             let physical = codec.physical(lba, offset);
-            if physical < i64::from(plan.estimated_art_start_sector) * 2352 {
+            if physical < art_start {
                 continue;
             }
             let (x, y) = crate::codec::point(&plan.disc, physical);
@@ -170,18 +183,20 @@ struct Band {
 fn bands(plan: &Plan) -> Vec<Band> {
     let mut result = Vec::new();
     let mut end = 0;
-    for (i, track) in plan.tracks.iter().enumerate() {
-        end += track.sectors;
+    for (i, track) in plan.music_ranges().enumerate() {
+        if i > 0 {
+            result.push(Band {
+                end: track.start,
+                color: GAP,
+            });
+        }
+        end = track.end;
         let color = if i % 2 == 0 {
             MUSIC
         } else {
             [83, 132, 184, 255]
         };
         result.push(Band { end, color });
-        if i + 1 < plan.tracks.len() {
-            end += plan.disc.intertrack_gap_sectors;
-            result.push(Band { end, color: GAP });
-        }
     }
     end += plan.disc.session_reserve_sectors;
     result.push(Band {
@@ -219,20 +234,35 @@ pub fn save(plan: &Plan, artwork: Option<&Artwork>, path: &Path, size: u32) -> R
         matches!(extension.as_str(), "svg" | "png"),
         "preview output must end in .svg or .png"
     );
-    let disc = render(plan, artwork, size)?;
-    let mut png = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(disc).write_to(&mut png, ImageFormat::Png)?;
-    let bytes = if extension == "svg" {
-        report(plan, artwork, &png.into_inner()).into_bytes()
+    let png = render_png(plan, artwork, size)?;
+    if extension == "svg" {
+        write_preview(path, report(plan, artwork, &png).as_bytes())
     } else {
-        png.into_inner()
-    };
+        write_preview(path, &png)
+    }
+}
+
+pub(crate) fn save_bundle(plan: &Plan, artwork: Option<&Artwork>, directory: &Path) -> Result<()> {
+    let png = render_png(plan, artwork, 1024)?;
+    let svg = report(plan, artwork, &png);
+    write_preview(&directory.join("preview.svg"), svg.as_bytes())?;
+    write_preview(&directory.join("design.png"), &png)
+}
+
+fn render_png(plan: &Plan, artwork: Option<&Artwork>, size: u32) -> Result<Vec<u8>> {
+    let disc = render(plan, artwork, size)?;
+    let mut output = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(disc).write_to(&mut output, ImageFormat::Png)?;
+    Ok(output.into_inner())
+}
+
+fn write_preview(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .with_context(|| format!("cannot create {}", path.display()))?;
-    std::io::Write::write_all(&mut output, &bytes)?;
+    std::io::Write::write_all(&mut output, bytes)?;
     Ok(())
 }
 

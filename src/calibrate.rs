@@ -2,13 +2,11 @@
 //! The wide-band measurement workflow is inspired by DiscImageStudio.
 use std::{
     fs::{File, OpenOptions},
-    io::{Cursor, Write},
+    io::Write,
     path::Path,
 };
 
 use anyhow::{Context, Result, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
-use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -50,7 +48,8 @@ pub fn record_single(
     );
     #[cfg(target_os = "macos")]
     {
-        crate::macos::record_calibration(directory, device, speed, dry_run)
+        let device = device.map(crate::device::resolve_id).transpose()?;
+        crate::macos::record_calibration(directory, device.as_deref(), speed, dry_run)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -217,26 +216,13 @@ pub fn digest(directory: &Path) -> Result<String> {
     Ok(bundle(directory)?.2)
 }
 
-/// Produce a self-contained local page for taking points without a GUI dependency.
-pub fn mark(directory: &Path, photo: &Path, output: &Path) -> Result<()> {
-    let (_, _, digest) = bundle(directory)?;
-    let mut reader = ImageReader::open(photo)?.with_guessed_format()?;
-    ensure!(
-        matches!(reader.format(), Some(ImageFormat::Png | ImageFormat::Jpeg)),
-        "photo must be PNG or JPEG"
-    );
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    reader.limits(limits);
-    let photo = reader.decode()?.thumbnail(3072, 3072);
-    let mut bytes = Cursor::new(Vec::new());
-    photo.write_to(&mut bytes, ImageFormat::Png)?;
-    let page = include_str!("../assets/mark.html")
-        .replace("@BUNDLE@", &digest)
-        .replace("@PHOTO@", &STANDARD.encode(bytes.into_inner()));
-    write(output, page.as_bytes())
+/// Export the identity of a verified target for the website's photo point picker.
+pub fn mark(directory: &Path, output: &Path) -> Result<()> {
+    let descriptor = serde_json::json!({
+        "format": "discimage-mark-v1",
+        "bundle_sha256": digest(directory)?,
+    });
+    write(output, &serde_json::to_vec_pretty(&descriptor)?)
 }
 
 type Point = [f64; 2];

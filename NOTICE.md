@@ -34,7 +34,13 @@ other user-provided resources retain their original rights.
 The experimental timing importer and phase comparison use the CD `u/v` model
 and read-end conventions documented by
 [Ashley-QwQ/disc-probe](https://github.com/Ashley-QwQ/disc-probe)
-(`934bb784202dfadc420aa39355a0f31ac08e7614`). The external macOS acquisition tool is
-[NaiveTomcat/discprobe-macos](https://github.com/NaiveTomcat/discprobe-macos),
-also GPL-3.0-or-later. Its Python engine and native helper remain external;
-discimage adds result validation, coordinate conversion and candidate previews.
+(`934bb784202dfadc420aa39355a0f31ac08e7614`). The built-in CD acquisition
+adapts its spindle-period analysis, geometry ladder and Windows SCSI transport
+ideas, reviewed at `fa64fd60498c3eac8a6683828384d62082f0af65`.
+The macOS MMC user-client handshake adapts the native helper from
+[NaiveTomcat/discprobe-macos](https://github.com/NaiveTomcat/discprobe-macos).
+The CD-specific cache strategy and timing acquisition adapt
+[shiftz300/discprobe-macos](https://github.com/shiftz300/discprobe-macos)
+at `0fc8493522c4751988723640b266078445524f5e`. Both projects are GPL-3.0-or-later.
+DiscImage uses a bounded CD-only command set, operating-system transports,
+Rust timing and fitting, and its existing report and candidate formats.

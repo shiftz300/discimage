@@ -13,12 +13,11 @@ mkdir -p projects/my-album/audio
 `[[tracks]]`。路径以 TOML 所在目录为基准。加图后取消注释 `[artwork]`。已有标定时可在专辑顶层[引用预设](../calibrations/README.md)。
 
 ```sh
-mkdir -p output/my-album
+mkdir -p projects/my-album/output
 discimage plan projects/my-album/album.toml
-discimage template projects/my-album/album.toml --output output/my-album/templates
-discimage preview projects/my-album/album.toml --output output/my-album/preview.svg
+discimage template projects/my-album/album.toml --output projects/my-album/output/templates
+discimage preview projects/my-album/album.toml --output projects/my-album/output/preview.svg
 ```
 
-把模板目录里的 `layout.json` 导入网页编辑器。需要离线构建或刻录时，
-使用新输出目录，例如 `output/my-album/build` 或 `output/my-album/record`。
+把模板目录里的 `layout.json` 导入网页编辑器。离线镜像和刻录作业也放在专辑自己的 `output/` 下，每次使用新的子目录。
 [完整参数示例](../examples/album.toml) · [标定配置](../calibrations/README.md) · [刻录流程](../docs/recording.md)

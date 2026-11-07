@@ -26,10 +26,10 @@ discimage template album.toml --output templates
 discimage preview album.toml --output preview.svg
 discimage preview album.toml --output disc.png --size 1600
 discimage build album.toml --output album
-discimage readback album --output detail.png --samples 128 --size 1600
+discimage verify album --output detail.png --samples 128 --size 1600
 ```
 
-`preview` uses the source; `build` additionally exports all four views; `readback`
+`preview` uses the source; `build` additionally exports all four views; `verify -o`
 first verifies the bundle then reads its ISO. Output resolution is 256–4096,
 default 1024. Input PNG/JPEG dimensions are limited to 8192 per side. SVG embeds
 its raster image and has no external source links or executable content. Exports
@@ -56,8 +56,9 @@ mapping. Physical placement still uses the plan's absolute LBA/spiral model.
 Processing order is weighted sRGB-byte grayscale, gamma (`0.1–4`, exponent
 `1/gamma`), brightness (`-255–255`), optional inversion and finally tone.
 Transparent pixels composite over white. This is an artistic tone pipeline,
-not radiometric calibration. Disc sources normalize to 1600×1600; strips preserve
-aspect ratio with longest side 4096. The same normalized grid is used by design
+not radiometric calibration. Disc sources use a square canvas sized to the longest source side, bounded
+to 1600–4096 pixels. Strips retain their original pixels, up to the 8192-pixel
+decoder limit, without resizing. The same normalized grid is used by design
 preview and authoring, retained in the bundle as `source.png`.
 
 - **gray:** continuous in design; deterministic stochastic `0D/AA` halftoning

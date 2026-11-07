@@ -20,12 +20,12 @@ pub struct Options {
     /// Working directory. Reuse it to continue from the last step.
     #[arg(short, long)]
     output: PathBuf,
-    /// Required only if more than one optical drive is detected.
+    /// Drive ID or unique model; overrides the default saved by select.
     #[arg(long)]
     device: Option<String>,
-    /// Requested CD write speed multiplier for a new job.
-    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
-    speed: u32,
+    /// Requested CD speed multiplier; omit for the drive-selected maximum.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    speed: Option<u32>,
     /// Proceed with recording without the interactive confirmation.
     #[arg(long, conflicts_with = "bundle")]
     write: bool,
@@ -88,20 +88,15 @@ pub fn run(options: Options) -> Result<()> {
         );
         return Ok(());
     };
-    // The page belongs to one photo and one exact target.
-    let photo_digest = author::digest(&photo).context("无法读取盘片照片")?;
     let target_digest = calibrate::digest(&bundle)?;
-    let page = directory.join(format!(
-        "points-{}-{}.html",
-        &target_digest[..12],
-        &photo_digest[..12]
-    ));
-    if !page.try_exists()? {
-        calibrate::mark(&bundle, &photo, &page)?;
+    let target = directory.join(format!("mark-{}.json", &target_digest[..12]));
+    if !target.try_exists()? {
+        calibrate::mark(&bundle, &target)?;
     }
     println!(
-        "[2/3] 在浏览器打开 {}，按提示取点并下载 points.json。",
-        page.display()
+        "[2/3] 打开 discimage-website 的「标定取点」，导入 {} 和 {}，取点后导出 points.json。",
+        target.display(),
+        photo.display()
     );
     println!(
         "把 points.json 移到 {}，再运行同一条命令。",
@@ -177,10 +172,19 @@ fn record(directory: &Path, options: &Options) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let drives = device::list()?;
+    let selector = if journal.is_some() {
+        options.device.clone()
+    } else {
+        crate::selection::preferred(options.device.as_deref())?
+    };
+    let requested = selector
+        .as_deref()
+        .map(|id| device::resolve(&drives, id))
+        .transpose()?;
     let id = journal
         .as_ref()
         .map(|j| j.device.as_str())
-        .or(options.device.as_deref());
+        .or(requested.map(|drive| drive.id.as_str()));
     let drive = match (id, drives.as_slice()) {
         (_, []) => {
             println!("[1/3] 等待光驱。请连接刻录机并放入盘片，然后重跑同一条命令。");
@@ -194,13 +198,13 @@ fn record(directory: &Path, options: &Options) -> Result<Option<PathBuf>> {
         (None, _) => {
             println!("[1/3] 找到多个光驱，请用 --device 指定一个。");
             for drive in drives {
-                println!("  {}  {}", drive.name, drive.id);
+                println!("  {}  {}", drive.selector(), drive.name);
             }
             return Ok(None);
         }
     };
-    if let Some(id) = options.device.as_deref() {
-        ensure!(drive.id == id, "当前作业已绑定到另一台光驱");
+    if let Some(requested) = requested {
+        ensure!(drive.id == requested.id, "当前作业已绑定到另一台光驱");
     }
     let Some(media) = &drive.media else {
         println!(

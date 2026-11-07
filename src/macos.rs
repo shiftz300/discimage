@@ -1,6 +1,8 @@
-//! The only unsafe boundary: owned UTF-8 JSON and one opaque Objective-C session.
+//! DiscRecording bridge with owned UTF-8 JSON and one opaque session.
 use crate::{
-    audio, console,
+    audio,
+    codec::{COOKED, MODE1_PAYLOAD, RAW},
+    console,
     device::{self, Device, Music},
     project::CdText,
 };
@@ -85,15 +87,8 @@ impl Recorder {
             "media_node"
         };
         let media: MediaNode = self.request(json!({"op":op}))?;
-        let name = media
-            .bsd_name
-            .strip_prefix("/dev/")
-            .unwrap_or(&media.bsd_name);
-        ensure!(
-            name.strip_prefix("disk")
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
-            "invalid CD device name: {name}"
-        );
+        let name = device::whole_bsd_name(&media.bsd_name)
+            .with_context(|| format!("invalid CD device name: {}", media.bsd_name))?;
         let path = format!("/dev/r{name}");
         File::open(&path).with_context(|| format!("cannot open {path} for CD readback"))
     }
@@ -102,12 +97,12 @@ impl Recorder {
         let iso = File::open(path)?;
         for relative in [16, sectors - 2, sectors - 1] {
             let lba = start + relative;
-            let mut raw = [0; 2352];
-            let mut expected = [0; 2048];
-            disc.read_exact_at(&mut raw, u64::from(lba) * 2352)?;
-            iso.read_exact_at(&mut expected, u64::from(relative) * 2048)?;
+            let mut raw = [0; RAW];
+            let mut expected = [0; COOKED];
+            disc.read_exact_at(&mut raw, u64::from(lba) * RAW as u64)?;
+            iso.read_exact_at(&mut expected, u64::from(relative) * COOKED as u64)?;
             ensure!(
-                raw[15] == 1 && raw[16..2064] == expected,
+                raw[15] == 1 && raw[MODE1_PAYLOAD] == expected,
                 "Mode 1 readback mismatch at LBA {lba}"
             );
         }
@@ -120,6 +115,40 @@ impl Drop for Recorder {
             let _: Result<Value> = self.request(json!({"op":"close"}));
         }
     }
+}
+
+pub fn erase(id: &str, quick: bool, confirm: impl FnOnce(&Device) -> Result<bool>) -> Result<()> {
+    let mut recorder = Recorder::new(id);
+    // Reserve and identify this physical media before asking for confirmation.
+    let selected: Device = recorder.request(json!({"op":"erase_open", "device":id}))?;
+    if !confirm(&selected)? {
+        println!("Erase cancelled. No disc contents changed.");
+        return Ok(());
+    }
+    ensure!(!device::cancelled(), "erase cancelled before starting");
+    console::phase(
+        "erase",
+        format_args!(
+            "{} erase of {}",
+            if quick { "Quick" } else { "Full" },
+            selected.name
+        ),
+    );
+    let after: Device = recorder.request(json!({"op":"erase", "quick":quick}))?;
+    ensure!(
+        after.id == id
+            && after.media.as_ref().is_some_and(|m| m.kind == "cd-rw"
+                && m.blank
+                && m.sessions == 0
+                && m.tracks == 0
+                && m.free_sectors.is_some_and(|n| n > 0))
+            && after.tracks.iter().all(|t| t.empty),
+        "erase finished but blank CD-RW state was not confirmed; inspect devices before recording"
+    );
+    console::success(format_args!(
+        "CD-RW erased; blank media and writable capacity confirmed. Ready for prepare."
+    ));
+    Ok(())
 }
 
 pub fn record_calibration(
@@ -247,7 +276,7 @@ impl device::Recorder for Recorder {
     fn music(
         &mut self,
         tracks: &[Music],
-        speed: u32,
+        speed: Option<u32>,
         cd_text: Option<(&str, &CdText)>,
     ) -> Result<()> {
         let mut request = json!({"op":"audio","tracks":tracks,"speed":speed});
@@ -264,7 +293,7 @@ impl device::Recorder for Recorder {
     fn verify_data_tail(&mut self, path: &Path, start: u32, sectors: u32) -> Result<()> {
         self.verify_mode1_tail(path, start, sectors)
     }
-    fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: u32) -> Result<()> {
+    fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: Option<u32>) -> Result<()> {
         let _: Value = self.request(
             json!({"op":"data","path":path,"start":start,"sectors":sectors,"speed":speed}),
         )?;
@@ -273,20 +302,17 @@ impl device::Recorder for Recorder {
 }
 
 fn verify_pcm(disc: &File, tracks: &[Music]) -> Result<()> {
-    const SECTOR_BYTES: usize = 2352;
     const CHUNK_SECTORS: u32 = 128;
-    let mut actual = vec![0; CHUNK_SECTORS as usize * SECTOR_BYTES];
+    let mut actual = vec![0; CHUNK_SECTORS as usize * RAW];
     let mut expected = actual.clone();
-    let mut lba = 0;
     let start = Instant::now();
     console::phase(
         "readback",
         format_args!("Comparing the music session with the prepared WAVs"),
     );
-    for (i, track) in tracks.iter().enumerate() {
-        if i != 0 {
-            lba += track.gap;
-        }
+    let ranges = audio::track_ranges(tracks.iter().map(|track| (track.sectors, track.gap)));
+    for (i, (track, range)) in tracks.iter().zip(ranges).enumerate() {
+        let mut lba = range.start;
         let number = i + 1;
         let source = audio::inspect(&track.path)?;
         ensure!(
@@ -308,12 +334,12 @@ fn verify_pcm(disc: &File, tracks: &[Music]) -> Result<()> {
         while left > 0 {
             ensure!(!device::cancelled(), "audio readback cancelled");
             let count = left.min(CHUNK_SECTORS);
-            let len = count as usize * SECTOR_BYTES;
+            let len = count as usize * RAW;
             wav.read_exact(&mut expected[..len])?;
-            disc.read_exact_at(&mut actual[..len], u64::from(lba) * SECTOR_BYTES as u64)
+            disc.read_exact_at(&mut actual[..len], u64::from(lba) * RAW as u64)
                 .with_context(|| format!("cannot read track {number} at LBA {lba}"))?;
-            let (actual_sectors, _) = actual[..len].as_chunks::<SECTOR_BYTES>();
-            let (expected_sectors, _) = expected[..len].as_chunks::<SECTOR_BYTES>();
+            let (actual_sectors, _) = actual[..len].as_chunks::<RAW>();
+            let (expected_sectors, _) = expected[..len].as_chunks::<RAW>();
             if let Some(offset) = actual_sectors
                 .iter()
                 .zip(expected_sectors)
@@ -350,7 +376,13 @@ fn verify_pcm(disc: &File, tracks: &[Music]) -> Result<()> {
 
 pub fn devices() -> Result<Vec<Device>> {
     let value: Value = Recorder::new("").request(json!({"op":"list"}))?;
-    Ok(serde_json::from_value(value["devices"].clone())?)
+    let mut drives: Vec<Device> = serde_json::from_value(value["devices"].clone())?;
+    for drive in &mut drives {
+        if let Some(identity) = crate::probe::hardware_identity(&drive.id) {
+            drive.hardware = Some(identity);
+        }
+    }
+    Ok(drives)
 }
 
 #[cfg(test)]
@@ -429,9 +461,21 @@ mod tests {
         let response: Value = Recorder::new("")
             .request(json!({
                 "op":"selftest","path":path,"audio":wav,"audio_sectors":sectors,
+                "erase_candidates":[
+                    {"media":{"kind":"cd-rw"},"capabilities":{"cdrw":true}},
+                    {"media":{"kind":"cd-r"},"capabilities":{"cdrw":true}},
+                    {"media":null,"capabilities":{"cdrw":true}},
+                    {"media":{"kind":"cd-rw"},"capabilities":{"cdrw":false}}
+                ],
                 "calibration_candidates":[blank,used,rewritable,unknown_capacity,recorded_track]
             }))
             .unwrap();
+        assert_eq!(
+            response["erase_candidates"],
+            json!([true, false, false, false])
+        );
+        assert_eq!(response["automatic_speed"], true);
+        assert_eq!(response["manual_speed"], true);
         assert_eq!(response["image_sectors"], 4);
         assert_eq!(response["image_mode1"], true);
         assert_eq!(

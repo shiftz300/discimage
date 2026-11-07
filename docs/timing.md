@@ -1,48 +1,67 @@
 # Read timing and photo phase (experimental)
 
-The SW80EU1 / GX40N experiment can estimate a CD spiral from **reading an
-existing data track**. It does not require another erase or calibration burn.
-The reader must expose real media timing: caching, variable rotation and USB
-latency can make other drives unsuitable. The Rust CLI can invoke the external
-probe and import an offline candidate. It does not automatically extract photo
-features or accept a candidate as physically validated.
+Read timing estimates a CD spiral from a recorded data track. The probe runs
+inside DiscImage on macOS and Windows. Phase comparison and candidate import
+run offline on macOS, Windows and Linux. A drive must deliver real media
+reads at a stable rotation rate. Caching, changing speed and USB latency
+can make a drive unsuitable.
 
-## Use the workflow
+## Measure and compare
 
-Keep the visually accepted project. Reuse existing measurements when available;
-no erasure or new recording is needed for offline import.
-
-For a **finalized, single-session, single-track Mode 1 CD**, install the
-[CD-capable discprobe-macos branch](https://github.com/shiftz300/discprobe-macos/tree/codex/mode1-cd-geometry)
-and its native helper according to its README. Then, using the current drive ID
-and a recorded data interval (upper bound exclusive):
+Use a finalized, single-session, single-track Mode 1 CD. Run `discimage devices`
+and use the same drive ID or unique model as other commands, on macOS
+or Windows. After `discimage select ID`, the `--device` flag is optional;
+without a default, exactly one connected optical drive is required:
 
 ```sh
-discimage calibrate probe --probe-dir /path/to/discprobe-macos \
-  --device diskN --first 122000 --end 356000 --output measurement
+discimage devices
+discimage calibrate probe --device GX40N --check
+discimage calibrate probe --device GX40N --output measurement
 ```
 
-`--python` selects an interpreter if needed. Progress streams to the terminal and
-stdout is saved as `measurement/progress.log`; errors also appear on the terminal.
-Ctrl-C stops acquisition. The command records the checkout revision and arguments
-in `probe.json`. It does not install dependencies, unmount volumes or write media.
-The external CD backend rejects audio, mixed, multisession and unfinalized media.
-Our existing CD Extra CD-RW was measured with a separate restricted adapter;
-reuse those results instead of running this single-session backend on that disc.
+When several drives share a model, replace `GX40N` with the exact selector shown by `devices`
+(the 12-character hardware ID, or `local-xxxxxxxxxx` without a reliable drive serial). Legacy macOS whole-disc names (`diskN`) and Windows drive letters
+(`E:`) remain accepted. If macOS exclusive access fails, identify and unmount
+only that optical volume. Windows SCSI pass-through needs permission to open
+the optical device; access failures do not change permissions.
 
-Create a phase report using the command below, including `--evidence`, then import:
+`--check` reports the recorded range using only metadata commands. Measurement
+defaults to 3–85% of that range, matching DiscProbe. Supply both `--first` and
+`--end` (exclusive) to choose another range. The probe rejects audio, mixed,
+multisession and unfinalized media. Existing CD Extra experiments can still be
+imported from saved reports.
+
+The probe requests a read speed of 1411 kB/s and tests 40 ordinary reads and
+40 FUA reads at the middle of the track. If ordinary reads look cached and
+FUA does not help, it tries a zero-length READ(12) with FUA before each read.
+The last fallback reads 256 sectors elsewhere in the confirmed track in
+chunks of up to 32 sectors before each timed read. Indirect methods discard
+timed reads under 3 ms. Phase estimation subtracts the local drift
+interpolated from adjacent reference reads. The probe issues no writes to
+the disc. Ctrl+C stops before the next command.
+
+Keep `measurement/summary.json`, `measurement/targets.csv` and
+`measurement/status.json` together. An interrupted acquisition has
+`completed=false`. The receipt records the chosen cache strategy as soon as
+the cache test completes. Compatible reports from earlier probes still work.
+
+Use phase points extracted from the photo and the exact bundle used to
+record the photographed artwork:
 
 ```sh
+discimage calibrate phase --timing measurement/summary.json \
+  --bundle record/actual-1 --points points.json \
+  --evidence photo.jpg --output comparison
+
 discimage calibrate import album.toml \
-  --timing measurement/geo-DRIVE-TIME/summary.json \
-  --phase comparison/report.json --bundle record/actual-1 \
-  --output candidate
+  --timing measurement/summary.json --phase comparison/report.json \
+  --bundle record/actual-1 --output candidate
 ```
 
-Open `candidate/index.html` to switch between design, predicted old placement,
-predicted candidate placement and their difference, zoom to 4×, and inspect the
-angle-drift curve. `candidate/candidate.toml` is a complete, separate project usable
-with existing `plan`, `preview`, `build` and `burn` commands. It references the
+Import the `candidate/` folder in **时序对比** on
+[discimage-website](https://discimage.kasetry.cn/). The tab shows the four
+comparison images and the drift curve from `report.json`. Export `candidate.toml`
+to use with `plan`, `preview`, `build` and `burn`. It references the
 original assets by absolute path; it is not a portable bundle. No preset is
 automatically applied. Use a new output directory on each run.
 
@@ -57,7 +76,8 @@ rebuild. Original projects without timing metadata retain their prior behavior.
 Current candidate screening requires at least eight distinct targets plus a
 reference, verified FUA or uncached plain reads, period spread ≤0.5%, timing RMS
 ≤0.3°, span sigma ≤0.5°, and at least two photo curves with validation RMS ≤0.3°
-and maximum error ≤1°. These are conservative software gates, **not universal
+and maximum error ≤1°. Flush and eviction runs can be analyzed for phase but
+do not qualify for candidate import. These are conservative software gates, **not universal
 accuracy guarantees**. Interrupted experimental runs with `completed=false`
 are rejected. The hashes identify evidence; they are not independent proof that
 the photo extraction or physical assumptions were correct.
@@ -93,21 +113,14 @@ The experiment combined the read-only macOS transport from
 [discprobe-macos](https://github.com/NaiveTomcat/discprobe-macos/tree/61ea3498dd6139bc92328bb3c1b9afae099f5394)
 and the CD solver from
 [disc-probe](https://github.com/Ashley-QwQ/disc-probe/tree/934bb784202dfadc420aa39355a0f31ac08e7614).
-Both are GPL-3.0-or-later. Their temporary device adapters are not part of
-discimage's recording backend. A mixed audio/data disc needs data-track bounds;
+Both are GPL-3.0-or-later. This experiment predates the built-in probe. A mixed audio/data disc needs data-track bounds;
 do not use a whole-disc data-read sweep across its audio and session gaps.
 
 ## Compare an existing photograph offline
 
-`tools/phase.py` uses Python 3.9+ and the standard library. It never opens a
-drive or changes a project. It compares an external timing summary, the exact
-written bundle's manifest, and already extracted photo phase points:
-
-```sh
-python3 tools/phase.py --timing geometry/summary.json \
-  --bundle record/actual-1 --points points.json \
-  --evidence photo.jpg --output comparison
-```
+`discimage calibrate phase` compares the timing summary, the exact written
+bundle and phase points already extracted from a photo. It works offline
+and does not open a drive or modify project settings.
 
 Open `comparison/index.html` in a browser. `report.json` includes input hashes,
 individual fits, a shared fit and leave-one-curve-out checks. The output
@@ -216,6 +229,7 @@ application. A complete front-on photo of the same disc, including rim and
 true center hole, would improve the remaining check without another burn.
 
 ```sh
-python3 -m unittest discover -s tests -p phase.py
+cargo test --locked --lib phase::tests
+cargo test --locked --lib probe::tests
 cargo test --locked --lib codec::tests
 ```

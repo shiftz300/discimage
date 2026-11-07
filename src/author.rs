@@ -8,7 +8,7 @@ use crate::{
     audio,
     codec::{COOKED, Codec, RAW},
     console,
-    iso::{Entry, Volume},
+    iso::{Entry, Volume, extent_offset},
     layout::Plan,
     preview,
     project::{Artwork, Project},
@@ -56,13 +56,7 @@ pub(crate) fn build_project(
     let plan = Plan::from_project(&project, session_start)?;
     let start = plan.session_start();
     let sectors = plan.data_sectors();
-    let volume = Volume::new(
-        project.files.as_deref(),
-        start,
-        sectors,
-        plan.disc.data_reserve_sectors,
-        &plan.title,
-    )?;
+    let volume = volume(&project, &plan)?;
     // Input image is decoded before creating any output directory.
     let source = project.artwork.as_ref().map(art::load).transpose()?;
     std::fs::create_dir(output)
@@ -88,8 +82,7 @@ pub(crate) fn build_project(
         )?;
         assets.push("target.json".into());
     }
-    preview::save(&plan, artwork.as_ref(), &output.join("preview.svg"), 1024)?;
-    preview::save(&plan, artwork.as_ref(), &output.join("design.png"), 1024)?;
+    preview::save_bundle(&plan, artwork.as_ref(), output)?;
     assets.extend(["preview.svg", "design.png"].map(str::to_owned));
     if artwork.is_some() {
         assets.push("source.png".into());
@@ -136,12 +129,22 @@ pub(crate) fn build_project(
     Ok(manifest)
 }
 
+pub(crate) fn volume(project: &Project, plan: &Plan) -> Result<Volume> {
+    Volume::new(
+        project.files.as_deref(),
+        plan.session_start(),
+        plan.data_sectors(),
+        plan.disc.data_reserve_sectors,
+        &plan.title,
+    )
+}
+
 fn music(plan: &Plan, output: &Path) -> Result<Vec<String>> {
     let mut assets = Vec::new();
     let mut cue =
         String::from("REM SESSION 1 ONLY - write appendable; see manifest.json for session 2\n");
     for (i, track) in plan.tracks.iter().enumerate() {
-        let name = format!("audio/{:02}.wav", i + 1);
+        let name = audio::track_path(i);
         audio::export(track, &output.join(&name))?;
         assets.push(name.clone());
         cue.push_str(&format!(
@@ -358,15 +361,14 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
         );
     }
     for entry in &manifest.files {
-        ensure!(
-            entry.lba >= manifest.session_start
-                && u64::from(entry.lba - manifest.session_start) * 2048 + u64::from(entry.bytes)
-                    <= u64::from(manifest.data_sectors) * 2048,
-            "file extent outside session"
-        );
-        iso.seek(SeekFrom::Start(
-            u64::from(entry.lba - manifest.session_start) * 2048,
-        ))?;
+        let offset = extent_offset(
+            manifest.session_start,
+            manifest.data_sectors,
+            entry.lba,
+            u64::from(entry.bytes),
+        )
+        .context("file extent outside session")?;
+        iso.seek(SeekFrom::Start(offset))?;
         ensure!(
             hash_reader(&mut (&mut iso).take(u64::from(entry.bytes)))? == entry.sha256,
             "ISO file checksum mismatch: {}",

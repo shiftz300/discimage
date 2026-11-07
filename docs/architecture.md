@@ -9,7 +9,7 @@ until another backend introduces substantial native dependencies.
 | `project` | Strict TOML settings, radial profiles and relative paths |
 | `audio` | RIFF validation, sector alignment and unchanged PCM export |
 | `layout` | Track budgets, session extents and available artwork radii |
-| `spiral` | Shared sector/radius/angle mapping, independent of writable limits |
+| `spiral` | Shared sector/radius/angle mapping and CD channel coordinates |
 | `target` | Pure radial bands and angular pulse patterns |
 | `art` | Disc/strip image sampling, tone and selection of the drawing source |
 | `codec` | Inverse CIRC positions, scrambler and Mode 1 EDC/ECC framing |
@@ -17,23 +17,28 @@ until another backend introduces substantial native dependencies.
 | `author` | Bundle construction, manifest, hashes and integrity verification |
 | `preview` | Design report, ISO payload projection and difference image |
 | `template` | Editable canvases and masks derived from the album layout |
-| `calibrate` | Target export, local photo picker and radial fitting |
-| `timing` | External probe invocation, measured-coverage import and candidate conversion |
+| `calibrate` | Target export, photo point exchange and radial fitting |
+| `probe` | Read-only CD acquisition, spindle timing and geometry fit |
+| `phase` | Offline photo phase comparison and held-out checks |
+| `timing` | Measured-coverage import and candidate conversion |
 | `burn` | Journaled two-session state machine, snapshots and recovery |
 | `device` | Device descriptions, discovery and the backend interface |
 | `macos` | Owned JSON FFI adapter and PCM readback |
 | `main`, `guide` | CLI commands and interactive calibration prompts |
+| `selection` | CLI-only user defaults, atomic TOML updates and explicit override precedence |
 
 `native/macos.m` wraps DiscRecording and is built only on macOS.
-`assets/mark.html` is the self-contained photo point picker embedded by `calibrate`.
-`tools/phase.py` is a separate, standard-library Python experiment for comparing
-external CD timing geometry with photo curves. `timing` consumes its report and
-the probe's numeric measurements, converts the model to ordinary `Disc` geometry,
-and exports a separate candidate. `disc.timing` carries evidence hashes and the
-valid encoding range; `layout` enforces that range, including after an NWA rebuild.
-No new spiral or native drive implementation is introduced. `assets/timing.html` compares
-old and candidate designs projected into the measured model; it is not an optical
-simulation or independent validation. Probe acquisition stays in external Python.
+`calibrate mark` exports a target descriptor for the website's photo point picker.
+The probe uses a separate read-only boundary. `native/probe.c` acquires an
+optical MMC user client on macOS. The two macOS adapters share whole-disc
+identification and I/O Registry traversal. Windows uses direct SCSI pass-through
+on an optical drive letter. Both probe transports share Mode 1 media checks,
+cache checks and the CD timing fit. `phase` compares a photo with measured geometry
+offline. `timing` converts
+the report to ordinary `Disc` geometry and exports a separate candidate.
+`disc.timing` carries evidence hashes and the valid encoding range. `layout`
+enforces it, including after an NWA rebuild. The website displays the
+candidate's report and images exported by `calibrate import`.
 Pure rendering and configuration do not depend on the calibration workflow;
 `calibrate` re-exports its former public configuration types for compatibility.
 
@@ -52,7 +57,9 @@ Project + WAVs → Plan → Volume + Drawing → ISO / RAW / manifest
 once. Both encoding and design previews use it. Pixel dithering in design
 previews remains distinct from byte-phased physical dithering.
 
-`Spiral` owns the constant-pitch area model and its inverse. The capacity and
+`Spiral` owns the constant-pitch area model and its inverse. `ChannelSpiral`
+expresses the measured geometry in channel bits for the probe, photo phase
+comparison and candidate import. The capacity and
 radii define a **reference geometry**; available media space only limits the
 write extent by increasing the end margin. Neither preparation nor a later
 NWA rebuild should silently change the calibrated spiral.

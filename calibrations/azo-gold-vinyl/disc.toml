@@ -1,6 +1,6 @@
 # Albums select a name under profiles. Verification and measurements are records only.
 
-[profiles.digital-vinyl]
+[profiles.azo-gold-vinyl]
 capacity_sectors = 359846
 inner_radius_mm = 24.85823843354061
 outer_radius_mm = 58.06851677424674
@@ -12,15 +12,15 @@ velocity = 1200.988153403327
 angle = 0.0
 
 # Photo-only fit. The artwork preset above uses the timing-derived geometry.
-[measurements.digital-vinyl]
+[measurements.azo-gold-vinyl]
 reference_sectors = 359846
 inner_radius_mm = 25.04586658040409
 outer_radius_mm = 57.96881427836141
 rms_mm = 0.07686033972941834
 
 # Timing fit assumes a 108-frame read shift. Absolute phase relative to the label is unmeasured.
-[verification.digital-vinyl]
-media = "Verbatim Digital Vinyl AZO CD-R"
+[verification.azo-gold-vinyl]
+media = "AZO Gold Vinyl"
 drive = "Apple SuperDrive 2.00"
 requested_speed = 24
 status = "visually-confirmed"
