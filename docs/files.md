@@ -15,14 +15,23 @@
 | [.github/workflows/](../.github/workflows/) | CI 检查 / Continuous integration |
 | `target/` | Cargo 编译产物 / Cargo build products |
 
-把可编辑的专辑配置、音频和图案放在 `projects/<album>/`。模板、预览、离线镜像和刻录作业放在该专辑的 `output/` 下。每次刻录使用新的作业目录，保存当次输入的快照和实际写入的会话。Git 忽略本地专辑、生成物和原始标定证据。
+把可编辑的配置、原始音频和图案放在 `projects/<album>/`。每种盘型保留独立 TOML，
+共享原始素材。`build` 默认输出到该项目的 `output/<TOML文件名>/`，成品内部所有文件平铺。
+Git 忽略个人专辑、生成物和原始标定证据。
 
-Keep editable album inputs in `projects/<album>/`. Store templates, previews, offline images and recording jobs in that album's `output/` directory. Use a fresh directory for each burn. A job stores its own input snapshot and recorded session. Git ignores private albums, generated files and raw calibration evidence.
+Editable albums live in `projects/<album>/`. Separate medium configurations share
+original inputs. Each build produces one flat `output/<TOML name>/` package.
 
-| 制品 / Artifact | 如何识别 / What to look for |
+| 文件 / File | 用途 / Purpose |
 | --- | --- |
-| 模板 / Template | `layout.json`、PNG 和 SVG，供图案编辑使用 / Geometry plus artwork canvases |
-| 离线镜像 / Offline bundle | `manifest.json`、`audio/`、`session2.iso`、`session2.bin` 和预览 / Checksummed files for local inspection |
-| 刻录作业 / Burn job | `journal.json` 保存阶段，`planned/` 是预检，`actual-N/` 对应实测写入地址 / State, planned image and measured-session bundle |
-| 标靶 / Calibration target | `calibration.iso` 和封盘后生成的 `single.json` / Single-session image and finalized receipt |
-| 读回 / Readback | 数据或音频校验报告以及可选的 `cdtext.txt` / Digital verification and optional CD‑Text output |
+| `01.wav`, `02.wav`, … | 唯一一套归一化 PCM / One normalized audio set |
+| `artwork.png` | 冻结的图案输入 / Frozen artwork |
+| `manifest.toml` | 参数、输入校验和、数据镜像信息和刻录状态 / Settings, hashes and recording state |
+| `preview.svg` | 当前设计或实际写入区域的完整预览 / Current self-contained preview |
+| `session2.iso` | 请求导出或读取实际 NWA 后生成 / Requested export or measured data-session image |
+| `session2.bin` | 仅显式 `--raw` 时生成 / Explicit RAW export only |
+| `file-0001.bin`, … | 可选附加文件，原路径存在清单中 / Optional companion data with original ISO paths preserved |
+| `target.json` | 标靶才有 / Calibration targets only |
+
+`.work/` 只用于生成数据时的临时文件，成功后删除；不保留 `source/planned/actual-N`。
+旧格式读写兼容仅用于恢复和迁移，见[刻录说明](recording.md)。

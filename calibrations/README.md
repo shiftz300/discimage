@@ -16,7 +16,7 @@ Add this line at the top level of `projects/my-album/album.toml`. The path is re
 preset = { file = "../../calibrations/azo-gold-vinyl/disc.toml", name = "azo-gold-vinyl" }
 ```
 
-`[profiles]` 是专辑使用的参数。`[verification]` 记录实测光驱、固件和请求速度，`[measurements]` 保留照片拟合等观测值。选定预设后，刻录仍使用当前光驱报告的可写空间和第二会话起点。换光驱或速度时，同批盘可以沿用预设，先用一张检查盘面对齐和读回。
+`[profiles]` 是专辑使用的参数；`media` 指定 `cd-r` 或 `cd-rw`，刻录前核对盘型。`[verification]` 记录实测光驱、固件和请求速度，`[measurements]` 保留照片拟合等观测值。选定预设后，刻录仍使用当前光驱报告的可写空间和第二会话起点。换光驱或速度时，同批盘可以沿用预设，先用一张检查盘面对齐和读回。
 
 `[profiles]` supplies the album settings. `[verification]` records the tested drive, firmware, and requested speed. `[measurements]` holds observations such as the photo fit. Recording uses the current drive's writable capacity and measured second-session start. When changing drive or speed, use the same-batch preset as a starting point and check artwork alignment and readback on the first disc.
 

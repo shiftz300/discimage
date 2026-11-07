@@ -162,7 +162,9 @@ impl Recorder for Drive {
         assert!(
             tracks
                 .iter()
-                .all(|t| t.path.starts_with(self.job.join("planned/audio")) && t.path.is_file())
+                .all(|t| (t.path.starts_with(self.job.join("planned/audio"))
+                    || t.path.parent() == Some(self.job.as_path()))
+                    && t.path.is_file())
         );
         self.calls.push("music");
         if self.fault == Fault::Music {
@@ -380,7 +382,7 @@ fn dry_run_freezes_inputs_then_writes_two_sessions_using_the_measured_nwa() {
     let prepared = burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
     assert_eq!(prepared.stage, Stage::Prepared);
     let wrong_drive = std::process::Command::new(env!("CARGO_BIN_EXE_discimage"))
-        .arg("resume")
+        .arg("burn")
         .arg(&work.job)
         .args(["--device", "wrong-drive"])
         .output()
@@ -631,4 +633,191 @@ fn blank_cdrw_uses_the_same_measured_nwa_and_frozen_calibration() {
     assert_eq!(actual.session_start, 12150);
     assert_eq!(actual.plan.disc.geometry(), (24.6, 57.2, 14000));
     assert_eq!(planned.plan.disc.geometry(), actual.plan.disc.geometry());
+}
+
+#[test]
+fn flat_package_build_is_offline_and_defers_all_data_encoding() {
+    use discimage::package::{self, Package};
+    let work = Work::new();
+    package::build(&work.project, &work.job, None, None).unwrap();
+    let package = Package::load(&work.job).unwrap();
+    package.verify(&work.job).unwrap();
+    assert!(package.journal.is_none() && package.image.is_none());
+    assert!(!work.job.join("session2.iso").exists());
+    assert!(
+        std::fs::read_dir(&work.job)
+            .unwrap()
+            .all(|e| e.unwrap().file_type().unwrap().is_file())
+    );
+    assert!(work.job.join("01.wav").is_file() && work.job.join("02.wav").is_file());
+    let manifest = std::fs::read(work.job.join("manifest.toml")).unwrap();
+    std::fs::write(work.job.join("notes.txt"), "private note").unwrap();
+    assert!(package::build(&work.project, &work.job, None, None).is_err());
+    assert_eq!(
+        std::fs::read(work.job.join("manifest.toml")).unwrap(),
+        manifest
+    );
+    std::fs::remove_file(work.job.join("notes.txt")).unwrap();
+    package::build(&work.project, &work.job, None, None).unwrap();
+    std::fs::write(work.job.join("01.wav"), "changed").unwrap();
+    assert!(Package::load(&work.job).unwrap().verify(&work.job).is_err());
+    let mut drive = Drive::new(&work, Fault::None);
+    assert!(burn::record(&mut drive, &work.job, Some(8)).is_err());
+    assert!(drive.calls.is_empty());
+}
+
+#[test]
+fn selected_image_formats_are_real_and_raw_only_remains_verifiable() {
+    use discimage::{
+        author::Images,
+        package::{self, Package},
+    };
+    for (images, iso, raw) in [
+        (Images::Iso, true, false),
+        (Images::Raw, false, true),
+        (Images::Both, true, true),
+    ] {
+        let work = Work::new();
+        let settings = std::fs::read_to_string(&work.project)
+            .unwrap()
+            .replace("[disc]\n", "[disc]\ncapacity_sectors=14000\n");
+        std::fs::write(&work.project, settings).unwrap();
+        package::build(&work.project, &work.job, Some(images), Some(12150)).unwrap();
+        let package = Package::load(&work.job).unwrap();
+        package.verify(&work.job).unwrap();
+        assert_eq!(work.job.join("session2.iso").exists(), iso);
+        assert_eq!(work.job.join("session2.bin").exists(), raw);
+        assert!(!work.job.join(".work").exists());
+        assert!(
+            std::fs::read_dir(&work.job).unwrap().all(|e| e
+                .unwrap()
+                .file_type()
+                .unwrap()
+                .is_file())
+        );
+        let image = package.image.unwrap();
+        discimage::preview::readback(&work.job, &image, &work.root.join("encoded.png"), 256, 16)
+            .unwrap();
+    }
+}
+
+#[test]
+fn flat_recording_keeps_one_copy_and_recovers_after_audio_verification_failure() {
+    use discimage::package::{self, Package};
+    let work = Work::new();
+    package::build(&work.project, &work.job, None, None).unwrap();
+    let audio = author::digest(&work.job.join("01.wav")).unwrap();
+    let mut drive = Drive::new(&work, Fault::AudioReadback);
+    assert!(burn::record(&mut drive, &work.job, Some(8)).is_err());
+    assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::MusicWritten);
+    assert!(!work.job.join("session2.iso").exists());
+    assert!(package::build(&work.project, &work.job, None, None).is_err());
+    assert!(burn::record(&mut drive, &work.job, Some(10)).is_err());
+    drive.fault = Fault::None;
+    let complete = burn::record(&mut drive, &work.job, None).unwrap();
+    assert_eq!(complete.stage, Stage::Complete);
+    assert_eq!(complete.actual(&work.job), work.job.canonicalize().unwrap());
+    assert_eq!(drive.calls.iter().filter(|&&c| c == "music").count(), 1);
+    assert_eq!(author::digest(&work.job.join("01.wav")).unwrap(), audio);
+    Package::load(&work.job).unwrap().verify(&work.job).unwrap();
+    assert!(work.job.join("session2.iso").is_file());
+    assert!(!work.job.join("session2.bin").exists());
+    assert!(
+        std::fs::read_dir(&work.job)
+            .unwrap()
+            .all(|e| e.unwrap().file_type().unwrap().is_file())
+    );
+    let writes = drive.writes();
+    assert!(burn::record(&mut drive, &work.job, None).is_err());
+    assert_eq!(writes, drive.writes());
+    package::build(&work.project, &work.job, None, None).unwrap();
+    assert!(Package::load(&work.job).unwrap().journal.is_none());
+}
+
+#[test]
+fn completed_legacy_recording_migrates_without_changing_the_written_iso() {
+    use discimage::package::{self, Package};
+    let work = Work::new();
+    let mut drive = Drive::new(&work, Fault::None);
+    let complete = burn::start(&mut drive, &work.project, &work.job, Some(8), false).unwrap();
+    let hash = author::digest(&complete.actual(&work.job).join("session2.iso")).unwrap();
+    let changed = work.job.join("source/unexpected.txt");
+    std::fs::write(&changed, "changed after recording").unwrap();
+    assert!(package::migrate(&work.job).is_err());
+    assert!(work.job.join("journal.json").exists());
+    assert_eq!(
+        author::digest(&complete.actual(&work.job).join("session2.iso")).unwrap(),
+        hash
+    );
+    std::fs::remove_file(changed).unwrap();
+    package::migrate(&work.job).unwrap();
+    let migrated = Package::load(&work.job).unwrap();
+    migrated.verify(&work.job).unwrap();
+    assert_eq!(migrated.journal.unwrap().stage, Stage::Complete);
+    assert_eq!(
+        author::digest(&work.job.join("session2.iso")).unwrap(),
+        hash
+    );
+    assert!(
+        std::fs::read_dir(&work.job)
+            .unwrap()
+            .all(|e| e.unwrap().file_type().unwrap().is_file())
+    );
+    assert!(!work.job.join("planned").exists() && !work.job.join("actual-1").exists());
+}
+
+#[test]
+fn flat_package_requires_the_configured_medium_before_any_write() {
+    use discimage::package;
+    let work = Work::new();
+    let settings = std::fs::read_to_string(&work.project)
+        .unwrap()
+        .replace("[disc]\n", "[disc]\nmedia='cd-rw'\n");
+    std::fs::write(&work.project, settings).unwrap();
+    package::build(&work.project, &work.job, None, None).unwrap();
+    let mut drive = Drive::new(&work, Fault::None);
+    let error = burn::record(&mut drive, &work.job, Some(8)).unwrap_err();
+    assert!(format!("{error:#}").contains("requires cd-rw"));
+    assert!(drive.calls.is_empty());
+}
+
+#[test]
+fn flat_package_replaces_data_at_changed_nwa_without_keeping_attempt_folders() {
+    use discimage::package::{self, Package};
+    let work = Work::new();
+    package::build(&work.project, &work.job, None, None).unwrap();
+    let mut drive = Drive::new(&work, Fault::MovingNwa);
+    let error = burn::record(&mut drive, &work.job, Some(8)).unwrap_err();
+    assert!(format!("{error:#}").contains("NWA changed before data write"));
+    assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::DataReady);
+    drive.fault = Fault::None;
+    let complete = burn::record(&mut drive, &work.job, None).unwrap();
+    assert_eq!(complete.nwa, Some(12151));
+    assert_eq!(complete.attempt, 2);
+    assert_eq!(drive.calls.iter().filter(|&&c| c == "music").count(), 1);
+    Package::load(&work.job).unwrap().verify(&work.job).unwrap();
+    assert!(
+        std::fs::read_dir(&work.job)
+            .unwrap()
+            .all(|e| e.unwrap().file_type().unwrap().is_file())
+    );
+}
+
+#[test]
+fn flat_uncertain_writes_are_protected_from_retry_and_rebuild() {
+    use discimage::package;
+    for (fault, stage) in [
+        (Fault::Music, Stage::MusicWriting),
+        (Fault::Close, Stage::DataWriting),
+    ] {
+        let work = Work::new();
+        package::build(&work.project, &work.job, None, None).unwrap();
+        let mut drive = Drive::new(&work, fault);
+        assert!(burn::record(&mut drive, &work.job, Some(8)).is_err());
+        assert_eq!(Journal::load(&work.job).unwrap().stage, stage);
+        let calls = drive.calls.len();
+        assert!(burn::record(&mut drive, &work.job, None).is_err());
+        assert!(package::build(&work.project, &work.job, None, None).is_err());
+        assert_eq!(calls, drive.calls.len());
+    }
 }

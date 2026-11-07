@@ -2,7 +2,7 @@
 
 > [!WARNING]
 > **READ BEFORE RECORDING.**
-> - **START WITH `burn --dry-run` AND CONFIRM THE DRIVE AND DISC.**
+> - **START WITH `build` AND CONFIRM THE DRIVE AND DISC.**
 > - **`burn` AND CALIBRATION RECORDING WRITE TO THE DISC. A WRITTEN CD-R CANNOT BE ERASED. ERASING A CD-RW DESTROYS ITS CONTENTS.**
 > - **USE A SPEED SUPPORTED BY BOTH THE DRIVE AND DISC. DO NOT RUN AS ROOT OR UNPLUG THE DRIVE DURING A WRITE. IF A WRITE FAILS, CHECK THE JOB JOURNAL BEFORE RETRYING.**
 
@@ -50,12 +50,14 @@ source <(discimage completions zsh)
 Add these lines after PATH/alias setup in `~/.zshrc` to load completion in new
 sessions. `completions` also supports `bash`, `fish`, `powershell` and `elvish`.
 It prints a script without accessing the drive.
+After updating the executable, run `source <(discimage completions zsh)` again.
+Reloading replaces DiscImage's old completion functions; hidden compatibility
+commands and options are not suggested.
 
-## Plan and preview
+## Design
 
-Prepare one 44.1 kHz, 16-bit stereo PCM WAV per track (at least four seconds). Convert other formats with XLD or FFmpeg, for example `ffmpeg -i song.flac -ar 44100 -ac 2 -c:a pcm_s16le 01.wav`.
-
-Save `album.toml` beside the WAVs and run the commands below from that album directory. Paths are relative to this file, and the array sets the play order.
+Use one 44.1 kHz, 16-bit stereo PCM WAV per track (at least four seconds).
+The TOML track array sets the order; paths are relative to the TOML.
 
 ```toml
 title = "My album"
@@ -67,81 +69,87 @@ mode = "strip"
 ```
 
 ```sh
-discimage plan album.toml
-mkdir -p output
-discimage template album.toml --output output/templates
-discimage preview album.toml --output output/preview.svg
+discimage preview album.toml
+discimage preview album.toml -o preview.svg
+discimage template album.toml -o templates
 ```
 
-Create the output parent directory once and use a new destination for each export. `template` works before the artwork file exists. Open the SVG in a browser. In `strip` mode the image wraps clockwise from 12 o'clock, with its top edge at the outer rim. Use `mode = "disc"` for a centered image clipped to the available ring. Images can be PNG or JPEG. For a calibrated disc, add the matching `preset` to the album before planning. See [media presets](calibrations/README.md), [artwork options](docs/preview.md) and the [full album example](examples/album.toml).
+`preview` shows music length and available artwork space; `--json` exports the
+layout data. `strip` wraps a panoramic PNG/JPEG around the ring; `disc` clips a
+centered image to it. Use the website to design artwork with exported templates.
+See [artwork options](docs/preview.md) and [media presets](calibrations/README.md).
 
-`discimage devices` shows a 12-character hexadecimal hardware ID, without a prefix, derived from the
-standard drive vendor, model and serial number. It stays the same across macOS,
-Windows and Linux when the drive exposes that serial; ports, drive letters and
-firmware versions are excluded. Discovery uses read-only metadata commands.
-Without a reliable serial, the selector is `local-xxxxxxxxxx` and is valid only
-for that OS connection. `devices --json` includes the hardware fields,
-`hardware_id`, `connection_selector`, preferred `selector` and full native `id`.
-Use `--device GX40N` for a unique model, or copy the displayed selector.
-Display numbers cannot select a drive. Missing or ambiguous selectors stop the
-operation, including duplicate hardware IDs. Saved jobs keep their original
-native ID and must be prepared again after moving a drive to another connection.
-
-Choose either a saved default or an explicit device for each command:
+## Build and record
 
 ```sh
-# Save the default, then prepare a job.
-discimage select GX40N
-discimage burn album.toml -o record --dry-run
+discimage build album.toml
+open output/album/preview.svg
+# Insert a blank CD-R or CD-RW, then write:
+discimage burn output/album
 ```
 
-```sh
-# Alternatively, specify the drive in one command.
-discimage burn album.toml -o record --dry-run --device GX40N
-```
+`build` works without a drive on every platform. It freezes the audio, artwork,
+settings and checksums into one flat directory, defaulting to `output/<TOML name>`
+beside the project. `-o DIR` overrides that path. No provisional ISO is generated.
+Rebuilding updates an unstarted or completed package; unfinished recordings and
+unmanaged files are protected.
 
-`select` alone shows the saved default; `select --clear` removes it.
-`--device` overrides the default for that operation without changing it.
-The default applies to `erase`, new recording jobs and live calibration commands.
-A missing or ambiguous default stops the operation. Existing jobs always retain
-their saved drive; an explicit `--device` must match it. Offline commands ignore
-the default. Selection only saves an ID and never reserves or writes a disc.
-The setting is `device = "ID"` in the user-level `discimage/config.toml`:
-`~/Library/Application Support` on macOS, `%APPDATA%` on Windows, or
-`$XDG_CONFIG_HOME` (default `~/.config`) on Linux.
+`burn` is implemented on macOS. It checks the drive and media, writes and reads
+back the audio, reads the actual NWA, generates the data session once, verifies
+it and finalizes the disc. The package retains one set of inputs and the actual
+image; it has no `source/`, `planned/` or `actual-N/` directories. Parameters,
+checksums and recording state share `manifest.toml`. `burn` accepts no `-o` or
+`--dry-run`. Optional `--speed N` is frozen when recording starts; omit it for
+automatic speed. Do not change drives or speed while continuing a recording.
 
-## Record on macOS
-
-Allow a few GB of free disk space, insert a blank CD-R or CD-RW, then run these commands in Terminal:
+### Drive selection and CD-RW
 
 ```sh
 discimage devices
-mkdir -p output
-discimage burn album.toml --output output/record --dry-run
-open output/record/planned/preview.svg
-# After checking the preview, start writing:
-discimage burn output/record
+discimage select DRIVE_ID
+discimage erase             # Used CD-RW only; type ERASE after checking the target.
+discimage burn output/album
 ```
 
-`burn --dry-run` uses the only eligible blank disc, saves the drive and requested speed with the job, and builds a preview without writing to the disc. If several drives qualify, pass `--device` with a short selector or unique model from `devices`. By default, the drive chooses its supported maximum speed. Use `--speed N` to request a specific multiplier. Existing jobs keep their saved speed when resumed. Each recording needs a new output directory; a completed job cannot be prepared again. For a previously written CD-RW, run `discimage erase` first. It selects the only available CD-RW, asks for confirmation, performs a full erase and confirms blank media. `erase --dry-run` checks selection without erasing; `erase --quick` only resets disc metadata.
+Or pass `--device DRIVE_ID` to a single operation. `select` alone shows the
+default; `select --clear` removes it. A missing or ambiguous selection stops the
+operation. Hardware IDs use the drive's standard vendor/model/serial fields,
+without a prefix; `local-...` is an OS-connection fallback. Display numbers are
+not selectors. Selection never erases or writes a disc.
 
-`burn JOB` writes the audio session, compares the recorded PCM against the prepared WAVs, then uses the drive's measured next writable address to build, write and verify the data session. Check `output/record/journal.json` for stage `complete` and run `discimage devices` again to confirm the disc is closed and reports two sessions. Inspect the disc surface for artwork quality. To prepare and record immediately, use `discimage burn album.toml -o output/new-job`. For interruptions and CD-Text, see [recording and recovery](docs/recording.md).
+Erasing defaults to a full erase. `erase --dry-run` only checks the target;
+`erase --quick` clears metadata and may leave old artwork visible. CD-R cannot
+be erased. After a successful burn, `devices` should show a closed disc with
+two sessions. Check the physical artwork and audition the music.
 
-The former `prepare`, `resume` and `readback` commands remain hidden compatibility entry points. Use `burn PROJECT --dry-run`, `burn JOB` and `verify BUNDLE -o FILE` in new workflows.
-
-Logs show the active stage and, during drive writes, reported progress, speed and elapsed time. The macOS Terminal uses basic ANSI colors. Set `NO_COLOR=1` for plain logs. Redirected logs are plain text, and `plan --json` and `devices --json` write JSON to stdout.
-
-## Build offline
+## Optional image export and verification
 
 ```sh
-mkdir -p output
-discimage build album.toml --output output/album
+discimage build album.toml --iso
+discimage build album.toml --raw
 discimage verify output/album
-discimage verify output/album --output output/readback.png
+discimage verify output/album -o encoded.png
 ```
 
-The bundle contains audio, a session-offset ISO, a RAW data image, previews and a checksummed manifest. `verify` uses local files. The recording job uses the ISO at the measured address. The layout is music first, then Mode 1 data. Full Blue Book CD Extra/XA compliance and consumer player compatibility remain unverified.
+Choose `--iso`, `--raw`, or both. ISO is 2048-byte data; RAW adds 2352-byte
+Mode 1 framing and EDC/ECC. These are data-session images; audio remains separate.
+Without an observed `--session-start LBA`, exports are estimates. Recording
+always regenerates data at the drive's actual NWA and uses cooked ISO.
+`verify` checks local files, not the physical disc. Encoded previews require
+an exported or recorded image; they remain optional.
 
-[Album template](projects/README.md) · [Media presets](calibrations/README.md) · [Calibration guide](docs/calibration.md) · [Experimental read-timing calibration](docs/timing.md) · [Hardware results](docs/validation.md) · [Repository layout](docs/files.md)
+Old completed jobs can be verified and flattened once with
+`discimage verify OLD_JOB --compact`; calibration evidence stays in its original
+layout. Old unfinished jobs remain readable for safe recovery. The former
+`plan`, `prepare`, `resume` and `readback` commands have been removed.
 
-Inspired by [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio) by JiaFeiMiao-K-Cat and contributors, including its CDImage-derived CIRC mapping. See [credits](NOTICE.md) and the [GPL-3.0-or-later license](LICENSE).
+Logs support macOS Terminal ANSI colors, `NO_COLOR=1` and plain redirected output.
+`preview --json` and `devices --json` keep stdout machine-readable. CD-Text is
+optional and currently supports printable ASCII. Full Blue Book CD Extra/XA
+compliance and consumer-player compatibility remain unverified.
+
+[Album template](projects/README.md) · [Calibration](docs/calibration.md) · [Timing](docs/timing.md) · [Recording and recovery](docs/recording.md) · [Hardware results](docs/validation.md) · [Files](docs/files.md)
+
+Inspired by [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio)
+by JiaFeiMiao-K-Cat and contributors, including its CDImage-derived CIRC mapping.
+See [credits](NOTICE.md) and the [GPL-3.0-or-later license](LICENSE).

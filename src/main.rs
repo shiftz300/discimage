@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use discimage::{
     author, burn, calibrate, console, device,
     layout::Plan,
+    package::{self, Package},
     phase, preview, probe,
     project::{Artwork, Project},
     template, timing,
@@ -17,7 +18,7 @@ mod selection;
 #[command(
     version,
     about = "Music-first enhanced CD authoring, previews and macOS recording",
-    after_help = "Offline: plan -> template / preview -> build -> verify\nRecord on macOS: devices -> burn PROJECT --dry-run -o JOB -> burn JOB"
+    after_help = "Design: preview PROJECT -> template PROJECT -o DIR\nPrepare: build PROJECT [--iso] [--raw]\nRecord on macOS: burn PACKAGE"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,9 +41,6 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
-    /// Prepare a recording job from a blank CD without reserving or writing it (macOS).
-    #[command(hide = true)]
-    Prepare(Recording),
     /// Erase a CD-RW, confirm the target and verify blank media (macOS).
     Erase {
         /// Drive ID or unique model; overrides select, otherwise use the only available CD-RW.
@@ -58,24 +56,17 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Record a project, or write/continue an existing job (macOS).
+    /// Write or continue a prepared recording job (macOS).
     Burn {
-        #[command(flatten)]
-        recording: Recording,
-        /// Reserve a blank CD-R of this exact capacity, selecting the drive automatically.
-        #[arg(long, conflicts_with = "dry_run", value_parser = clap::value_parser!(u32).range(1..=360_000))]
-        blank_cdr: Option<u32>,
-        /// Prepare a project and its preview without writing the disc.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Write or continue a job using its saved drive and speed (macOS).
-    #[command(hide = true)]
-    Resume {
+        /// Recording job directory created by build.
+        #[arg(value_name = "JOB")]
         directory: PathBuf,
-        /// Drive selector; it must resolve to the drive saved in the job.
+        /// Drive ID; it must match the drive saved in the job.
         #[arg(long)]
         device: Option<String>,
+        /// Write speed multiplier; frozen once recording starts. Omit for automatic.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+        speed: Option<u32>,
     },
     /// Export disc/strip artwork templates from the album's actual WAV lengths.
     Template {
@@ -88,18 +79,30 @@ enum Commands {
         #[arg(long)]
         session_start: Option<u32>,
     },
-    /// Author audio, a session-offset ISO/RAW, previews and a checksummed manifest.
+    /// Build a flat recording package without a drive; optionally export ISO/RAW.
+    #[command(group(clap::ArgGroup::new("images").multiple(true)))]
     Build {
+        /// Album TOML file.
         project: PathBuf,
+        /// Output directory; defaults to output/<project name> beside the TOML.
         #[arg(short, long)]
-        output: PathBuf,
-        /// Override session 2 INDEX 01 with an observed next writable LBA.
-        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Export the 2048-byte data-session ISO.
+        #[arg(long, group = "images")]
+        iso: bool,
+        /// Export 2352-byte Mode 1 RAW data.
+        #[arg(long, group = "images")]
+        raw: bool,
+        /// Use a measured session 2 start; otherwise exports are estimates.
+        #[arg(long, requires = "images")]
         session_start: Option<u32>,
     },
     /// Verify an offline bundle; optionally export its encoded-payload preview.
     Verify {
         directory: PathBuf,
+        /// Migrate a verified completed legacy job into the flat layout.
+        #[arg(long)]
+        compact: bool,
         /// Export a preview from the local ISO, not the physical disc.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -108,38 +111,20 @@ enum Commands {
         #[arg(long, requires = "output", default_value_t = 32)]
         samples: u32,
     },
-    /// Verify and project the encoded drawing payload using the authoring geometry.
-    #[command(hide = true)]
-    Readback {
-        directory: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-        #[arg(long, default_value_t = 1024)]
-        size: u32,
-        #[arg(long, default_value_t = 32)]
-        samples: u32,
-    },
-    /// Inspect actual PCM WAV lengths and estimate the free artwork annulus.
-    Plan {
+    /// Show album timing and artwork space; optionally export a PNG/SVG preview.
+    Preview {
+        /// Album TOML file.
         project: PathBuf,
         #[arg(long)]
         session_start: Option<u32>,
-        /// Print a machine-readable estimate, including burn_ready=false.
+        /// Export PNG or SVG; omit to print the layout summary.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Print the layout estimate as JSON without accessing a drive.
         #[arg(long)]
         json: bool,
-        /// Save a labeled SVG layout and artwork report; never overwrite.
-        #[arg(long, hide = true)]
-        svg: Option<PathBuf>,
-    },
-    /// Export a PNG disc composition or self-contained SVG preview report.
-    Preview {
-        project: PathBuf,
-        #[arg(long)]
-        session_start: Option<u32>,
-        #[arg(short, long)]
-        output: PathBuf,
         /// Resolution of the raster disc preview (256–4096).
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, requires = "output", default_value_t = 1024)]
         size: u32,
     },
     /// Query the OS for optical drives (read-only, platform-specific output).
@@ -150,22 +135,6 @@ enum Commands {
     /// Create a CD calibration target, mark a photo, or fit radial geometry.
     #[command(subcommand)]
     Calibrate(Calibration),
-}
-
-#[derive(Args)]
-struct Recording {
-    /// Album TOML file, or existing job directory when continuing with burn.
-    #[arg(value_name = "PROJECT_OR_JOB")]
-    project: PathBuf,
-    /// Drive ID or unique model; overrides select, otherwise use the only eligible blank drive.
-    #[arg(long, value_name = "DRIVE")]
-    device: Option<String>,
-    /// New job directory (required for a project; omit for an existing job).
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-    /// Requested CD speed multiplier; omit for the drive-selected maximum.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
-    speed: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -276,12 +245,7 @@ fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Completions { shell } => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "discimage",
-                &mut std::io::stdout(),
-            );
+            completions(shell, &mut std::io::stdout())?;
         }
         Commands::Calibrate(command) => match command {
             Calibration::Record {
@@ -388,26 +352,11 @@ fn run(cli: Cli) -> Result<()> {
                 );
             }
         },
-        Commands::Prepare(recording) => record(recording, None, true)?,
         Commands::Burn {
-            recording,
-            blank_cdr,
-            dry_run,
-        } => {
-            if recording.project.is_dir() {
-                ensure!(
-                    recording.output.is_none()
-                        && recording.speed.is_none()
-                        && blank_cdr.is_none()
-                        && !dry_run,
-                    "an existing job uses its saved inputs and speed; omit --output, --speed, --blank-cdr and --dry-run"
-                );
-                resume_job(&recording.project, recording.device.as_deref())?;
-            } else {
-                record(recording, blank_cdr, dry_run)?;
-            }
-        }
-        Commands::Resume { directory, device } => resume_job(&directory, device.as_deref())?,
+            directory,
+            device,
+            speed,
+        } => resume_job(&directory, device.as_deref(), speed)?,
         Commands::Template {
             project,
             output,
@@ -426,31 +375,43 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Build {
             project,
             output,
+            iso,
+            raw,
             session_start,
         } => {
-            let manifest = author::build(&project, &output, session_start)?;
-            println!(
-                "Built {}: session 2 starts at LBA {}, {} data sectors. Offline bundle only.",
-                output.display(),
-                manifest.session_start,
-                manifest.data_sectors
-            );
+            let output = output
+                .map(Ok)
+                .unwrap_or_else(|| package::default_output(&project))?;
+            let images = match (iso, raw) {
+                (true, true) => Some(author::Images::Both),
+                (true, false) => Some(author::Images::Iso),
+                (false, true) => Some(author::Images::Raw),
+                _ => None,
+            };
+            package::build(&project, &output, images, session_start)?;
+            console::success(format_args!(
+                "Built {} without accessing a drive",
+                output.display()
+            ));
+            println!("Preview: {}", output.join("preview.svg").display());
+            println!("To record: discimage burn {}", output.display());
+            if images.is_some() && session_start.is_none() {
+                console::warning(format_args!(
+                    "Exported data image uses an estimated session start; recording will read the actual NWA"
+                ));
+            }
         }
         Commands::Verify {
             directory,
             output,
             size,
             samples,
+            compact,
         } => {
+            if compact {
+                package::migrate(&directory)?;
+            }
             verify_bundle(&directory, output.as_deref(), size, samples)?;
-        }
-        Commands::Readback {
-            directory,
-            output,
-            size,
-            samples,
-        } => {
-            verify_bundle(&directory, Some(&output), size, samples)?;
         }
         Commands::Select { device, clear } => selection::run(device.as_deref(), clear)?,
         Commands::Devices { json } => {
@@ -505,74 +466,177 @@ fn run(cli: Cli) -> Result<()> {
             project,
             session_start,
             output,
+            json,
             size,
-        } => {
-            let (plan, artwork) = prepare(&project, session_start)?;
-            preview::save(&plan, artwork.as_ref(), &output, size)?;
+        } => preview_project(&project, session_start, output.as_deref(), size, json)?,
+    }
+    Ok(())
+}
+
+fn preview_project(
+    project: &Path,
+    session_start: Option<u32>,
+    output: Option<&Path>,
+    size: u32,
+    json: bool,
+) -> Result<()> {
+    let (plan, artwork) = prepare(project, session_start)?;
+    if let Some(output) = output {
+        preview::save(&plan, artwork.as_ref(), output, size)?;
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("{}", plan.title);
+        println!(
+            "Music: {} tracks, {:.3} seconds (sector-aligned)",
+            plan.tracks.len(),
+            f64::from(plan.music_sectors) / 75.0
+        );
+        println!(
+            "Artwork budget: {} sectors, estimated radius {:.2}–{:.2} mm",
+            plan.artwork_sectors, plan.artwork_inner_radius_mm, plan.artwork_outer_radius_mm
+        );
+        println!(
+            "{}. This command does not access the optical drive.",
+            plan.geometry_label()
+        );
+        if let Some(output) = output {
             println!(
                 "Saved {} — design preview only, not a burn image.",
                 output.display()
             );
         }
-        Commands::Plan {
-            project,
-            session_start,
-            json,
-            svg: svg_path,
-        } => {
-            let (plan, artwork) = prepare(&project, session_start)?;
-            if let Some(path) = svg_path {
-                preview::save(&plan, artwork.as_ref(), &path, 1024)?;
-            }
-            if json {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-            } else {
-                println!("{}", plan.title);
-                println!(
-                    "Music: {} tracks, {:.3} seconds (sector-aligned)",
-                    plan.tracks.len(),
-                    f64::from(plan.music_sectors) / 75.0
-                );
-                println!(
-                    "Artwork budget: {} sectors, estimated radius {:.2}–{:.2} mm",
-                    plan.artwork_sectors,
-                    plan.artwork_inner_radius_mm,
-                    plan.artwork_outer_radius_mm
-                );
-                println!(
-                    "{}. This command does not access the optical drive.",
-                    plan.geometry_label()
-                );
-            }
-        }
     }
     Ok(())
 }
 
-fn resume_job(directory: &Path, id: Option<&str>) -> Result<()> {
-    let saved = burn::Journal::load(directory).with_context(|| {
-        format!("cannot read {}; burn expects an album TOML file with --output, or an existing job directory", directory.join("journal.json").display())
-    })?;
-    let id = id.map(|id| {
-        device::resolve_id(id).with_context(|| format!("--device does not match the recording job's saved drive {} or is not connected", saved.device))
-    }).transpose()?;
-    ensure!(
-        id.as_deref().is_none_or(|id| id == saved.device),
-        "--device does not match the recording job's saved drive: {}",
-        saved.device
+// Static generators do not consistently honor clap's hidden items. Project
+// the visible CLI from the same command definitions instead of maintaining a list.
+fn completion_command(command: &clap::Command) -> clap::Command {
+    let mut visible = clap::Command::new(command.get_name().to_owned())
+        .disable_help_flag(command.is_disable_help_flag_set())
+        .disable_version_flag(command.is_disable_version_flag_set())
+        .disable_help_subcommand(command.is_disable_help_subcommand_set())
+        .visible_aliases(command.get_visible_aliases().map(str::to_owned))
+        .groups(command.get_groups().cloned())
+        .args(
+            command
+                .get_arguments()
+                .filter(|arg| !arg.is_hide_set())
+                .cloned(),
+        )
+        .subcommands(
+            command
+                .get_subcommands()
+                .filter(|sub| !sub.is_hide_set())
+                .map(completion_command),
+        );
+    if let Some(about) = command.get_about() {
+        visible = visible.about(about.clone());
+    }
+    if let Some(version) = command.get_version() {
+        visible = visible.version(version.to_owned());
+    }
+    visible
+}
+
+fn completions(shell: clap_complete::Shell, output: &mut impl std::io::Write) -> Result<()> {
+    if shell == clap_complete::Shell::Zsh {
+        // clap_complete guards helper definitions, so sourcing a newer script
+        // otherwise leaves the old command lists in the current zsh process.
+        output.write_all(
+            br#"#compdef discimage
+() {
+    local name
+    for name in ${(k)functions}; do
+        case "$name" in
+            _discimage|_discimage_commands|_discimage__subcmd__*) unfunction "$name" ;;
+        esac
+    done
+}
+
+"#,
+        )?;
+    }
+    clap_complete::generate(
+        shell,
+        &mut completion_command(&Cli::command()),
+        "discimage",
+        output,
     );
-    let mut recorder = device::recorder(&saved.device)?;
+    Ok(())
+}
+
+fn resume_job(directory: &Path, id: Option<&str>, speed: Option<u32>) -> Result<()> {
+    let flat = directory.join("manifest.toml").try_exists()?;
+    let saved = if flat {
+        Package::load(directory)?.journal
+    } else {
+        Some(burn::Journal::load(directory).with_context(|| {
+            format!(
+                "burn expects a built package; run 'discimage build PROJECT' first ({})",
+                directory.display()
+            )
+        })?)
+    };
+    if let Some(saved) = &saved {
+        ensure!(
+            matches!(
+                saved.stage,
+                burn::Stage::Prepared | burn::Stage::MusicWritten | burn::Stage::DataReady
+            ),
+            "stage {:?} cannot be resumed automatically; no write attempted",
+            saved.stage
+        );
+    }
+    let selected = if let Some(saved) = &saved {
+        if let Some(id) = id {
+            ensure!(
+                device::resolve_id(id).context(
+                    "--device does not match the recording job's saved drive or is not connected"
+                )? == saved.device,
+                "--device does not match the recording's saved drive"
+            );
+        }
+        saved.device.clone()
+    } else {
+        let selector = selection::preferred(id)?;
+        let drives = device::list()?;
+        if let Some(selector) = selector {
+            device::resolve(&drives, &selector)?.id.clone()
+        } else {
+            burn::select_blank(&drives)?.id.clone()
+        }
+    };
+    let mut recorder = device::recorder(&selected)?;
     device::install_cancel_handler()?;
-    console::phase(
-        "burn",
-        format_args!("{} | {}", directory.display(), console::speed(saved.speed)),
-    );
-    let result = burn::resume(&mut *recorder, directory)?;
-    recording_complete(&result, directory);
+    let journal = burn::record(&mut *recorder, directory, speed)?;
+    recording_complete(&journal, directory);
     Ok(())
 }
 
 fn verify_bundle(directory: &Path, output: Option<&Path>, size: u32, samples: u32) -> Result<()> {
+    if directory.join("manifest.toml").try_exists()? {
+        let package = Package::load(directory)?;
+        package.verify(directory)?;
+        println!(
+            "Verified {} frozen inputs{}.",
+            package.inputs.len(),
+            if package.image.is_some() {
+                " and data image"
+            } else {
+                "; no data image generated yet"
+            }
+        );
+        if let Some(output) = output {
+            let image = package.image.context(
+                "no encoded image yet; record the disc or export with build --iso/--raw first",
+            )?;
+            preview::readback(directory, &image, output, size, samples)?;
+        }
+        return Ok(());
+    }
     let manifest = author::verify(directory)?;
     println!(
         "Verified {} assets, {} ISO files, {} Mode 1 sectors.",
@@ -586,50 +650,6 @@ fn verify_bundle(directory: &Path, output: Option<&Path>, size: u32, samples: u3
             "Saved {} — encoded payload projected from the local ISO, not a physical-disc readback.",
             output.display()
         );
-    }
-    Ok(())
-}
-
-fn record(recording: Recording, blank_cdr: Option<u32>, dry_run: bool) -> Result<()> {
-    let Recording {
-        project,
-        device: id,
-        output,
-        speed,
-    } = recording;
-    let output = output.context("a new recording project requires --output with a new job directory; use --dry-run to prepare without writing")?;
-    burn::check_destination(&output)?;
-    let id = selection::preferred(id.as_deref())?;
-    let id = id.as_deref().map(device::resolve_id).transpose()?;
-    device::install_cancel_handler()?;
-    let mut recorder = match (blank_cdr, id.as_deref()) {
-        (Some(capacity), id) => device::blank_cdr_recorder(id, capacity)?,
-        (None, id) => {
-            let drives;
-            let id = match id {
-                Some(id) => id,
-                None => {
-                    ensure!(
-                        cfg!(target_os = "macos"),
-                        "Recording is implemented for macOS only"
-                    );
-                    drives = device::list()?;
-                    &burn::select_blank(&drives)?.id
-                }
-            };
-            device::recorder(id)?
-        }
-    };
-    let result = burn::start(&mut *recorder, &project, &output, speed, dry_run)?;
-    if dry_run {
-        console::success(format_args!(
-            "Prepared {} without writing the disc",
-            output.display()
-        ));
-        println!("Preview: {}", output.join("planned/preview.svg").display());
-        println!("To write the job: discimage burn {}", output.display());
-    } else {
-        recording_complete(&result, &output);
     }
     Ok(())
 }
@@ -654,57 +674,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merged_commands_keep_legacy_entry_points_hidden() {
-        let command = Cli::command();
-        for name in ["prepare", "resume", "readback"] {
-            assert!(command.find_subcommand(name).unwrap().is_hide_set());
+    fn public_workflow_is_unambiguous_and_build_never_takes_device_options() {
+        for name in ["plan", "prepare", "resume", "readback"] {
+            assert!(Cli::command().find_subcommand(name).is_none());
         }
         for args in [
             vec!["discimage", "select"],
             vec!["discimage", "select", "GX40N"],
-            vec!["discimage", "select", "--clear"],
-            vec!["discimage", "calibrate", "probe", "--check"],
-            vec!["discimage", "burn", "album.toml", "-o", "job", "--dry-run"],
-            vec!["discimage", "burn", "job"],
-            vec!["discimage", "verify", "bundle"],
+            vec!["discimage", "build", "album.toml"],
+            vec!["discimage", "build", "album.toml", "--iso"],
+            vec!["discimage", "build", "album.toml", "--raw"],
+            vec!["discimage", "build", "album.toml", "--iso", "--raw"],
             vec![
                 "discimage",
-                "verify",
-                "bundle",
-                "-o",
-                "payload.png",
-                "--samples",
-                "128",
+                "build",
+                "album.toml",
+                "--iso",
+                "--session-start",
+                "12000",
             ],
-            vec!["discimage", "prepare", "album.toml", "-o", "job"],
-            vec!["discimage", "resume", "job"],
-            vec!["discimage", "readback", "bundle", "-o", "payload.png"],
+            vec!["discimage", "preview", "album.toml"],
+            vec!["discimage", "preview", "album.toml", "--json"],
+            vec!["discimage", "preview", "album.toml", "-o", "preview.svg"],
+            vec!["discimage", "burn", "output/album"],
+            vec!["discimage", "verify", "output/album"],
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+        for command in ["build", "burn"] {
+            for flags in [vec!["--offline"], vec!["--dry-run"]] {
+                assert!(
+                    Cli::try_parse_from(
+                        ["discimage", command, "album.toml"]
+                            .into_iter()
+                            .chain(flags)
+                    )
+                    .is_err()
+                );
+            }
+        }
         assert!(
-            Cli::try_parse_from(["discimage", "verify", "bundle", "--samples", "128"]).is_err()
+            Cli::try_parse_from(["discimage", "build", "album.toml", "--device", "GX40N"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["discimage", "build", "album.toml", "--speed", "10"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["discimage", "burn", "job", "-o", "other"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "discimage",
+                "build",
+                "album.toml",
+                "--session-start",
+                "12000"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["discimage", "preview", "album.toml", "--size", "2048"]).is_err()
         );
         assert!(Cli::try_parse_from(["discimage", "select", "GX40N", "--clear"]).is_err());
-    }
-
-    #[test]
-    fn job_options_cannot_override_frozen_recording_inputs() {
-        let directory =
-            std::env::temp_dir().join(format!("discimage-job-options-{}", std::process::id()));
-        std::fs::create_dir(&directory).unwrap();
-        for flags in [
-            vec!["--speed", "10"],
-            vec!["--output", "new"],
-            vec!["--dry-run"],
-            vec!["--blank-cdr", "360000"],
-        ] {
-            let args = ["discimage", "burn", directory.to_str().unwrap()];
-            let error =
-                run(Cli::try_parse_from(args.into_iter().chain(flags)).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("saved inputs and speed"));
-        }
-        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -717,33 +746,75 @@ mod tests {
             clap_complete::Shell::Elvish,
         ] {
             let mut bytes = Vec::new();
-            clap_complete::generate(shell, &mut Cli::command(), "discimage", &mut bytes);
+            completions(shell, &mut bytes).unwrap();
             let script = String::from_utf8(bytes).unwrap();
             for token in ["burn", "verify", "erase", "select", "completions", "speed"] {
                 assert!(script.contains(token), "{shell}: missing {token}");
             }
+            let visible = completion_command(&Cli::command());
+            for name in ["prepare", "resume", "readback", "plan"] {
+                assert!(
+                    visible.find_subcommand(name).is_none(),
+                    "{shell}: hidden command {name}"
+                );
+            }
+            assert!(!script.contains("--svg"));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_reload_replaces_stale_helpers_without_removing_custom_functions() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let mut script = b"autoload -Uz compinit\ncompinit -D\n_describe() { print -rl -- \"${commands[@]}\"; }\n_discimage_custom() { print keep; }\n".to_vec();
+        for _ in 0..2 {
+            script.extend_from_slice(b"_discimage_commands() { print stale; }\n_discimage__subcmd__calibrate_commands() { print stale; }\n");
+            completions(clap_complete::Shell::Zsh, &mut script).unwrap();
+            script.extend_from_slice(
+                br#"
+[[ $(_discimage_commands) == *select:* ]] || exit 11
+[[ $(_discimage_commands) != *stale* ]] || exit 12
+[[ $(_discimage_commands) != *resume:* ]] || exit 13
+[[ $(_discimage__subcmd__calibrate_commands) == *probe:* ]] || exit 14
+[[ $(_discimage_custom) == keep ]] || exit 15
+[[ $_comps[discimage] == _discimage ]] || exit 16
+"#,
+            );
+        }
+        let mut child = Command::new("zsh")
+            .args(["-f", "-s"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&script).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "zsh reload failed: {:?}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
     fn recording_speed_defaults_to_auto_and_validates_explicit_values() {
-        for command in ["prepare", "burn"] {
-            let args = ["discimage", command, "album.toml", "--output", "job"];
-            let parsed = Cli::try_parse_from(args).unwrap();
-            let recording = match parsed.command {
-                Commands::Prepare(recording) | Commands::Burn { recording, .. } => recording,
-                _ => unreachable!(),
-            };
-            assert_eq!(recording.speed, None);
-            for speed in ["0", "65"] {
-                assert!(Cli::try_parse_from(args.into_iter().chain(["--speed", speed])).is_err());
-            }
-            let parsed = Cli::try_parse_from(args.into_iter().chain(["--speed", "10"])).unwrap();
-            let recording = match parsed.command {
-                Commands::Prepare(recording) | Commands::Burn { recording, .. } => recording,
-                _ => unreachable!(),
-            };
-            assert_eq!(recording.speed, Some(10));
+        for (value, valid) in [("0", false), ("65", false), ("10", true)] {
+            assert_eq!(
+                Cli::try_parse_from(["discimage", "burn", "job", "--speed", value]).is_ok(),
+                valid
+            );
         }
+        let Cli {
+            command: Commands::Burn { speed, .. },
+        } = Cli::try_parse_from(["discimage", "burn", "job"]).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(speed, None);
     }
 }

@@ -10,6 +10,7 @@ pub mod iso;
 pub mod layout;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod package;
 pub mod phase;
 pub mod preview;
 pub mod probe;

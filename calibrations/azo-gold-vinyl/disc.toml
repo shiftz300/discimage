@@ -1,6 +1,7 @@
 # Albums select a name under profiles. Verification and measurements are records only.
 
 [profiles.azo-gold-vinyl]
+media = "cd-r"
 capacity_sectors = 359846
 inner_radius_mm = 24.85823843354061
 outer_radius_mm = 58.06851677424674

@@ -42,14 +42,7 @@ pub fn readback(
     )
     .context("artwork extent outside session")?;
     let codec = Codec::default();
-    let mut input = std::io::BufReader::with_capacity(
-        1024 * 1024,
-        std::fs::File::open(directory.join("session2.iso"))?,
-    );
-    ensure!(
-        input.get_ref().metadata()?.len() == u64::from(manifest.data_sectors) * COOKED as u64,
-        "incorrect ISO length"
-    );
+    let mut input = crate::author::payload(directory, manifest)?;
     input.seek(SeekFrom::Start(offset))?;
     let mut sums = vec![0u64; (size * size) as usize];
     let mut counts = vec![0u32; (size * size) as usize];

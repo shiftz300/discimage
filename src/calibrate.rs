@@ -208,7 +208,7 @@ fn bundle(directory: &Path) -> Result<(Target, u32, String)> {
     Ok((
         target,
         plan.disc.capacity_sectors,
-        author::digest(&directory.join("manifest.json"))?,
+        author::digest(&author::manifest_path(directory))?,
     ))
 }
 

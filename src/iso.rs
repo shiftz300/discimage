@@ -6,11 +6,74 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
-    io::{Read, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 pub const BLOCK: u32 = crate::codec::COOKED as u32;
+
+/// A cooked-payload view of either a 2048-byte ISO or 2352-byte Mode 1 RAW.
+pub(crate) struct Image {
+    input: BufReader<File>,
+    stride: u64,
+    header: u64,
+    position: u64,
+    physical: u64,
+    length: u64,
+}
+
+impl Image {
+    pub(crate) fn open(path: &Path, raw: bool, sectors: u32) -> Result<Self> {
+        let input = BufReader::with_capacity(1024 * 1024, File::open(path)?);
+        let stride = if raw {
+            crate::codec::RAW as u64
+        } else {
+            u64::from(BLOCK)
+        };
+        ensure!(
+            input.get_ref().metadata()?.len() == u64::from(sectors) * stride,
+            "incorrect session image length"
+        );
+        Ok(Self {
+            input,
+            stride,
+            header: if raw { 16 } else { 0 },
+            position: 0,
+            physical: 0,
+            length: u64::from(sectors) * u64::from(BLOCK),
+        })
+    }
+}
+
+impl Read for Image {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.position >= self.length {
+            return Ok(0);
+        }
+        let within = self.position % u64::from(BLOCK);
+        let physical = self.position / u64::from(BLOCK) * self.stride + self.header + within;
+        self.input
+            .seek_relative(physical as i64 - self.physical as i64)?;
+        let count = buffer.len().min((u64::from(BLOCK) - within) as usize);
+        let read = self.input.read(&mut buffer[..count])?;
+        self.physical = physical + read as u64;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for Image {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let position = match from {
+            SeekFrom::Start(value) => i128::from(value),
+            SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
+            SeekFrom::End(value) => i128::from(self.length) + i128::from(value),
+        };
+        self.position = u64::try_from(position)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid image offset"))?;
+        Ok(self.position)
+    }
+}
 
 /// Convert an absolute LBA to a file offset if the entire extent fits the session.
 /// An empty extent may begin at EOF.

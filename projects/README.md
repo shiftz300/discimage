@@ -14,10 +14,15 @@ mkdir -p projects/my-album/audio
 
 ```sh
 mkdir -p projects/my-album/output
-discimage plan projects/my-album/album.toml
+discimage preview projects/my-album/album.toml
 discimage template projects/my-album/album.toml --output projects/my-album/output/templates
 discimage preview projects/my-album/album.toml --output projects/my-album/output/preview.svg
 ```
 
 把模板目录里的 `layout.json` 导入网页编辑器。离线镜像和刻录作业也放在专辑自己的 `output/` 下，每次使用新的子目录。
 [完整参数示例](../examples/album.toml) · [标定配置](../calibrations/README.md) · [刻录流程](../docs/recording.md)
+
+制作成品时执行 `discimage build projects/my-album/album.toml`。
+默认成品是 `projects/my-album/output/album/`，内部平铺文件。用
+`discimage burn projects/my-album/output/album` 刻录。
+CD-R/CD-RW 可分别使用 `cdr.toml`、`cdrw.toml`，无需手写日期目录。

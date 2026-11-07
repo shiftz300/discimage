@@ -4,15 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Args;
 use discimage::{
     author,
     burn::{self, Journal, Stage},
     calibrate, device,
-    layout::Plan,
-    preview,
-    project::Project,
+    package::{self, Package},
 };
 
 #[derive(Args)]
@@ -124,40 +122,54 @@ fn record(directory: &Path, options: &Options) -> Result<Option<PathBuf>> {
     let job = directory.join("record");
     let target = directory.join("target");
     let config = target.join("target.toml");
-    let journal = if job.try_exists()? {
-        let journal = Journal::load(&job)?;
-        match journal.stage {
-            Stage::Complete => return Ok(Some(journal.actual(&job))),
-            Stage::Prepared | Stage::MusicWritten | Stage::DataReady => {}
-            _ => bail!(
-                "当前阶段 {:?} 无法继续。请查看 {}",
-                journal.stage,
-                job.join("journal.json").display()
-            ),
+    let journal = if job.join("manifest.toml").try_exists()? {
+        let package = Package::load(&job)?;
+        ensure!(
+            package.project.disc.calibration_target,
+            "现有成品不是标靶工程"
+        );
+        if let Some(journal) = &package.journal {
+            if journal.stage == Stage::Complete {
+                return Ok(Some(job));
+            }
+            ensure!(
+                matches!(
+                    journal.stage,
+                    Stage::Prepared | Stage::MusicWritten | Stage::DataReady
+                ),
+                "当前刻录阶段无法自动继续"
+            );
         }
+        package.journal
+    } else if job.try_exists()? {
+        let journal = Journal::load(&job)?;
+        if journal.stage == Stage::Complete {
+            return Ok(Some(journal.actual(&job)));
+        }
+        ensure!(
+            matches!(
+                journal.stage,
+                Stage::Prepared | Stage::MusicWritten | Stage::DataReady
+            ),
+            "当前刻录阶段无法自动继续"
+        );
         ensure!(
             author::load(&job.join("planned"))?
                 .plan
                 .disc
                 .calibration_target,
-            "现有刻录作业不是标靶工程"
+            "现有作业不是标靶工程"
         );
         Some(journal)
     } else {
         if !target.try_exists()? {
             calibrate::create(&target, 360_000)?;
         }
-        let project = Project::load(&config)?;
-        ensure!(
-            project.disc.calibration_target,
-            "工作目录的 target.toml 不是标靶工程"
+        package::build(&config, &job, None, None)?;
+        println!(
+            "[1/3] 标靶成品已准备。预览 {}",
+            job.join("preview.svg").display()
         );
-        let preview_path = target.join("preview.svg");
-        if !preview_path.try_exists()? {
-            let plan = Plan::from_project(&project, None)?;
-            preview::save(&plan, None, &preview_path, 1024)?;
-        }
-        println!("[1/3] 标靶已准备。预览 {}", preview_path.display());
         None
     };
     ensure!(
@@ -224,28 +236,25 @@ fn record(directory: &Path, options: &Options) -> Result<Option<PathBuf>> {
 
     let mut recorder = device::recorder(&drive.id)?;
     device::install_cancel_handler()?;
-    let journal = match journal {
-        Some(journal) => journal,
-        None => burn::start(&mut *recorder, &config, &job, options.speed, true)?,
-    };
-    let kind = journal
-        .observed
-        .media
-        .as_ref()
-        .map_or("CD", |m| m.kind.as_str());
-    println!("[1/3] 光驱 {}，介质 {}。", drive.name, kind);
-    if journal.stage == Stage::Prepared {
-        println!(
-            "预演已完成。预览 {}",
-            job.join("planned/preview.svg").display()
-        );
+    let prepared = journal.as_ref().is_none_or(|j| j.stage == Stage::Prepared);
+    println!("[1/3] 光驱 {}，介质 {}。", drive.name, media.kind);
+    if prepared {
+        let preview = if journal
+            .as_ref()
+            .is_some_and(|j| j.format == "discimage-burn-v1")
+        {
+            job.join("planned/preview.svg")
+        } else {
+            job.join("preview.svg")
+        };
+        println!("成品已准备。预览 {}", preview.display());
     }
     if !options.write {
         if !io::stdin().is_terminal() {
             println!("作业已预演。请在终端重跑确认，或明确指定 --write。");
             return Ok(None);
         }
-        let action = if journal.stage == Stage::Prepared {
+        let action = if prepared {
             "现在写入标靶"
         } else {
             "继续写入标靶的数据会话"
@@ -258,6 +267,6 @@ fn record(directory: &Path, options: &Options) -> Result<Option<PathBuf>> {
             return Ok(None);
         }
     }
-    let complete = burn::resume(&mut *recorder, &job)?;
+    let complete = burn::record(&mut *recorder, &job, options.speed)?;
     Ok(Some(complete.actual(&job)))
 }

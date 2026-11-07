@@ -79,7 +79,7 @@ jobs:
           "$executable" --help
           "$executable" calibrate target --capacity-sectors 16500 --output smoke-target
           "$executable" preview smoke-target/target.toml --size 256 --output smoke-preview.svg
-          "$executable" build smoke-target/target.toml --output smoke-bundle
+          "$executable" build smoke-target/target.toml --iso --raw --output smoke-bundle
           "$executable" verify smoke-bundle
       - name: Archive executable
         if: runner.os != 'Windows'

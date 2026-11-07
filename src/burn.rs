@@ -5,6 +5,7 @@ use crate::{
     console,
     device::{Device, Media, Music, Recorder, Track},
     layout::Plan,
+    package::{self, Package},
     project::{Project, Track as Input},
 };
 use anyhow::{Context, Result, ensure};
@@ -29,7 +30,7 @@ pub enum Stage {
     Complete,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
     pub format: String,
     pub stage: Stage,
@@ -45,6 +46,11 @@ pub struct Journal {
 }
 impl Journal {
     pub fn load(directory: &Path) -> Result<Self> {
+        if directory.join("manifest.toml").try_exists()? {
+            return Package::load(directory)?
+                .journal
+                .context("package has not been recorded yet");
+        }
         let file = File::open(directory.join("journal.json"))?;
         ensure!(
             file.metadata()?.len() <= 1024 * 1024,
@@ -58,6 +64,11 @@ impl Journal {
         Ok(value)
     }
     fn save(&self, directory: &Path) -> Result<()> {
+        if self.format == "discimage-burn-v2" {
+            let mut package = Package::load(directory)?;
+            package.journal = Some(self.clone());
+            return package.save(directory);
+        }
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let temp = directory.join(format!(
             "journal-{}-{}.tmp",
@@ -82,7 +93,11 @@ impl Journal {
         self.save(directory)
     }
     pub fn actual(&self, directory: &Path) -> PathBuf {
-        directory.join(format!("actual-{}", self.attempt))
+        if self.format == "discimage-burn-v2" {
+            directory.to_path_buf()
+        } else {
+            directory.join(format!("actual-{}", self.attempt))
+        }
     }
 }
 
@@ -110,6 +125,7 @@ pub fn start(
         ),
     );
     let mut project = Project::load(project)?;
+    check_medium(&project, &observed)?;
     check_cd_text(backend, &observed, &project)?;
     project
         .disc
@@ -190,7 +206,11 @@ pub fn start(
     finish(&directory, journal, result)
 }
 
-fn normalize_length(backend: &mut dyn Recorder, path: &Path, mut sectors: u32) -> Result<()> {
+pub(crate) fn normalize_length(
+    backend: &mut dyn Recorder,
+    path: &Path,
+    mut sectors: u32,
+) -> Result<()> {
     // Some decoders round an exact CD frame boundary up by one sector.
     let original = sectors;
     while let Some(reported) = backend.audio_sectors(path)? {
@@ -215,6 +235,75 @@ fn normalize_length(backend: &mut dyn Recorder, path: &Path, mut sectors: u32) -
     Ok(())
 }
 
+pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) -> Result<Journal> {
+    ensure!(
+        speed.is_none_or(|v| (1..=64).contains(&v)),
+        "speed must be 1–64x"
+    );
+    if !directory.join("manifest.toml").try_exists()? {
+        ensure!(
+            speed.is_none(),
+            "legacy recording jobs use their saved speed"
+        );
+        return resume(backend, directory);
+    }
+    let directory = std::fs::canonicalize(directory)?;
+    let _lock = package::lock(&directory)?;
+    let mut package = Package::load(&directory)?;
+    let mut journal = if let Some(journal) = package.journal {
+        ensure!(
+            speed.is_none_or(|v| journal.speed == Some(v)),
+            "recording already started; its speed is frozen"
+        );
+        journal
+    } else {
+        package.verify_inputs(&directory)?;
+        let observed = backend.inspect()?;
+        let available = blank(&observed, false)?;
+        let mut project = package.project(&directory);
+        check_medium(&project, &observed)?;
+        check_cd_text(backend, &observed, &project)?;
+        project
+            .disc
+            .limit_end(available.saturating_sub(project.disc.end_margin_sectors));
+        if project.tracks.len() > 1 {
+            project.disc.intertrack_gap_sectors =
+                backend.music_gap(&observed, project.disc.intertrack_gap_sectors);
+        }
+        for track in &project.tracks {
+            normalize_length(backend, &track.path, audio::inspect(&track.path)?.sectors)?;
+        }
+        Plan::from_project(&project, None)?;
+        package.project.disc = project.disc;
+        package.refresh(&directory)?;
+        let journal = Journal {
+            format: "discimage-burn-v2".into(),
+            stage: Stage::Prepared,
+            device: observed.id.clone(),
+            speed,
+            source_sha256: None,
+            planned_sha256: None,
+            actual_sha256: None,
+            attempt: 0,
+            nwa: None,
+            observed,
+            error: None,
+        };
+        journal.save(&directory)?;
+        journal
+    };
+    ensure!(
+        matches!(
+            journal.stage,
+            Stage::Prepared | Stage::MusicWritten | Stage::DataReady
+        ),
+        "stage {:?} cannot be resumed automatically; no write attempted",
+        journal.stage
+    );
+    let result = run(backend, &directory, &mut journal);
+    finish(&directory, journal, result)
+}
+
 pub fn resume(backend: &mut dyn Recorder, directory: &Path) -> Result<Journal> {
     let directory = std::fs::canonicalize(directory)?;
     let _lock = job_lock(&directory)?;
@@ -232,6 +321,9 @@ pub fn resume(backend: &mut dyn Recorder, directory: &Path) -> Result<Journal> {
 }
 
 fn job_lock(directory: &Path) -> Result<File> {
+    if directory.join("manifest.toml").try_exists()? {
+        return package::lock(directory);
+    }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -269,10 +361,35 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         "check",
         format_args!("Checking the saved inputs and recording bundle"),
     );
-    let snapshot = directory.join("source");
+    let flat = journal.format == "discimage-burn-v2";
+    let snapshot = if flat {
+        directory.to_path_buf()
+    } else {
+        directory.join("source")
+    };
     check_source(&snapshot, journal)?;
-    let planned = directory.join("planned");
-    let manifest = checked_bundle(&planned, journal.planned_sha256.as_deref())?;
+    let planned = if flat {
+        directory.to_path_buf()
+    } else {
+        directory.join("planned")
+    };
+    let manifest = if flat {
+        let package = Package::load(directory)?;
+        let plan = package.verify_inputs(directory)?;
+        Manifest {
+            format: "discimage-extra-v1".into(),
+            generator: env!("CARGO_PKG_VERSION").into(),
+            session_start: plan.session_start(),
+            session_start_source: "planned".into(),
+            data_sectors: plan.data_sectors(),
+            plan,
+            artwork: package.project.artwork,
+            files: vec![],
+            assets: vec![],
+        }
+    } else {
+        checked_bundle(&planned, journal.planned_sha256.as_deref())?
+    };
     inspect_job(backend, journal)?;
     check_cancel(backend)?;
     backend.lock()?;
@@ -284,14 +401,22 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         .iter()
         .enumerate()
         .map(|(i, t)| Music {
-            path: planned.join(audio::track_path(i)),
+            path: planned.join(if flat {
+                package::audio_path(i)
+            } else {
+                audio::track_path(i)
+            }),
             sectors: t.sectors,
             gap: if i == 0 { 150 } else { gap },
         })
         .collect::<Vec<_>>();
     if journal.stage == Stage::Prepared {
         let available = blank(&journal.observed, true)?;
-        let project = Project::load(&snapshot.join("project.toml"))?;
+        let project = if flat {
+            Package::load(directory)?.project(directory)
+        } else {
+            Project::load(&snapshot.join("project.toml"))?
+        };
         check_cd_text(backend, &journal.observed, &project)?;
         ensure!(
             available >= manifest.plan.estimated_art_end_sector,
@@ -341,17 +466,25 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         .verify_music(&tracks)
         .context("music readback failed before data append")?;
     let cached = if journal.stage == Stage::DataReady && journal.nwa == Some(nwa) {
-        Some(checked_bundle(
-            &journal.actual(directory),
-            journal.actual_sha256.as_deref(),
-        )?)
+        Some(if flat {
+            let package = Package::load(directory)?;
+            let image = package.image.context("saved data image is missing")?;
+            author::verify_manifest(directory, &image, false)?;
+            image
+        } else {
+            checked_bundle(&journal.actual(directory), journal.actual_sha256.as_deref())?
+        })
     } else {
         None
     };
     let actual = if let Some(actual) = cached.filter(|a| a.data_sectors <= free) {
         actual
     } else {
-        let mut project = Project::load(&snapshot.join("project.toml"))?;
+        let mut project = if flat {
+            Package::load(directory)?.project(directory)
+        } else {
+            Project::load(&snapshot.join("project.toml"))?
+        };
         let end = nwa
             .checked_add(free)
             .context("drive reported an invalid writable range")?;
@@ -368,9 +501,27 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
             "session 2",
             format_args!("Rebuilding the data bundle at LBA {nwa}"),
         );
-        author::build_project(project, &path, Some(nwa))?;
-        let actual = author::verify(&path)?;
-        journal.actual_sha256 = Some(author::digest(&path.join("manifest.json"))?);
+        let actual = if flat {
+            let mut package = Package::load(directory)?;
+            let images = if package
+                .image
+                .as_ref()
+                .is_some_and(|i| i.assets.iter().any(|a| a.path == "session2.bin"))
+            {
+                author::Images::Both
+            } else {
+                author::Images::Iso
+            };
+            package.images(directory, Some(nwa), Some(end), images)?;
+            package
+                .image
+                .context("image generation produced no image")?
+        } else {
+            author::build_project(project, &path, Some(nwa))?;
+            let actual = author::verify(&path)?;
+            journal.actual_sha256 = Some(author::digest(&path.join("manifest.json"))?);
+            actual
+        };
         journal.advance(directory, Stage::DataReady)?;
         actual
     };
@@ -443,6 +594,10 @@ fn checked_bundle(path: &Path, expected: Option<&str>) -> Result<Manifest> {
     author::verify(path)
 }
 fn check_source(path: &Path, journal: &Journal) -> Result<()> {
+    if journal.format == "discimage-burn-v2" {
+        Package::load(path)?.verify_inputs(path)?;
+        return Ok(());
+    }
     ensure!(
         journal.source_sha256.as_deref() == Some(fingerprint(path)?.as_str()),
         "frozen recording inputs changed"
@@ -475,6 +630,18 @@ fn check_device(device: &Device, journal: &Journal) -> Result<()> {
     );
     Ok(())
 }
+fn check_medium(project: &Project, device: &Device) -> Result<()> {
+    if let Some(expected) = project.disc.media {
+        ensure!(
+            writable_cd(device)?.kind == expected.kind(),
+            "this package requires {}, but the inserted disc is {}; no write attempted",
+            expected.kind(),
+            writable_cd(device)?.kind
+        );
+    }
+    Ok(())
+}
+
 fn writable_cd(device: &Device) -> Result<&Media> {
     ensure!(!device.id.is_empty(), "drive has no stable identifier");
     let media = device
@@ -674,7 +841,7 @@ fn closed(device: &Device, plan: &Plan, nwa: u32, sectors: u32) -> Result<bool> 
 }
 
 /// Hash names, directory markers and file contents, independent of absolute job path.
-fn fingerprint(root: &Path) -> Result<String> {
+pub(crate) fn fingerprint(root: &Path) -> Result<String> {
     fn visit(root: &Path, path: &Path, hash: &mut Sha256) -> Result<()> {
         let meta = std::fs::symlink_metadata(path)?;
         ensure!(

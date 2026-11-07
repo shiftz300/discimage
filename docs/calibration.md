@@ -53,8 +53,8 @@ discimage calibrate guide --output calibration
 
 Use `--photo PATH` and `--points PATH` to select files explicitly. With an
 externally recorded target, `--bundle PATH` skips the recorder and works offline.
-Use the exact bundle written to the disc, normally `record/actual-1/`; its hash
-binds the photo measurements to the target. `planned/` is only a prediction.
+Use the exact bundle written to the disc, normally `record/`; its hash
+binds the photo measurements to the target. An unrecorded export is only a prediction.
 
 The fit reports six residuals and radial RMS. It rejects excessive perspective,
 invalid points and mismatched bundles. It does not fit angular phase, optical
@@ -66,14 +66,14 @@ do not guess points or repeatedly reburn the same unmeasurable target.
 ```sh
 discimage calibrate target --output target
 discimage preview target/target.toml --output target.svg
-discimage burn target/target.toml --device GX40N --output record --dry-run
+discimage build target/target.toml --output record
 discimage burn record
-discimage calibrate mark record/actual-1 --output mark.json
+discimage calibrate mark record --output mark.json
 # Import mark.json and photo.jpg in the website's photo point picker.
-discimage calibrate fit record/actual-1 points.json --output calibration.toml
+discimage calibrate fit record points.json --output calibration.toml
 ```
 
-For offline authoring use `build target/target.toml --output bundle
+For offline authoring use `build target/target.toml --iso --output bundle
 --session-start LBA`, with the actual recording start. The current CLI has no
 standalone physical-disc readback command; `verify -o` renders a local ISO.
 

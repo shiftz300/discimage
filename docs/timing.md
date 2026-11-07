@@ -50,18 +50,18 @@ record the photographed artwork:
 
 ```sh
 discimage calibrate phase --timing measurement/summary.json \
-  --bundle record/actual-1 --points points.json \
+  --bundle record --points points.json \
   --evidence photo.jpg --output comparison
 
 discimage calibrate import album.toml \
   --timing measurement/summary.json --phase comparison/report.json \
-  --bundle record/actual-1 --output candidate
+  --bundle record --output candidate
 ```
 
 Import the `candidate/` folder in **时序对比** on
 [discimage-website](https://discimage.kasetry.cn/). The tab shows the four
 comparison images and the drift curve from `report.json`. Export `candidate.toml`
-to use with `plan`, `preview`, `build` and `burn`. It references the
+to use with `preview` and `build`, then record the resulting package with `burn`. It references the
 original assets by absolute path; it is not a portable bundle. No preset is
 automatically applied. Use a new output directory on each run.
 
@@ -131,13 +131,13 @@ for that separate check.
 
 The timing summary must use the disc-probe CD `u`/`v` convention, 57,624 channel
 bits per sector and the assumed 108-frame read tail. Keep `targets.csv` next to
-`summary.json`: the script derives coverage from accepted targets and the fit
+`summary.json`: the importer derives coverage from accepted targets and the fit
 reference. It accepts both the Mac branch's `readable_lba_range` and the earlier
 adapter's `experiment_range` as bounds, not as proof of coverage. An inferred
 read-completion location is not a measured hardware delay.
 
 If a separate fiducial measurement supplied the forward offset `D`, add
-`--offset-frames D --offset-evidence measurement.json`. The script records that
+`--offset-frames D --offset-evidence measurement.json`. The comparison records that
 file's hash and checks the supplied offset against the photo curves without
 refitting it. This does not make shared-photo observations independent. Omitting
 these flags fits the offset from the provided curves.
@@ -147,7 +147,7 @@ The point file has this structure (at least 12 samples per curve):
 ```json
 {
   "format": "discimage-phase-v1",
-  "bundle_sha256": "SHA256 of the exact manifest.json",
+  "bundle_sha256": "SHA256 of the exact manifest.toml (legacy: manifest.json)",
   "evidence_sha256": "SHA256 of the photograph or rectified array",
   "evidence_kind": "photo",
   "convention": "photo-minus-design-clockwise",

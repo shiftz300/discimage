@@ -5,6 +5,7 @@
 # Correction: -0.82 degree/mm around 40.24394 mm.
 
 [profiles.sw80eu1]
+media = "cd-rw"
 capacity_sectors = 359847
 inner_radius_mm = 24.5
 outer_radius_mm = 57.22749180512035
@@ -16,6 +17,7 @@ velocity = 1183.177343317657
 angle = 12.9100280418
 
 [profiles.sw80eu1-timing]
+media = "cd-rw"
 capacity_sectors = 359847
 inner_radius_mm = 24.500316327764533
 outer_radius_mm = 57.22742040838572

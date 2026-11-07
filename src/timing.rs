@@ -271,7 +271,7 @@ pub fn import(
     );
     let summary_hash = author::digest(summary)?;
     let targets_hash = author::digest(&targets)?;
-    let manifest_hash = author::digest(&bundle.join("manifest.json"))?;
+    let manifest_hash = author::digest(&author::manifest_path(bundle))?;
     ensure!(
         report["sources"]["timing_sha256"] == summary_hash
             && report["sources"]["targets_sha256"] == targets_hash

@@ -71,7 +71,7 @@ fn timing_import_roundtrips_candidate_and_rejects_changed_evidence() {
         &points,
         json!({
             "format":"discimage-phase-v1", "convention":"photo-minus-design-clockwise",
-            "bundle_sha256":author::digest(&bundle.join("manifest.json")).unwrap(),
+            "bundle_sha256":author::digest(&author::manifest_path(&bundle)).unwrap(),
             "evidence_sha256":author::digest(&photo).unwrap(), "samples":samples,
         })
         .to_string(),
@@ -284,10 +284,10 @@ fn cli_resolves_project_paths_and_refuses_svg_overwrite() {
     .unwrap();
     let svg = temp.0.join("layout.svg");
     let output = Command::new(env!("CARGO_BIN_EXE_discimage"))
-        .arg("plan")
+        .arg("preview")
         .arg(&manifest)
         .arg("--json")
-        .arg("--svg")
+        .arg("--output")
         .arg(&svg)
         .current_dir(std::env::temp_dir())
         .output()
@@ -303,9 +303,9 @@ fn cli_resolves_project_paths_and_refuses_svg_overwrite() {
     let diagram = std::fs::read_to_string(&svg).unwrap();
     assert!(diagram.contains("EP &lt;&amp;&gt;"));
     let output = Command::new(env!("CARGO_BIN_EXE_discimage"))
-        .arg("plan")
+        .arg("preview")
         .arg(&manifest)
-        .arg("--svg")
+        .arg("--output")
         .arg(&svg)
         .output()
         .unwrap();
@@ -749,6 +749,7 @@ fn calibration_cli_binds_photo_points_to_the_written_target() {
     cli(&[
         "build",
         "target/target.toml",
+        "--iso",
         "--output",
         "written",
         "--session-start",
@@ -794,7 +795,7 @@ fn calibration_cli_binds_photo_points_to_the_written_target() {
             [512.0 + 8.0 * radius, 512.0]
         })
         .collect::<Vec<_>>();
-    let digest = author::digest(&directory.join("manifest.json")).unwrap();
+    let digest = author::digest(&author::manifest_path(&directory)).unwrap();
     let points = serde_json::json!({
         "width": 1024, "height": 1024, "rim": circle(60.0), "hole": circle(7.5),
         "edges": edges, "bundle_sha256": digest,

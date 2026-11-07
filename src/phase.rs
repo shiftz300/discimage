@@ -60,7 +60,7 @@ pub fn compare(
     offset: Option<(f64, &Path)>,
     output: &Path,
 ) -> Result<()> {
-    let manifest_path = bundle.join("manifest.json");
+    let manifest_path = author::manifest_path(bundle);
     let manifest = author::load(bundle)?;
     let manifest_hash = author::digest(&manifest_path)?;
     let (geometry, bounds) = timing::phase_geometry(summary)?;

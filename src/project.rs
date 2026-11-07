@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     pub title: String,
@@ -50,13 +50,13 @@ impl PresetReference {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Track {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CdText {
     pub artist: String,
@@ -161,9 +161,27 @@ impl Profile {
 }
 
 /// Planning inputs, never a replacement for the drive's reported capacity/NWA.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub enum Medium {
+    #[serde(rename = "cd-r")]
+    Cdr,
+    #[serde(rename = "cd-rw")]
+    Cdrw,
+}
+impl Medium {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Cdr => "cd-r",
+            Self::Cdrw => "cd-rw",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Disc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<Medium>,
     pub capacity_sectors: u32,
     pub inner_radius_mm: f64,
     pub outer_radius_mm: f64,
@@ -186,6 +204,7 @@ pub struct Disc {
 impl Default for Disc {
     fn default() -> Self {
         Self {
+            media: None,
             capacity_sectors: 360_000,
             inner_radius_mm: 25.0,
             outer_radius_mm: 58.0,

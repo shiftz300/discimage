@@ -24,14 +24,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Asset {
     pub path: String,
     pub bytes: u64,
     pub sha256: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub format: String,
     pub generator: String,
@@ -44,14 +44,47 @@ pub struct Manifest {
     pub assets: Vec<Asset>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Images {
+    Iso,
+    Raw,
+    Both,
+}
+impl Images {
+    fn iso(self) -> bool {
+        !matches!(self, Self::Raw)
+    }
+    fn raw(self) -> bool {
+        !matches!(self, Self::Iso)
+    }
+}
+
 pub fn build(project: &Path, output: &Path, session_start: Option<u32>) -> Result<Manifest> {
     build_project(Project::load(project)?, output, session_start)
+}
+
+pub fn build_images(
+    project: &Path,
+    output: &Path,
+    session_start: Option<u32>,
+    images: Images,
+) -> Result<Manifest> {
+    build_project_images(Project::load(project)?, output, session_start, images)
 }
 
 pub(crate) fn build_project(
     project: Project,
     output: &Path,
     session_start: Option<u32>,
+) -> Result<Manifest> {
+    build_project_images(project, output, session_start, Images::Both)
+}
+
+pub(crate) fn build_project_images(
+    project: Project,
+    output: &Path,
+    session_start: Option<u32>,
+    images: Images,
 ) -> Result<Manifest> {
     let plan = Plan::from_project(&project, session_start)?;
     let start = plan.session_start();
@@ -73,8 +106,14 @@ pub(crate) fn build_project(
     }
     let drawing = Drawing::new(&plan, artwork.as_ref())?;
     let mut assets = music(&plan, output)?;
-    let files = data(&plan, &volume, &drawing, output)?;
-    assets.extend(["session2.iso", "session2.bin", "session2.toc"].map(str::to_owned));
+    let files = data(&plan, &volume, &drawing, output, images)?;
+    if images.iso() {
+        assets.push("session2.iso".into());
+    }
+    if images.raw() {
+        assets.push("session2.bin".into());
+    }
+    assets.push("session2.toc".into());
     if plan.disc.calibration_target {
         std::fs::write(
             output.join("target.json"),
@@ -113,6 +152,9 @@ pub(crate) fn build_project(
         &output.join("difference.png"),
     )?;
     assets.extend(["readback.png", "difference.png"].map(str::to_owned));
+    if !images.iso() {
+        std::fs::remove_file(output.join("session2.iso"))?;
+    }
     for name in assets {
         let path = output.join(&name);
         manifest.assets.push(Asset {
@@ -127,6 +169,71 @@ pub(crate) fn build_project(
     )?;
     std::fs::remove_file(output.join("incomplete"))?;
     Ok(manifest)
+}
+
+pub(crate) fn images(
+    project: &Project,
+    output: &Path,
+    session_start: Option<u32>,
+    images: Images,
+) -> Result<Manifest> {
+    let plan = Plan::from_project(project, session_start)?;
+    let volume = volume(project, &plan)?;
+    let drawing = Drawing::new(&plan, project.artwork.as_ref())?;
+    std::fs::create_dir(output)?;
+    let files = data(&plan, &volume, &drawing, output, images)?;
+    let mut names = vec!["session2.toc", "preview.svg"];
+    if images.iso() {
+        names.push("session2.iso");
+    }
+    if images.raw() {
+        names.push("session2.bin");
+    }
+    preview::save(
+        &plan,
+        project.artwork.as_ref(),
+        &output.join("preview.svg"),
+        1600,
+    )?;
+    if plan.disc.calibration_target {
+        std::fs::write(
+            output.join("target.json"),
+            serde_json::to_vec_pretty(&Target::new(&plan))?,
+        )?;
+        names.push("target.json");
+    }
+    if !images.iso() {
+        std::fs::remove_file(output.join("session2.iso"))?;
+    }
+    let assets = names
+        .into_iter()
+        .map(|name| asset(output, name))
+        .collect::<Result<_>>()?;
+    Ok(Manifest {
+        format: "discimage-extra-v1".into(),
+        generator: env!("CARGO_PKG_VERSION").into(),
+        session_start: plan.session_start(),
+        session_start_source: if session_start.is_some() {
+            "provided"
+        } else {
+            "planned"
+        }
+        .into(),
+        data_sectors: plan.data_sectors(),
+        plan,
+        artwork: project.artwork.clone(),
+        files,
+        assets,
+    })
+}
+
+pub(crate) fn asset(directory: &Path, name: &str) -> Result<Asset> {
+    let path = directory.join(name);
+    Ok(Asset {
+        path: name.into(),
+        bytes: std::fs::metadata(&path)?.len(),
+        sha256: digest(&path)?,
+    })
 }
 
 pub(crate) fn volume(project: &Project, plan: &Plan) -> Result<Volume> {
@@ -164,7 +271,13 @@ fn music(plan: &Plan, output: &Path) -> Result<Vec<String>> {
     Ok(assets)
 }
 
-fn data(plan: &Plan, volume: &Volume, drawing: &Drawing<'_>, output: &Path) -> Result<Vec<Entry>> {
+fn data(
+    plan: &Plan,
+    volume: &Volume,
+    drawing: &Drawing<'_>,
+    output: &Path,
+    images: Images,
+) -> Result<Vec<Entry>> {
     let start = volume.base;
     let sectors = volume.sectors;
     let codec = Codec::default();
@@ -184,25 +297,33 @@ fn data(plan: &Plan, volume: &Volume, drawing: &Drawing<'_>, output: &Path) -> R
         bytes: plan.artwork_sectors * 2048,
         sha256: drawing_hash,
     });
-    let mut iso = BufReader::with_capacity(1024 * 1024, File::open(output.join("session2.iso"))?);
-    let mut raw = BufWriter::with_capacity(1024 * 1024, File::create(output.join("session2.bin"))?);
-    console::phase(
-        "encode",
-        format_args!("Generating Mode 1 framing for {sectors} sectors"),
-    );
-    let mut reported = Instant::now();
-    for (index, lba) in (start..start + sectors).enumerate() {
-        let mut payload = [0; COOKED];
-        iso.read_exact(&mut payload)?;
-        raw.write_all(&codec.sector(lba, &payload))?;
-        sector_progress("encode", index as u32 + 1, sectors, &mut reported);
+    if images.raw() {
+        let mut iso =
+            BufReader::with_capacity(1024 * 1024, File::open(output.join("session2.iso"))?);
+        let mut raw =
+            BufWriter::with_capacity(1024 * 1024, File::create(output.join("session2.bin"))?);
+        console::phase(
+            "encode",
+            format_args!("Generating Mode 1 framing for {sectors} sectors"),
+        );
+        let mut reported = Instant::now();
+        for (index, lba) in (start..start + sectors).enumerate() {
+            let mut payload = [0; COOKED];
+            iso.read_exact(&mut payload)?;
+            raw.write_all(&codec.sector(lba, &payload))?;
+            sector_progress("encode", index as u32 + 1, sectors, &mut reported);
+        }
+        raw.flush()?;
+        drop(raw);
     }
-    raw.flush()?;
-    drop(raw);
     // This TOC describes session 2 only; its required absolute start is in the manifest.
     std::fs::write(
         output.join("session2.toc"),
-        "// SESSION 2 ONLY - requires manifest.json session_start\nCD_ROM\nTRACK MODE1\nDATAFILE \"session2.iso\"\n",
+        if images.iso() {
+            "// SESSION 2 ONLY - requires the session start recorded in the manifest\nCD_ROM\nTRACK MODE1\nDATAFILE \"session2.iso\"\n"
+        } else {
+            "// SESSION 2 ONLY - requires the session start recorded in the manifest\nCD_ROM\nTRACK MODE1_RAW\nDATAFILE \"session2.bin\"\n"
+        },
     )?;
     Ok(files)
 }
@@ -240,7 +361,20 @@ pub(crate) fn encode_drawing(
     Ok(crate::hex(&hash.finalize()))
 }
 
+pub fn manifest_path(directory: &Path) -> std::path::PathBuf {
+    directory.join(if directory.join("manifest.toml").is_file() {
+        "manifest.toml"
+    } else {
+        "manifest.json"
+    })
+}
+
 pub fn load(directory: &Path) -> Result<Manifest> {
+    if directory.join("manifest.toml").try_exists()? {
+        return crate::package::Package::load(directory)?
+            .image
+            .context("no data image yet; record the package or export --iso/--raw first");
+    }
     ensure!(
         !directory.join("incomplete").try_exists()?,
         "bundle is incomplete"
@@ -255,6 +389,11 @@ pub fn load(directory: &Path) -> Result<Manifest> {
         manifest.format == "discimage-extra-v1",
         "unsupported bundle format"
     );
+    validate(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate(manifest: &Manifest) -> Result<()> {
     let p = &manifest.plan;
     ensure!(
         !(p.disc.calibration_target || p.disc.phase_target.is_some()) || manifest.artwork.is_none(),
@@ -282,20 +421,23 @@ pub fn load(directory: &Path) -> Result<Manifest> {
         manifest.assets.len() <= 110 && manifest.files.len() <= 10_001,
         "manifest entry limit exceeded"
     );
-    Ok(manifest)
+    Ok(())
 }
 
 pub fn verify(directory: &Path) -> Result<Manifest> {
+    if directory.join("manifest.toml").try_exists()? {
+        let package = crate::package::Package::load(directory)?;
+        package.verify(directory)?;
+        return package.image.context("no data image generated yet");
+    }
     let manifest = load(directory)?;
-    console::phase(
-        "verify",
-        format_args!(
-            "Checking local files and {} Mode 1 sectors",
-            manifest.data_sectors
-        ),
-    );
+    verify_manifest(directory, &manifest, true)?;
+    Ok(manifest)
+}
+
+pub(crate) fn verify_assets(directory: &Path, assets: &[Asset]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
-    for asset in &manifest.assets {
+    for asset in assets {
         ensure!(
             !asset.path.is_empty()
                 && Path::new(&asset.path)
@@ -315,44 +457,83 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
             asset.path
         );
     }
-    for required in ["session2.iso", "session2.bin", "session1.cue"] {
-        ensure!(seen.contains(required), "missing required asset {required}");
-    }
+    Ok(())
+}
+
+pub(crate) fn payload(directory: &Path, manifest: &Manifest) -> Result<crate::iso::Image> {
+    let raw =
+        !manifest.assets.is_empty() && !manifest.assets.iter().any(|a| a.path == "session2.iso");
+    crate::iso::Image::open(
+        &directory.join(if raw { "session2.bin" } else { "session2.iso" }),
+        raw,
+        manifest.data_sectors,
+    )
+}
+
+pub(crate) fn verify_manifest(directory: &Path, manifest: &Manifest, music: bool) -> Result<()> {
+    validate(manifest)?;
+    console::phase(
+        "verify",
+        format_args!(
+            "Checking local files and {} data sectors",
+            manifest.data_sectors
+        ),
+    );
+    verify_assets(directory, &manifest.assets)?;
+    let seen = manifest
+        .assets
+        .iter()
+        .map(|a| a.path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    ensure!(
+        seen.contains("session2.iso") || seen.contains("session2.bin"),
+        "missing session image"
+    );
     ensure!(
         !manifest.plan.disc.calibration_target || seen.contains("target.json"),
         "missing calibration target metadata"
     );
-    for (i, track) in manifest.plan.tracks.iter().enumerate() {
-        let name = format!("audio/{:02}.wav", i + 1);
-        ensure!(seen.contains(name.as_str()), "missing audio asset {name}");
-        let exported = audio::inspect(&directory.join(name))?;
+    if music {
         ensure!(
-            exported.sample_frames == track.sectors * 588 && exported.sectors == track.sectors,
-            "exported music duration does not match the session layout"
+            seen.contains("session1.cue"),
+            "missing required asset session1.cue"
         );
+        for (i, track) in manifest.plan.tracks.iter().enumerate() {
+            let name = audio::track_path(i);
+            ensure!(seen.contains(name.as_str()), "missing audio asset {name}");
+            let exported = audio::inspect(&directory.join(name))?;
+            ensure!(
+                exported.sample_frames == track.sectors * 588 && exported.sectors == track.sectors,
+                "exported music duration does not match the session layout"
+            );
+        }
     }
-    let mut iso =
-        BufReader::with_capacity(1024 * 1024, File::open(directory.join("session2.iso"))?);
-    let mut raw =
-        BufReader::with_capacity(1024 * 1024, File::open(directory.join("session2.bin"))?);
-    ensure!(
-        iso.get_ref().metadata()?.len() == u64::from(manifest.data_sectors) * COOKED as u64
-            && raw.get_ref().metadata()?.len() == u64::from(manifest.data_sectors) * RAW as u64,
-        "incorrect session image length"
-    );
+    let mut iso = payload(directory, manifest)?;
+    let mut raw = if seen.contains("session2.bin") {
+        let file = File::open(directory.join("session2.bin"))?;
+        ensure!(
+            file.metadata()?.len() == u64::from(manifest.data_sectors) * RAW as u64,
+            "incorrect RAW length"
+        );
+        Some(BufReader::with_capacity(1024 * 1024, file))
+    } else {
+        None
+    };
     let codec = Codec::default();
     let mut reported = Instant::now();
     for (index, lba) in
         (manifest.session_start..manifest.session_start + manifest.data_sectors).enumerate()
     {
-        let mut payload = [0; COOKED];
-        let mut sector = [0; RAW];
-        iso.read_exact(&mut payload)?;
-        raw.read_exact(&mut sector)?;
-        ensure!(
-            sector == codec.sector(lba, &payload),
-            "Mode 1 framing/EDC/ECC mismatch at LBA {lba}"
-        );
+        let mut bytes = [0; COOKED];
+        iso.read_exact(&mut bytes)?;
+        if let Some(raw) = &mut raw {
+            let mut sector = [0; RAW];
+            raw.read_exact(&mut sector)?;
+            ensure!(
+                sector == codec.sector(lba, &bytes),
+                "Mode 1 framing/EDC/ECC mismatch at LBA {lba}"
+            );
+        }
         sector_progress(
             "verify",
             index as u32 + 1,
@@ -375,7 +556,7 @@ pub fn verify(directory: &Path) -> Result<Manifest> {
             entry.path
         );
     }
-    Ok(manifest)
+    Ok(())
 }
 
 fn sector_progress(label: &str, done: u32, count: u32, reported: &mut Instant) {

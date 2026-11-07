@@ -2,7 +2,7 @@
 
 > [!WARNING]
 > **SAFETY WARNING · 刻录前必读**
-> - **先用 `burn --dry-run` 预演，并确认选中的光驱和盘片。**
+> - **先用 `build` 预演，并确认选中的光驱和盘片。**
 > - **`burn` 和标定刻录都会写盘。CD‑R 刻后无法擦除，擦除 CD‑RW 会清空盘内数据。**
 > - **只用光驱和盘片都支持的速度。请勿以管理员权限运行，写入期间请勿拔掉光驱。写入失败先看作业日志，再决定是否重试。**
 
@@ -49,15 +49,16 @@ source <(discimage completions zsh)
 
 把这两行放到 `~/.zshrc` 中 PATH／别名设置之后，可在新窗口自动加载。
 也支持 `bash`、`fish`、`powershell` 和 `elvish`；生成脚本不访问光驱。
+更新可执行文件后，再执行 `source <(discimage completions zsh)` 即可重载。
+重载会替换旧的 DiscImage 补全函数，不再提示隐藏的兼容命令或参数。
 
-## 规划与预览
+## 设计
 
-每首歌准备一个 44.1 kHz、16 位、双声道 PCM WAV，至少四秒。其他格式可用 XLD 或 FFmpeg 转换，例如 `ffmpeg -i song.flac -ar 44100 -ac 2 -c:a pcm_s16le 01.wav`。
-
-把 `album.toml` 放在 WAV 旁。文件路径相对此配置，数组顺序就是播放顺序。
+每首歌使用 44.1 kHz、16 位、双声道 PCM WAV，至少四秒。
+TOML 的音轨数组决定播放顺序，路径相对 TOML 文件。
 
 ```toml
-title = "My album"
+title = "我的专辑"
 tracks = [{ path = "01.wav" }, { path = "02.wav" }]
 
 [artwork]
@@ -65,77 +66,76 @@ path = "artwork.png"
 mode = "strip"
 ```
 
-在 `album.toml` 所在的专辑目录运行。
-
 ```sh
-discimage plan album.toml
-mkdir -p output
-discimage template album.toml --output output/templates
-discimage preview album.toml --output output/preview.svg
+discimage preview album.toml
+discimage preview album.toml -o preview.svg
+discimage template album.toml -o templates
 ```
 
-输出的父目录只需创建一次，每次导出使用新路径。图片还没做完时也可以先生成模板。用浏览器打开 SVG。`strip` 从 12 点顺时针环绕，长条上边对应外缘。`mode = "disc"` 将图片居中并裁到可绘制的圆环。支持 PNG 和 JPEG。已有盘片标定时，先在专辑中引用对应的 `preset`，再规划和预览。见[盘片预设](../calibrations/README.md)、[图案选项](preview.md)及[完整专辑示例](../examples/album.toml)。
+`preview` 显示专辑时长和可绘区域，`--json` 输出布局数据。
+`strip` 将长条 PNG/JPEG 环绕一圈，`disc` 将居中图片裁进圆环。
+将模板导入网页编辑器设计。见[图案参数](preview.md)和[盘片预设](../calibrations/README.md)。
 
-`discimage devices` 显示由标准光驱厂商、型号、序列号生成的 12 位十六进制硬件 ID，不带前缀。
-只要光驱向系统提供相同序列号，macOS、Windows、Linux 得到的 ID 就相同；不包含端口、盘符或固件版本。
-检测只读取设备元数据。读不到可靠序列号时显示 `local-xxxxxxxxxx`，它只代表当前系统连接。
-`devices --json` 保留硬件字段、`hardware_id`、`connection_selector`、首选 `selector` 和完整系统 `id`。
-用 `--device GX40N` 选择唯一型号，或复制显示的标识；列表序号不能用于选择。
-标识不存在、匹配多台或硬件 ID 重复时停止操作。已有作业仍绑定原始系统 ID，换连接后应重新准备作业。
-
-两种写法任选其一：
+## 制作和刻录
 
 ```sh
-# 先保存默认光驱，再准备作业。
-discimage select GX40N
-discimage burn album.toml -o record --dry-run
+discimage build album.toml
+open output/album/preview.svg
+# 插入空白 CD-R 或 CD-RW，检查后刻录：
+discimage burn output/album
 ```
 
-```sh
-# 或者一次写全，明确指定本次光驱。
-discimage burn album.toml -o record --dry-run --device GX40N
-```
+`build` 在所有平台均不需要光驱。它将音频、图案、参数快照和校验清单整理成一份平铺的成品，
+默认放在 TOML 旁的 `output/<TOML文件名>/`，用 `-o DIR` 可指定位置。不预先编码估算 ISO。
+重建会更新尚未开始或已完成的成品；未完成的刻录和目录内额外的私人文件受到保护。
 
-`select` 单独运行可查看默认值，`select --clear` 清除默认值。
-`--device` 只覆盖本次操作，不修改默认值。
-默认选择用于 `erase`、新刻录作业和需要光驱的标定命令；指定光驱断开或匹配不唯一时停止，不改选其他设备。
-已有作业继续使用保存的光驱，显式 `--device` 必须与其一致；离线命令不读取默认选择。
-`select` 只保存 ID，不占用或写入盘片。
-设置以 `device = "ID"` 存在用户目录下的 `discimage/config.toml` 中：macOS 位于
-`~/Library/Application Support`，Windows 位于 `%APPDATA%`，Linux 位于 `$XDG_CONFIG_HOME`（默认 `~/.config`）。
+`burn` 目前在 macOS 实现。它检查光驱和盘片，写音乐并读回比对，读取实际 NWA，
+只生成一次正确起点的数据会话，再写入、校验和封盘。
+成品内只保留一套输入和实际镜像，没有 `source/`、`planned/`、`actual-N/` 多套目录。
+参数、校验和、刻录状态统一保存在 `manifest.toml`。
+`burn` 不接受 `-o` 或 `--dry-run`；省略速度自动选择，也可以用 `--speed N`。
+开始写入后速度和光驱会固定，恢复时不能更换。
 
-## 在 macOS 刻录
-
-预留几 GB 硬盘空间，放入空白 CD-R 或 CD-RW，在系统终端中运行：
+### 光驱选择和 CD-RW
 
 ```sh
 discimage devices
-mkdir -p output
-discimage burn album.toml --output output/record --dry-run
-open output/record/planned/preview.svg
-# 确认预览后再开始写盘
-discimage burn output/record
+discimage select 光驱ID
+discimage erase             # 仅用于旧 CD-RW；核对后输入 ERASE。
+discimage burn output/album
 ```
 
-`burn --dry-run` 会选择唯一符合条件的空白盘，保存光驱和请求速度并生成预览，不写盘。有多个光驱符合条件时，用 `--device` 指定 `devices` 显示的短标识或唯一型号。省略 `--speed` 时，由光驱按盘片选择支持的最高速度；需要固定倍速时使用 `--speed N`。已有作业恢复时沿用保存的速度。每次重新刻录都使用新的输出目录，已完成的作业不能再次准备。用过的 CD-RW 先运行 `discimage erase`：自动选择唯一可用的 CD-RW，确认后完整擦除并检查空盘状态。`erase --dry-run` 只检查选择，`erase --quick` 仅快速清除盘片目录。
+也可以每次用 `--device ID` 指定。`select` 查看默认值，`select --clear` 清除默认值。
+指定光驱断开、匹配不唯一时停止，不改选其他设备。
+硬件 ID 由标准厂商、型号和序列号生成，不带前缀；无法读取可靠序列号时显示 `local-...`，
+它只代表当前系统连接。列表序号不能用于选择。`select` 不擦除或写盘。
 
-`burn JOB` 先写音乐会话并逐字节读回 PCM，再按光驱报告的下一可写地址重建、写入并校验数据会话。完成后，`output/record/journal.json` 应显示 `complete`，再次运行 `discimage devices` 可确认盘片已封盘且显示两个会话。盘面图案需要实物观察。若希望一次完成准备和刻录，使用 `discimage burn album.toml -o output/new-job`。中断恢复和 CD-Text 见[刻录说明](recording.md)。
+`erase` 默认完整擦除；`erase --dry-run` 只检查，`erase --quick` 仅清除目录，可能残留旧图案。
+CD-R 不能擦除。刻录成功后，`devices` 应显示盘片已封盘、具有两个会话，再检查盘面并试听。
 
-旧的 `prepare`、`resume`、`readback` 保留为隐藏兼容入口；新流程分别使用 `burn PROJECT --dry-run`、`burn JOB`、`verify BUNDLE -o FILE`。
-
-日志显示当前阶段。写盘时还会显示光驱报告的进度、速度和用时。macOS 自带终端使用基础 ANSI 配色，设置 `NO_COLOR=1` 可关闭颜色。重定向的日志使用纯文本，`plan --json` 和 `devices --json` 将 JSON 写到标准输出。
-
-## 离线制作
+## 可选镜像导出与检查
 
 ```sh
-mkdir -p output
-discimage build album.toml --output output/album
+discimage build album.toml --iso
+discimage build album.toml --raw
 discimage verify output/album
-discimage verify output/album --output output/readback.png
+discimage verify output/album -o encoded.png
 ```
 
-制品包含音频、带会话偏移的 ISO、RAW 数据镜像、预览和校验清单。`verify` 检查本地文件。实际刻录按实测地址使用 ISO。布局为音乐在前、Mode 1 数据在后。完整 Blue Book CD Extra/XA 合规性及消费级播放器兼容性仍待验证。
+`--iso` 导出 2048 字节数据扇区，`--raw` 导出带 Mode 1 帧结构和 EDC/ECC 的 2352 字节扇区，可同时指定。
+两者都是数据会话镜像，音乐音轨单独保存。没有实测 `--session-start LBA` 时，导出明确属于估算。
+实际刻录仍按光驱报告的 NWA 重建数据并写入 ISO。
+`verify` 检查本地文件，不读取实盘；编码投影需已有导出或实际刻录的镜像，按需生成。
 
-[专辑模板](../projects/README.md) · [盘片标定配置](../calibrations/README.md) · [校准指南](calibration.md) · [读取计时实验](timing.md) · [实机结果](validation.md) · [目录结构](files.md)
+旧的已完成作业可用 `discimage verify OLD_JOB --compact` 验证后一次性迁移为平铺结构，
+标定证据保持原样。旧的未完成作业仍支持安全恢复。
+`plan`、`prepare`、`resume`、`readback` 命令已移除。
 
-项目受 JiaFeiMiao-K-Cat 及贡献者的 [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio) 启发，绘图的 CIRC 映射继承了 CDImage 的工作。见[来源说明](../NOTICE.md)和 [GPL-3.0-or-later 许可](../LICENSE)。
+日志兼容 macOS 自带终端 ANSI 配色，`NO_COLOR=1` 可关闭颜色，重定向自动使用纯文本。
+`preview --json`、`devices --json` 保持标准输出为 JSON。
+CD-Text 可选，当前仅支持可打印 ASCII。完整 Blue Book CD Extra/XA 合规性及消费级播放器兼容性仍待验证。
+
+[专辑模板](../projects/README.md) · [校准](calibration.md) · [读取计时](timing.md) · [刻录与恢复](recording.md) · [实机结果](validation.md) · [文件结构](files.md)
+
+项目受 JiaFeiMiao-K-Cat 及贡献者的 [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio) 启发。
+见[来源说明](../NOTICE.md)和 [GPL-3.0-or-later 许可](../LICENSE)。

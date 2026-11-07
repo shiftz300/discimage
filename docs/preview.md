@@ -25,14 +25,14 @@ transparent. Layout colors are annotations, not predicted disc colors.
 discimage template album.toml --output templates
 discimage preview album.toml --output preview.svg
 discimage preview album.toml --output disc.png --size 1600
-discimage build album.toml --output album
+discimage build album.toml --iso --output album
 discimage verify album --output detail.png --samples 128 --size 1600
 ```
 
-`preview` uses the source; `build` additionally exports all four views; `verify -o`
+`preview PROJECT` prints track timing and artwork space. Add `--json` for the layout data, or `-o FILE` to export PNG/SVG. `build --iso` exports the selected data format and a single SVG preview; encoded PNG and difference views remain optional through the preview/verification APIs; `verify -o`
 first verifies the bundle then reads its ISO. Output resolution is 256–4096,
 default 1024. Input PNG/JPEG dimensions are limited to 8192 per side. SVG embeds
-its raster image and has no external source links or executable content. Exports
+its raster image and has no external source links or executable content. Preview exports
 refuse overwrite. There is no interactive GUI dependency.
 
 ## Shared composition and tone
@@ -59,7 +59,7 @@ Transparent pixels composite over white. This is an artistic tone pipeline,
 not radiometric calibration. Disc sources use a square canvas sized to the longest source side, bounded
 to 1600–4096 pixels. Strips retain their original pixels, up to the 8192-pixel
 decoder limit, without resizing. The same normalized grid is used by design
-preview and authoring, retained in the bundle as `source.png`.
+preview and authoring, retained in the package as `artwork.png`.
 
 - **gray:** continuous in design; deterministic stochastic `0D/AA` halftoning
   at each absolute logical byte in authoring.
@@ -92,7 +92,7 @@ The separate guide report is for reference and must not be burned as artwork.
 
 Output directories must not exist; interrupted template exports keep an
 `incomplete` marker. `--size` selects disc canvas size (default 1600, 256–4096),
-with strip dimensions derived automatically. Template, plan and preview accept
+with strip dimensions derived automatically. Template and preview accept
 `--session-start`, matching build; use the same value for all operations.
 
 ## Readback fidelity

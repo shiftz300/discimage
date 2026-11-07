@@ -21,7 +21,8 @@ until another backend introduces substantial native dependencies.
 | `probe` | Read-only CD acquisition, spindle timing and geometry fit |
 | `phase` | Offline photo phase comparison and held-out checks |
 | `timing` | Measured-coverage import and candidate conversion |
-| `burn` | Journaled two-session state machine, snapshots and recovery |
+| `package` | Offline flat inputs, one TOML manifest, format export and verified migration |
+| `burn` | Shared two-session state machine and recovery for flat and legacy inputs |
 | `device` | Device descriptions, discovery and the backend interface |
 | `macos` | Owned JSON FFI adapter and PCM readback |
 | `main`, `guide` | CLI commands and interactive calibration prompts |
@@ -92,11 +93,18 @@ this is not a full channel encoder or reflectivity simulator.
 
 ## Recording boundary
 
-`burn` freezes source files and verifies them before each write. A job progresses
-through prepared → music writing → music written → data ready → data writing →
-complete. Write intent is persisted before a native call; uncertain writes
-cannot resume automatically. The backend must verify PCM before appending,
-use the measured NWA, verify data and report final two-session layout.
+`build` is offline and freezes one flat set of PCM/artwork and resolved settings.
+It creates no provisional data image unless `--iso`/`--raw` explicitly requests
+an export. The package manifest contains hashes and, after binding a drive, the
+recording journal. The old JSON journal layout is read only for compatibility.
+
+`burn PACKAGE` runs the same state machine for new and legacy inputs. New
+packages reuse their audio and artwork; only data is regenerated after the actual
+NWA is known. State progresses through prepared → music writing → music written
+→ data ready → data writing → complete. Write intent is persisted before native
+calls. Audio PCM is verified before append, and uncertain writes never retry
+automatically. Finalization checks both sessions. Temporary image files are
+verified before promotion; they do not become permanent parallel bundles.
 
 Device quirks such as system audio-decoder rounding and SuperDrive CD-RW gap
 requirements live behind `Recorder`. Offline rendering has no device branches.
