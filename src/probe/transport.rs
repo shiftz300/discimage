@@ -3,14 +3,16 @@ use anyhow::{Result, ensure};
 
 pub(super) use crate::codec::COOKED as SECTOR_BYTES;
 pub(super) const READ_CHUNK: u8 = 32;
+// Conservative timing read speed, shared by macOS and Windows. Actual spindle
+// speed is measured: SET CD SPEED does not guarantee a fixed rotation rate.
 pub(super) const READ_SPEED_KBPS: u16 = 1411;
 
-pub(super) enum Command {
-    #[cfg(any(target_os = "macos", windows, test))]
+pub(crate) enum Command {
+    #[cfg(any(target_os = "macos", test))]
     Inquiry {
         serial: bool,
     },
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", test))]
     DriveSerial,
     Ready,
     Configuration,
@@ -30,10 +32,10 @@ pub(super) enum Command {
 
 impl Command {
     #[cfg(any(target_os = "macos", windows, test))]
-    pub(super) fn packet(self) -> ([u8; 16], u8, usize) {
+    pub(crate) fn packet(self) -> ([u8; 16], u8, usize) {
         let mut bytes = [0; 16];
         let (length, transfer) = match self {
-            #[cfg(any(target_os = "macos", windows, test))]
+            #[cfg(any(target_os = "macos", test))]
             Self::Inquiry { serial } => {
                 bytes[0] = 0x12;
                 bytes[1] = u8::from(serial);
@@ -41,7 +43,7 @@ impl Command {
                 bytes[4] = if serial { 255 } else { 36 };
                 (6, usize::from(bytes[4]))
             }
-            #[cfg(any(target_os = "macos", windows, test))]
+            #[cfg(any(target_os = "macos", test))]
             Self::DriveSerial => {
                 bytes[0] = 0x46;
                 bytes[1] = 2;
@@ -109,7 +111,7 @@ impl Command {
     }
 }
 
-pub(super) struct Reply {
+pub(crate) struct Reply {
     pub data: Vec<u8>,
     pub status: u8,
     pub sense: [u8; 32],
@@ -118,6 +120,12 @@ pub(super) struct Reply {
 }
 
 impl Reply {
+    pub(crate) fn asc(&self) -> (u8, u8) {
+        match self.sense[0] & 0x7f {
+            0x72 | 0x73 => (self.sense[2], self.sense[3]),
+            _ => (self.sense[12], self.sense[13]),
+        }
+    }
     pub fn key(&self) -> u8 {
         match self.sense[0] & 0x7f {
             0x70 | 0x71 => self.sense[2] & 15,
@@ -127,13 +135,15 @@ impl Reply {
     }
 
     pub fn good(self) -> Result<Self> {
-        let (asc, ascq) = match self.sense[0] & 0x7f {
-            0x72 | 0x73 => (self.sense[2], self.sense[3]),
-            _ => (self.sense[12], self.sense[13]),
+        let (asc, ascq) = self.asc();
+        let detail = if self.key() == 3 && (asc, ascq) == (0x73, 3) {
+            "; drive reported a power calibration area error"
+        } else {
+            ""
         };
         ensure!(
             self.status == 0,
-            "SCSI read failed (status {:02x}, sense {:02x}/{asc:02x}/{ascq:02x}); check the disc and drive",
+            "SCSI command failed (status {:02x}, sense {:02x}/{asc:02x}/{ascq:02x}){detail}; check the disc and drive",
             self.status,
             self.key()
         );
@@ -141,7 +151,7 @@ impl Reply {
     }
 }
 
-pub(super) trait Link {
+pub(crate) trait Link {
     fn command(&mut self, command: Command) -> Result<Reply>;
 }
 
@@ -253,174 +263,66 @@ pub(super) use mac::Device;
 
 #[cfg(windows)]
 mod win {
-    use super::*;
-    use anyhow::Context;
-    use std::{
-        ffi::c_void,
-        fs::{File, OpenOptions},
-        mem::{offset_of, size_of},
-        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-        ptr,
-        time::Instant,
-    };
-    use windows_sys::Win32::{
-        Storage::{
-            FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW},
-            IscsiDisc::{
-                IOCTL_SCSI_PASS_THROUGH_DIRECT, SCSI_IOCTL_DATA_IN, SCSI_IOCTL_DATA_UNSPECIFIED,
-                SCSI_PASS_THROUGH_DIRECT,
-            },
-        },
-        System::{
-            IO::DeviceIoControl,
-            Memory::{
-                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-            },
-        },
-    };
-
-    #[repr(C)]
-    struct Packet {
-        request: SCSI_PASS_THROUGH_DIRECT,
-        sense: [u8; 32],
+    /// DiscProbe's Windows scheduling preference, scoped to acquisition. Restore
+    /// both settings on success, failure or Ctrl-C, including partial failures.
+    pub(crate) struct TimingPriority {
+        process: u32,
+        thread: i32,
+        _same_thread: std::marker::PhantomData<*mut ()>,
     }
 
-    pub(in crate::probe) struct Device {
-        handle: File,
-        buffer: *mut c_void,
-        epoch: Instant,
-    }
-
-    impl Device {
-        pub fn open(id: &str) -> Result<Self> {
-            let [letter] = id.strip_suffix(':').unwrap_or(id).as_bytes() else {
-                anyhow::bail!("expected a Windows optical drive letter such as E:");
+    impl TimingPriority {
+        pub(crate) fn new() -> Self {
+            use windows_sys::Win32::System::Threading::*;
+            let mut guard = Self {
+                process: 0,
+                thread: i32::MAX,
+                _same_thread: std::marker::PhantomData,
             };
-            ensure!(
-                letter.is_ascii_alphabetic(),
-                "expected a Windows optical drive letter"
-            );
-            let letter = letter.to_ascii_uppercase();
-            let root = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
-            // GetDriveTypeW reads this NUL-terminated drive root. DRIVE_CDROM is 5.
-            ensure!(
-                unsafe { GetDriveTypeW(root.as_ptr()) } == 5,
-                "{}: is not an optical drive",
-                char::from(letter)
-            );
-            // SPTI requires both access flags, even for data-in-only CDBs.
-            let handle = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .open(format!(r"\\.\{}:", char::from(letter)))
-                .context(
-                    "cannot open optical drive for Windows SCSI pass-through; check drive access",
-                )?;
-            // Direct SPTI requires an adapter-aligned buffer. VirtualAlloc is page-aligned.
-            let buffer = unsafe {
-                VirtualAlloc(
-                    ptr::null(),
-                    usize::from(READ_CHUNK) * SECTOR_BYTES,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE,
-                )
-            };
-            if buffer.is_null() {
-                return Err(std::io::Error::last_os_error()).context("cannot allocate SCSI buffer");
+            // Pseudo-handles belong to this process/thread and need no close.
+            unsafe {
+                let process = GetCurrentProcess();
+                let thread = GetCurrentThread();
+                let old_process = GetPriorityClass(process);
+                let old_thread = GetThreadPriority(thread);
+                if old_process != 0 && SetPriorityClass(process, HIGH_PRIORITY_CLASS) != 0 {
+                    guard.process = old_process;
+                }
+                if old_thread != i32::MAX && SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST) != 0
+                {
+                    guard.thread = old_thread;
+                }
             }
-            Ok(Self {
-                handle,
-                buffer,
-                epoch: Instant::now(),
-            })
+            if guard.process == 0 || guard.thread == i32::MAX {
+                crate::console::warning(format_args!(
+                    "Windows could not raise all timing priorities; keeping available scheduling settings"
+                ));
+            }
+            guard
         }
     }
 
-    impl Drop for Device {
+    impl Drop for TimingPriority {
         fn drop(&mut self) {
-            // No asynchronous IO outlives this device.
-            unsafe { VirtualFree(self.buffer, 0, MEM_RELEASE) };
-        }
-    }
-
-    impl Link for Device {
-        fn command(&mut self, command: Command) -> Result<Reply> {
-            let (cdb, length, transfer) = command.packet();
-            ensure!(
-                transfer <= usize::from(READ_CHUNK) * SECTOR_BYTES,
-                "SCSI transfer too large"
-            );
-            let mut packet = Packet {
-                request: SCSI_PASS_THROUGH_DIRECT {
-                    Length: size_of::<SCSI_PASS_THROUGH_DIRECT>() as u16,
-                    CdbLength: length,
-                    SenseInfoLength: 32,
-                    DataIn: if transfer == 0 {
-                        SCSI_IOCTL_DATA_UNSPECIFIED
-                    } else {
-                        SCSI_IOCTL_DATA_IN
-                    } as u8,
-                    DataTransferLength: transfer as u32,
-                    TimeOutValue: 5,
-                    DataBuffer: if transfer == 0 {
-                        ptr::null_mut()
-                    } else {
-                        self.buffer
-                    },
-                    SenseInfoOffset: offset_of!(Packet, sense) as u32,
-                    Cdb: cdb,
-                    ..Default::default()
-                },
-                sense: [0; 32],
-            };
-            let buffer = ptr::from_mut(&mut packet).cast();
-            let size = size_of::<Packet>() as u32;
-            let mut returned = 0;
-            let start = Instant::now();
-            // The request and its separate data-in buffer remain valid until IO returns.
-            let ok = unsafe {
-                DeviceIoControl(
-                    self.handle.as_raw_handle(),
-                    IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                    buffer,
-                    size,
-                    buffer,
-                    size,
-                    &mut returned,
-                    ptr::null_mut(),
-                )
-            };
-            let end = Instant::now();
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("Windows optical command {:02x} failed", cdb[0]));
+            use windows_sys::Win32::System::Threading::*;
+            unsafe {
+                if self.thread != i32::MAX {
+                    SetThreadPriority(GetCurrentThread(), self.thread);
+                }
+                if self.process != 0 {
+                    SetPriorityClass(GetCurrentProcess(), self.process);
+                }
             }
-            ensure!(
-                returned as usize >= size_of::<SCSI_PASS_THROUGH_DIRECT>(),
-                "short Windows SCSI response"
-            );
-            let used = if packet.request.ScsiStatus == 0 {
-                packet.request.DataTransferLength as usize
-            } else {
-                0
-            };
-            ensure!(used <= transfer, "invalid Windows SCSI transfer length");
-            // The successful synchronous request initialized the reported prefix.
-            let data =
-                unsafe { std::slice::from_raw_parts(self.buffer.cast::<u8>(), used) }.to_vec();
-            Ok(Reply {
-                data,
-                status: packet.request.ScsiStatus,
-                sense: packet.sense,
-                end: (end - self.epoch).as_secs_f64(),
-                duration: (end - start).as_secs_f64(),
-            })
         }
     }
 }
 #[cfg(windows)]
-pub(super) use win::Device;
+pub(super) use crate::windows::ProbeDevice as Device;
+
+#[cfg(windows)]
+pub(crate) fn timing_priority() -> win::TimingPriority {
+    win::TimingPriority::new()
+}
 
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(super) struct Device;

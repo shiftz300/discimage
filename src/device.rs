@@ -1,7 +1,7 @@
 //! Device descriptions and the recording boundary shared by platform backends.
 mod identity;
 use crate::project::CdText;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use anyhow::bail;
 use anyhow::{Context, Result};
 pub use identity::Identity;
@@ -99,7 +99,10 @@ pub fn resolve<'a>(drives: &'a [Device], selector: &str) -> Result<&'a Device> {
         is_hardware || !selector.bytes().all(|c| c.is_ascii_digit()),
         "display numbers are not device selectors; use a selector or unique model from devices"
     );
-    let exact: Vec<_> = drives.iter().filter(|d| d.id == selector).collect();
+    let exact: Vec<_> = drives
+        .iter()
+        .filter(|d| d.id == selector || (cfg!(windows) && d.id.eq_ignore_ascii_case(selector)))
+        .collect();
     if let [drive] = exact.as_slice() {
         return Ok(drive);
     }
@@ -177,6 +180,9 @@ pub struct Music {
 /// The recorder owns its media reservation until dropped.
 pub trait Recorder {
     fn inspect(&mut self) -> Result<Device>;
+    fn preflight_speed(&mut self, _speed: Option<u32>) -> Result<()> {
+        Ok(())
+    }
     fn music_gap(&self, _drive: &Device, requested: u32) -> u32 {
         requested
     }
@@ -212,10 +218,16 @@ pub fn blank_cdr_recorder(id: Option<&str>, capacity: u32) -> Result<Box<dyn Rec
             capacity,
         )?))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(crate::windows::Recorder::reserve_blank_cdr(
+            id, capacity,
+        )?))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (id, capacity);
-        bail!("Recording is implemented for macOS only")
+        bail!("Recording is implemented for macOS and Windows")
     }
 }
 
@@ -224,10 +236,16 @@ pub fn recorder(id: &str) -> Result<Box<dyn Recorder>> {
     {
         Ok(Box::new(crate::macos::Recorder::new(id)))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(crate::windows::Recorder::new(id)?))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = id;
-        bail!("Recording is implemented for macOS only; offline authoring remains cross-platform")
+        bail!(
+            "Recording is implemented for macOS and Windows; offline authoring remains cross-platform"
+        )
     }
 }
 
@@ -258,7 +276,7 @@ pub fn erase(
     dry_run: bool,
     confirm: impl FnOnce(&Device) -> Result<bool>,
 ) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let drives = list()?;
         let selected = select_erasable(&drives, id)?;
@@ -271,12 +289,19 @@ pub fn erase(
             return Ok(());
         }
         install_cancel_handler()?;
-        crate::macos::erase(&selected.id, quick, confirm)
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::erase(&selected.id, quick, confirm)
+        }
+        #[cfg(windows)]
+        {
+            crate::windows::erase(&selected.id, quick, confirm)
+        }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (id, quick, dry_run, confirm);
-        bail!("CD-RW erasing is implemented for macOS only")
+        bail!("CD-RW erasing is implemented for macOS and Windows")
     }
 }
 
@@ -311,39 +336,7 @@ pub fn list() -> Result<Vec<Device>> {
     }
     #[cfg(target_os = "windows")]
     {
-        let output=std::process::Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); @(Get-CimInstance Win32_CDROMDrive | Select-Object DeviceID,Drive,Name) | ConvertTo-Json -Compress"]).output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "device query failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if output.stdout.iter().all(u8::is_ascii_whitespace) {
-            return Ok(Vec::new());
-        }
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let rows = match value {
-            serde_json::Value::Array(v) => v,
-            serde_json::Value::Null => Vec::new(),
-            v => vec![v],
-        };
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let mut drive = discovery(
-                    r["Drive"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| r["DeviceID"].as_str())
-                        .unwrap_or("")
-                        .into(),
-                    r["Name"].as_str().unwrap_or("").into(),
-                    "windows-cim",
-                );
-                drive.hardware = crate::probe::hardware_identity(&drive.id);
-                drive
-            })
-            .collect())
+        crate::windows::devices()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -351,7 +344,7 @@ pub fn list() -> Result<Vec<Device>> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn discovery(id: String, name: String, backend: &str) -> Device {
     Device {
         hardware: None,

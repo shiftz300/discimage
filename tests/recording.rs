@@ -267,6 +267,32 @@ fn track(number: u32, session: u32, start: i64, sectors: u32, audio: bool) -> Tr
 }
 
 #[test]
+fn reused_native_path_cannot_resume_on_replaced_or_unidentified_hardware() {
+    for replacement_serial in [Some("UNIT-B"), None] {
+        let work = Work::new();
+        let mut drive = Drive::new(&work, Fault::None);
+        drive.status.id = "D:".into();
+        drive.status.hardware = Some(discimage::device::Identity {
+            vendor: "Fixture".into(),
+            product: "Writer".into(),
+            serial: "UNIT-A".into(),
+        });
+        assert!(drive.status.hardware_id().is_some());
+        burn::start(&mut drive, &work.project, &work.job, Some(8), true).unwrap();
+        drive.status.hardware = replacement_serial.map(|serial| discimage::device::Identity {
+            vendor: "Fixture".into(),
+            product: "Writer".into(),
+            serial: serial.into(),
+        });
+        drive.calls.clear();
+        let error = burn::resume(&mut drive, &work.job).unwrap_err();
+        assert!(format!("{error:#}").contains("hardware identity"));
+        assert!(drive.calls.is_empty());
+        assert_eq!(Journal::load(&work.job).unwrap().stage, Stage::Prepared);
+    }
+}
+
+#[test]
 fn automatic_speed_survives_preparation_and_resume_for_both_sessions() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::None);

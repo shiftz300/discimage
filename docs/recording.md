@@ -1,7 +1,12 @@
 # Recording and recovery
 
 `preview` and `build` are offline. Only `burn`, `erase` and explicit calibration
-recording write to a disc. Recording currently uses macOS DiscRecording.
+recording write to a disc. Recording uses macOS DiscRecording or Windows IMAPI2
+MMC commands. Windows sends audio SAO with exact CUE gaps and optional
+CD-Text, followed by cooked Mode 1 TAO at the observed NWA. Its aligned transport
+buffer and IMAPI2 reservation stay owned until the recorder is dropped; media
+change notification is restored when the session closes.
+See the [Windows workflow](windows.md) for hardware bring-up.
 
 ## Normal workflow
 
@@ -59,7 +64,7 @@ discimage erase
 Check the displayed drive and disc, then type `ERASE`. Full erase is the default;
 `--quick` only resets metadata and may leave old artwork. CD-R is rejected.
 Erasing confirms a blank medium with writable capacity and does not start a burn.
-DRErase cannot be aborted: after starting, the CLI waits and reports progress.
+An erase cannot be safely undone: after starting, the CLI waits and reports progress.
 Keep the drive connected until completion.
 
 ## Recording transaction

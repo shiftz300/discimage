@@ -2,7 +2,7 @@
 mod cache;
 mod fit;
 mod period;
-mod transport;
+pub(crate) mod transport;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -28,12 +28,9 @@ const REPS: usize = 32;
 
 /// Discovery reads only INQUIRY and GET CONFIGURATION metadata. It does not reserve media, set speed,
 /// run the timing probe or bypass a failed permissions check.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 pub(crate) fn hardware_identity(id: &str) -> Option<crate::device::Identity> {
-    #[cfg(target_os = "macos")]
     let mut link = Device::for_identity(id).ok()?;
-    #[cfg(windows)]
-    let mut link = Device::open(id).ok()?;
     let standard = link
         .command(Command::Inquiry { serial: false })
         .ok()?
@@ -74,6 +71,8 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
     device::install_cancel_handler()?;
     let mut link = Device::open(&resolved)?;
     let readable = disc_bounds(&mut link, true)?;
+    #[cfg(windows)]
+    let _priority = transport::timing_priority();
     let Range { start: first, end } = requested.unwrap_or_else(|| {
         let span = readable.end - readable.start - 1;
         readable.start + span * 3 / 100..readable.start + span * 85 / 100
@@ -89,6 +88,20 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
         "format": "discimage-probe-v1", "device": id, "native_device": resolved,
         "requested_range": [first, end], "completed": false,
     });
+    #[cfg(windows)]
+    {
+        receipt["transport"] = json!({
+            "backend": "windows-imapi2", "exclusive": true,
+            "clock": "QueryPerformanceCounter", "timing": "synchronous-command",
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        receipt["transport"] = json!({
+            "backend": "macos-iokit", "exclusive": true,
+            "clock": "CLOCK_UPTIME_RAW", "timing": "synchronous-command",
+        });
+    }
     save(&output.join("status.json"), &receipt)?;
     let reference = first + (end - first) / 2;
     let mut probe = Probe {
@@ -112,6 +125,13 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
             "Verified Mode 1 range {}..{} | reference LBA {reference} | cache {}",
             readable.start, readable.end, cache["strategy"]
         ),
+    );
+    let rotation = probe.check_rotation(first..end)?;
+    receipt["rotation_check"] = rotation.clone();
+    save(&output.join("status.json"), &receipt)?;
+    ensure!(
+        rotation["looks_clv"] != true,
+        "drive appears to use constant linear velocity across this range; geometry timing needs stable constant rotation"
     );
     probe.settle()?;
     let fit = fit::ladder(first..end, reference, |lba| probe.measure(lba))?;
@@ -140,6 +160,7 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
             "experiment_range": [first, end],
         },
         "cache": cache,
+        "rotation_check": rotation,
         "set_cd_speed": speed,
     });
     let targets_path = output.join("targets.csv");
@@ -295,8 +316,49 @@ impl Probe<'_> {
         self.random ^= self.random << 13;
         self.random ^= self.random >> 17;
         self.random ^= self.random << 5;
-        std::thread::sleep(Duration::from_micros(u64::from(self.random % 50_000)));
+        // A slow spindle needs jitter spanning a whole revolution to avoid
+        // period aliases. The initial unknown-period window remains 50 ms.
+        let window = (self.period.unwrap_or(0.04) * 1.25 * 1e6).max(50_000.0) as u64;
+        std::thread::sleep(Duration::from_micros(u64::from(self.random) % window));
         self.sample(lba)
+    }
+
+    fn check_rotation(&mut self, range: Range<u32>) -> Result<Value> {
+        let inner = range.start;
+        let outer = range.end - 1;
+        let radius_squared = |lba| {
+            25.0f64.powi(2)
+                + 0.0016 * (16.0 / f64::from(SECTOR_BITS)) * read_end_bits(lba) as f64
+                    / std::f64::consts::PI
+        };
+        let expected = (radius_squared(outer) / radius_squared(inner)).sqrt();
+        if expected < 1.1 {
+            return Ok(
+                json!({"checked":false,"reason":"range too narrow to distinguish CAV from CLV"}),
+            );
+        }
+        console::phase(
+            "probe",
+            format_args!("Checking inner/outer rotation before the geometry ladder"),
+        );
+        let mut periods = Vec::new();
+        for lba in [inner, outer] {
+            let mut times = Vec::new();
+            for _ in 0..2 {
+                times.clear();
+                for _ in 0..24 {
+                    times.extend(self.timed(lba)?);
+                }
+            }
+            let Some(fit) = period::estimate(&times, None).filter(|p| p.coherence >= 0.8) else {
+                return Ok(json!({"checked":false,"reason":"inconclusive rotation period"}));
+            };
+            periods.push(fit.seconds);
+        }
+        let ratio = periods[1] / periods[0];
+        Ok(json!({"checked":true,"inner_lba":inner,"outer_lba":outer,
+            "period_ms":periods.iter().map(|p| p*1000.0).collect::<Vec<_>>(),
+            "ratio":ratio,"expected_clv":expected,"looks_clv":looks_clv(ratio, expected)}))
     }
 
     fn settle(&mut self) -> Result<()> {
@@ -311,7 +373,7 @@ impl Probe<'_> {
             for _ in 0..16 {
                 times.extend(self.timed(self.reference)?);
             }
-            let current = period::estimate(&times, None).filter(|fit| fit.coherence >= 0.99);
+            let current = period::estimate(&times, None).filter(|fit| fit.coherence >= 0.95);
             if let (Some(current), Some(last)) = (&current, previous)
                 && stable(current, last)
             {
@@ -345,7 +407,7 @@ impl Probe<'_> {
                 target.extend(self.timed(lba)?);
             }
             if let Some(fit) = period::estimate(&reference, self.period)
-                && fit.coherence >= 0.98
+                && fit.coherence >= 0.93
                 && self.period.is_some_and(|last| stable(&fit, last))
                 && let Some((phase, spread, used)) = period::phase(&fit, &target)
             {
@@ -367,6 +429,11 @@ impl Probe<'_> {
 
 fn stable(period: &Period, previous: f64) -> bool {
     (period.seconds / previous - 1.0).abs() <= PERIOD_TOL
+}
+
+fn looks_clv(ratio: f64, expected: f64) -> bool {
+    (expected - expected.round()).abs() / expected >= 0.03
+        && (ratio - expected).abs() / expected < 0.03
 }
 
 #[cfg(test)]
@@ -465,6 +532,7 @@ mod tests {
             evicted: u32,
             reads: u32,
             next_evict: u32,
+            cached_duration: f64,
         }
         impl Link for Reader {
             fn command(&mut self, command: Command) -> Result<Reply> {
@@ -495,7 +563,7 @@ mod tests {
                             Cache::Flush => std::mem::take(&mut self.flushed),
                             Cache::Evict => self.evicted == 256,
                         };
-                        (count, if media { 0.024 } else { 0.0002 })
+                        (count, if media { 0.024 } else { self.cached_duration })
                     }
                     _ => panic!("unexpected command during cache test"),
                 };
@@ -508,13 +576,20 @@ mod tests {
                 })
             }
         }
-        for expected in [Cache::Plain, Cache::Fua, Cache::Flush, Cache::Evict] {
+        for (expected, cached_duration) in [
+            (Cache::Plain, 0.0002),
+            (Cache::Fua, 0.0002),
+            (Cache::Fua, 0.008),
+            (Cache::Flush, 0.0002),
+            (Cache::Evict, 0.0002),
+        ] {
             let mut reader = Reader {
                 expected,
                 flushed: false,
                 evicted: 0,
                 reads: 0,
                 next_evict: 1179,
+                cached_duration,
             };
             let mut probe = Probe {
                 link: &mut reader,
@@ -541,6 +616,65 @@ mod tests {
             assert_eq!(report["after_flush"]["n"] == 40, after_flush);
             assert!(reader.reads >= if after_flush { 121 } else { 81 });
         }
+    }
+
+    #[test]
+    fn read10_fallback_requires_a_refused_opcode_and_never_hides_media_errors() {
+        struct Refused {
+            key: u8,
+            commands: Vec<u8>,
+        }
+        impl Link for Refused {
+            fn command(&mut self, command: Command) -> Result<Reply> {
+                let (cdb, _, length) = command.packet();
+                self.commands.push(cdb[0]);
+                let refused = self.commands.len() == 1;
+                let mut sense = [0; 32];
+                if refused {
+                    sense[0] = 0x70;
+                    sense[2] = self.key;
+                    sense[12] = if self.key == 5 { 0x20 } else { 0x11 };
+                }
+                Ok(Reply {
+                    data: vec![0; length],
+                    status: if refused { 2 } else { 0 },
+                    sense,
+                    end: 1.0,
+                    duration: 0.03,
+                })
+            }
+        }
+        for key in [3, 5] {
+            let mut link = Refused {
+                key,
+                commands: Vec::new(),
+            };
+            let mut probe = Probe {
+                link: &mut link,
+                bounds: 0..10000,
+                reference: 5000,
+                read12: true,
+                cache: Cache::Plain,
+                evict_cursor: 0,
+                period: None,
+                random: 1,
+            };
+            let result = probe.setup_reads();
+            assert_eq!(result.is_ok(), key == 5);
+            assert_eq!(probe.read12, key != 5);
+            if key == 3 {
+                assert_eq!(link.commands, [0xa8]);
+            } else {
+                assert_eq!(&link.commands[..3], [0xa8, 0x28, 0xbb]);
+            }
+        }
+    }
+
+    #[test]
+    fn clv_screen_distinguishes_constant_rotation_and_whole_turn_aliases() {
+        assert!(looks_clv(1.82, 1.8));
+        assert!(!looks_clv(1.0, 1.8));
+        assert!(!looks_clv(2.0, 2.01));
     }
 
     #[test]

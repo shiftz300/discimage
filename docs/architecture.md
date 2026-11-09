@@ -108,8 +108,19 @@ verified before promotion; they do not become permanent parallel bundles.
 
 Device quirks such as system audio-decoder rounding and SuperDrive CD-RW gap
 requirements live behind `Recorder`. Offline rendering has no device branches.
-Windows CIM and Linux sysfs currently provide discovery only; implementing a
-new recorder must preserve reservation, NWA and finalization semantics.
+Windows uses `GetDriveTypeW` and MMC metadata for discovery. Its recorder owns an
+IMAPI2 session for exclusive access and aligned MMC transfers, suppresses media
+change notification, and prevents tray removal while recording. Read timing also
+owns an exclusive IMAPI2 session with QPC timestamps at the synchronous MMC call
+boundary, excluding buffer preparation and result copying. Its bounded command
+enum cannot submit media writes. Both platforms use the same conservative
+1411 kB/s timing read-speed request and 32 read pairs per target, with cache,
+rotation and phase checks. Recording and erasing retain maximum-supported-speed
+defaults.
+MMC page 05 selects audio SAO / cooked Mode 1 TAO; CUE and CD-Text are encoded in
+Rust. READ CD compares PCM and READ(10) compares every data sector. Linux sysfs
+currently provides discovery only. Every recorder preserves the same reservation,
+NWA, journal and finalization semantics.
 
 ## Validation boundaries
 
@@ -118,7 +129,10 @@ unchanged media bytes. `tests/fixtures/encoding.json` pins pre-refactor ISO/RAW 
 preview hashes for four drawing modes. `tests/recording.rs` exercises the real
 authoring pipeline with a mock recorder, including capacity limits, changed
 NWA, interruption and immutable snapshots. macOS tests exercise framework
-producers and PCM comparison without writing a physical disc.
+producers and PCM comparison without writing a physical disc. Windows command
+simulations exercise its actual MMC recorder through flat packages, including
+CD-Text, exact gaps, nonzero PCM, reported NWA, readback corruption and uncertain
+write recovery. Byte-level MMC tests run on every test platform.
 
 Digital integrity, photographed appearance and player compatibility are
 separate acceptance checks. See [validation](validation.md),

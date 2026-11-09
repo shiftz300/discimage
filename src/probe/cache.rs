@@ -10,6 +10,7 @@ use super::{
 };
 
 const CACHE_HIT_US: f64 = 3000.0;
+const CACHE_RATIO: f64 = 3.0;
 const CACHE_READS: usize = 40;
 const EVICT_SECTORS: u32 = 256;
 const EVICT_REGION: u32 = 32_768;
@@ -93,22 +94,25 @@ impl Probe<'_> {
 
     pub(super) fn setup_reads(&mut self) -> Result<Value> {
         let lba = self.align(50);
-        if self.read(lba, 1, false)?.status != 0 {
+        let initial = self.read(lba, 1, false)?;
+        if initial.status != 0 && initial.key() == 5 && matches!(initial.asc().0, 0x20 | 0x24) {
             self.read12 = false;
+        } else {
+            initial.good()?;
         }
         self.read(lba, 1, false)?.good()?;
         check_cancel()?;
         let speed = active_media(self.link.command(Command::Speed)?)?;
         if speed.status != 0 {
             console::warning(format_args!(
-                "Drive rejected {READ_SPEED_KBPS} kB/s; using current read speed"
+                "Drive rejected the timing read-speed request ({READ_SPEED_KBPS} kB/s); using current read speed"
             ));
         }
         for percent in [0, 25, 50, 75, 100, 5] {
             self.read(self.align(percent), 1, false)?.good()?;
         }
         Ok(json!({
-            "requested_kBps": READ_SPEED_KBPS, "pure_cav": false,
+            "requested_kBps": READ_SPEED_KBPS, "policy": "conservative", "pure_cav": false,
             "status": speed.status, "sense": speed.sense,
         }))
     }
@@ -124,8 +128,11 @@ impl Probe<'_> {
         };
         let plain = repeated(false)?;
         let fua = repeated(true)?;
-        let plain_cached = plain.p50_us < CACHE_HIT_US;
         let fua_media = fua.p50_us >= CACHE_HIT_US && fua.failed == 0;
+        // Slow USB bridges can take >3 ms even for cached sectors. Compare FUA
+        // with plain reads, as DiscProbe does, before declaring them uncached.
+        let plain_cached =
+            plain.p50_us < CACHE_HIT_US || (fua_media && fua.p50_us >= CACHE_RATIO * plain.p50_us);
         let plain_good = plain.failed == 0;
         let mut out = json!({
             "lba": lba, "sectors": 1, "plain": plain, "fua": fua,
@@ -199,8 +206,10 @@ impl Probe<'_> {
 
 fn active_media(reply: Reply) -> Result<Reply> {
     // A changed or unavailable medium invalidates the bounds established at open.
-    if reply.status != 0 && matches!(reply.key(), 2 | 6) {
-        return reply.good().context("recorded CD is no longer ready");
+    if reply.status != 0 && matches!(reply.key(), 2 | 3 | 4 | 6) {
+        return reply
+            .good()
+            .context("recorded CD is no longer ready or cannot be read reliably");
     }
     Ok(reply)
 }

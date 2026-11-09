@@ -1,7 +1,7 @@
 # Calibration
 
 The offline tools work on macOS, Windows and Linux. The guided recorder uses
-macOS. Interactive prompts currently use Chinese; individual subcommands use
+macOS or Windows. Interactive prompts currently use Chinese; individual subcommands use
 English. Calibration has two separate parts:
 
 - **Radial:** three solid concentric bands locate known LBAs in millimeters.
@@ -15,8 +15,9 @@ It reuses existing evidence and does not change the saved preset.
 
 ## Guided radial fit
 
-On macOS, a single-session Mode 1 target can serve both the radial photo fit
-and the read-timing probe. With a blank CD-R inserted:
+On macOS and Windows, a single-session Mode 1 target can serve both the radial
+photo fit and the read-timing probe. Use a blank CD-R; Windows also supports a
+blank CD-RW (erase a used CD-RW explicitly first):
 
 ```sh
 mkdir -p calibrations/work

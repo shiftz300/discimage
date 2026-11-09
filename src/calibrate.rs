@@ -51,14 +51,21 @@ pub fn record_single(
         let device = device.map(crate::device::resolve_id).transpose()?;
         crate::macos::record_calibration(directory, device.as_deref(), speed, dry_run)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let device = device.map(crate::device::resolve_id).transpose()?;
+        crate::windows::record_calibration(directory, device.as_deref(), speed, dry_run)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (directory, device, speed, dry_run);
-        anyhow::bail!("Calibration recording requires macOS; photo fitting works offline")
+        anyhow::bail!(
+            "Calibration recording requires macOS or Windows; photo fitting works offline"
+        )
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn prepare_single(
     directory: &Path,
     free_sectors: u32,

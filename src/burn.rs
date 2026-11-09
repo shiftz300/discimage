@@ -126,6 +126,7 @@ pub fn start(
     );
     let mut project = Project::load(project)?;
     check_medium(&project, &observed)?;
+    backend.preflight_speed(speed)?;
     check_cd_text(backend, &observed, &project)?;
     project
         .disc
@@ -260,6 +261,7 @@ pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) 
         package.verify_inputs(&directory)?;
         let observed = backend.inspect()?;
         let available = blank(&observed, false)?;
+        backend.preflight_speed(speed)?;
         let mut project = package.project(&directory);
         check_medium(&project, &observed)?;
         check_cd_text(backend, &observed, &project)?;
@@ -345,7 +347,13 @@ fn finish(directory: &Path, mut journal: Journal, result: Result<()>) -> Result<
             format!(
                 "recording stopped at {:?}; see {}",
                 journal.stage,
-                directory.join("journal.json").display()
+                directory
+                    .join(if journal.format == "discimage-burn-v2" {
+                        "manifest.toml"
+                    } else {
+                        "journal.json"
+                    })
+                    .display()
             )
         });
     }
@@ -391,6 +399,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         checked_bundle(&planned, journal.planned_sha256.as_deref())?
     };
     inspect_job(backend, journal)?;
+    backend.preflight_speed(journal.speed)?;
     check_cancel(backend)?;
     backend.lock()?;
     journal.observed = inspect_job(backend, journal)?;
@@ -619,6 +628,12 @@ fn inspect_job(backend: &mut dyn Recorder, journal: &Journal) -> Result<Device> 
 
 fn check_device(device: &Device, journal: &Journal) -> Result<()> {
     ensure!(device.id == journal.device, "recording drive changed");
+    if let Some(expected) = journal.observed.hardware_id() {
+        ensure!(
+            device.hardware_id().as_ref() == Some(&expected),
+            "recording drive hardware identity changed or cannot be verified; native paths and Windows drive letters may be reused"
+        );
+    }
     let media = writable_cd(device)?;
     ensure!(
         journal

@@ -8,7 +8,7 @@
 
 [简体中文](docs/zhcn.md)
 
-Make a music CD with artwork in the outer ring. Plan, design and build on macOS, Windows or Linux. Record directly on macOS.
+Make a music CD with artwork in the outer ring. Plan, design and build on macOS, Windows or Linux. Record directly on macOS and Windows.
 
 ## Install
 
@@ -94,7 +94,7 @@ beside the project. `-o DIR` overrides that path. No provisional ISO is generate
 Rebuilding updates an unstarted or completed package; unfinished recordings and
 unmanaged files are protected.
 
-`burn` is implemented on macOS. It checks the drive and media, writes and reads
+`burn` is implemented on macOS and Windows. It checks the drive and media, writes and reads
 back the audio, reads the actual NWA, generates the data session once, verifies
 it and finalizes the disc. The package retains one set of inputs and the actual
 image; it has no `source/`, `planned/` or `actual-N/` directories. Parameters,
@@ -149,6 +149,11 @@ optional and currently supports printable ASCII. Full Blue Book CD Extra/XA
 compliance and consumer-player compatibility remain unverified.
 
 [Album template](projects/README.md) · [Calibration](docs/calibration.md) · [Timing](docs/timing.md) · [Recording and recovery](docs/recording.md) · [Hardware results](docs/validation.md) · [Files](docs/files.md)
+
+Windows recording is experimental. For drive access, CD-RW reuse and the current
+XD05 bring-up results, see the [Windows workflow](docs/windows.md) and
+[hardware validation](docs/validation.md). Simulated command tests do not establish
+physical recording or timing success.
 
 Inspired by [DiscImageStudio](https://github.com/JiaFeiMiao-K-Cat/DiscImageStudio)
 by JiaFeiMiao-K-Cat and contributors, including its CDImage-derived CIRC mapping.

@@ -44,3 +44,12 @@ The CD-specific cache strategy and timing acquisition adapt
 at `0fc8493522c4751988723640b266078445524f5e`. Both projects are GPL-3.0-or-later.
 DiscImage uses a bounded CD-only command set, operating-system transports,
 Rust timing and fitting, and its existing report and candidate formats.
+
+The Windows CD recorder's MMC write-parameter, CUE and CD-Text wire behavior was
+checked against cdrecord in [cdrtools](https://github.com/Distrotech/cdrtools)
+at `8adb0d06e070464f13d017b1de7187bf23dacd87` (notably `drv_mmc.c` and
+`cdtext.c`). Its Rust encoders and recorder are new implementations of those
+standard formats; no cdrtools source or binaries are linked or distributed.
+The Windows measurement update also reviews Ashley-QwQ/disc-probe at
+`db322e34e7199585ebff5a0b9d219b1532965404`, including slow-USB cache detection,
+READ opcode fallback, rotation screening and spindle sampling/scheduling.

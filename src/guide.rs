@@ -176,7 +176,7 @@ fn record(directory: &Path, options: &Options) -> Result<Option<PathBuf>> {
         options.photo.is_none() && options.points.is_none(),
         "先完成标靶刻录，或用 --bundle 指定已刻制品，再提交照片或点位"
     );
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", windows)) {
         println!(
             "[1/3] 标靶工程已生成于 {}。可离线 build，外部刻录后用 --bundle 继续取点。",
             config.display()

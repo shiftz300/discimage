@@ -8,7 +8,7 @@
 
 [English](../README.md)
 
-制作外圈带图案的音乐 CD。macOS、Windows 和 Linux 都可规划、预览和制作离线制品，目前可在 macOS 直接刻录。
+制作外圈带图案的音乐 CD。macOS、Windows 和 Linux 都可规划、预览和制作离线制品，macOS 可直接刻录，Windows 已接入实验性刻录后端。
 
 ## 安装
 
@@ -89,8 +89,9 @@ discimage burn output/album
 默认放在 TOML 旁的 `output/<TOML文件名>/`，用 `-o DIR` 可指定位置。不预先编码估算 ISO。
 重建会更新尚未开始或已完成的成品；未完成的刻录和目录内额外的私人文件受到保护。
 
-`burn` 目前在 macOS 实现。它检查光驱和盘片，写音乐并读回比对，读取实际 NWA，
+`burn` 在 macOS 和 Windows 实现。它检查光驱和盘片，写音乐并读回比对，读取实际 NWA，
 只生成一次正确起点的数据会话，再写入、校验和封盘。
+Windows 实机联调状态与命令见 [Windows 流程](windows.md)；苹果 GX40N 已通过双会话刻录和全量回读，XD05 尚未通过。
 成品内只保留一套输入和实际镜像，没有 `source/`、`planned/`、`actual-N/` 多套目录。
 参数、校验和、刻录状态统一保存在 `manifest.toml`。
 `burn` 不接受 `-o` 或 `--dry-run`；省略速度自动选择，也可以用 `--speed N`。

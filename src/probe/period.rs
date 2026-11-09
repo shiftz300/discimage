@@ -171,7 +171,7 @@ pub(super) fn phase(reference: &Period, times: &[f64]) -> Option<(f64, f64, usiz
     }
     let (center, resultant) = circular(kept.iter().copied());
     let spread = (-2.0 * resultant.ln()).sqrt();
-    (spread <= 20f64.to_radians()).then_some((center, spread, kept.len()))
+    (spread <= 30f64.to_radians()).then_some((center, spread, kept.len()))
 }
 
 #[cfg(test)]

@@ -17,8 +17,8 @@ mod selection;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Music-first enhanced CD authoring, previews and macOS recording",
-    after_help = "Design: preview PROJECT -> template PROJECT -o DIR\nPrepare: build PROJECT [--iso] [--raw]\nRecord on macOS: burn PACKAGE"
+    about = "Music-first enhanced CD authoring, previews and native recording",
+    after_help = "Design: preview PROJECT -> template PROJECT -o DIR\nPrepare: build PROJECT [--iso] [--raw]\nRecord on macOS/Windows: burn PACKAGE"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -41,7 +41,7 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
-    /// Erase a CD-RW, confirm the target and verify blank media (macOS).
+    /// Erase a CD-RW, confirm the target and verify blank media (macOS/Windows).
     Erase {
         /// Drive ID or unique model; overrides select, otherwise use the only available CD-RW.
         #[arg(long)]
@@ -56,7 +56,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Write or continue a prepared recording job (macOS).
+    /// Write or continue a prepared recording job (macOS/Windows).
     Burn {
         /// Recording job directory created by build.
         #[arg(value_name = "JOB")]

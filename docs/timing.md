@@ -22,8 +22,10 @@ discimage calibrate probe --device GX40N --output measurement
 When several drives share a model, replace `GX40N` with the exact selector shown by `devices`
 (the 12-character hardware ID, or `local-xxxxxxxxxx` without a reliable drive serial). Legacy macOS whole-disc names (`diskN`) and Windows drive letters
 (`E:`) remain accepted. If macOS exclusive access fails, identify and unmount
-only that optical volume. Windows SCSI pass-through needs permission to open
-the optical device; access failures do not change permissions.
+only that optical volume. Windows uses an exclusive IMAPI2 session and prevents
+media removal during measurement; access failures do not change permissions.
+It timestamps synchronous native commands with QueryPerformanceCounter and
+releases the reservation and tray prevention on exit, including errors.
 
 `--check` reports the recorded range using only metadata commands. Measurement
 defaults to 3–85% of that range, matching DiscProbe. Supply both `--first` and
@@ -31,14 +33,23 @@ defaults to 3–85% of that range, matching DiscProbe. Supply both `--first` and
 multisession and unfinalized media. Existing CD Extra experiments can still be
 imported from saved reports.
 
-The probe requests a read speed of 1411 kB/s and tests 40 ordinary reads and
+Both platforms use the same conservative 1411 kB/s read-speed request and
+32 reference/target pairs per point. The experimental fast/slow modes and
+configurable sampling options have been removed. The probe records the read-speed
+policy in the receipt and tests 40 ordinary reads and
 40 FUA reads at the middle of the track. If ordinary reads look cached and
 FUA does not help, it tries a zero-length READ(12) with FUA before each read.
 The last fallback reads 256 sectors elsewhere in the confirmed track in
 chunks of up to 32 sectors before each timed read. Indirect methods discard
-timed reads under 3 ms. Phase estimation subtracts the local drift
+timed reads under 3 ms. On slow USB bridges, FUA reads at least three times slower
+than ordinary reads also identify ordinary reads as cached. READ(10) fallback
+is limited to refused READ(12) commands; medium and hardware errors stop the run.
+An inner/outer rotation check rejects clear CLV behavior before the geometry
+ladder. Settled sampling jitter spans at least one spindle revolution. Phase
+estimation subtracts the local drift
 interpolated from adjacent reference reads. The probe issues no writes to
-the disc. Ctrl+C stops before the next command.
+the disc. Ctrl+C stops before the next command. Windows scopes DiscProbe-style
+process/thread scheduling priorities to acquisition and restores them on exit.
 
 Keep `measurement/summary.json`, `measurement/targets.csv` and
 `measurement/status.json` together. An interrupted acquisition has
