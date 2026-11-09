@@ -5,6 +5,14 @@
 /.discimage-archive.tar.zst.partial
 /calibrations/work/
 /calibrations/*/evidence/
+/calibrations/*/.calibrate.lock
+/calibrations/*/record/
+/calibrations/*/timing/
+/calibrations/*/timing-previous-*/
+/calibrations/*/mark.json
+/calibrations/*/points.json
+/calibrations/*/photo.*
+/calibrations/*/disc.toml.tmp
 .DS_Store
 *.wav
 *.flac

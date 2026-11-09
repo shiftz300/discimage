@@ -1000,6 +1000,7 @@ pub(crate) fn record_calibration(
     id: Option<&str>,
     speed: Option<u32>,
     dry_run: bool,
+    confirm: impl FnOnce(&Device) -> Result<bool>,
 ) -> Result<()> {
     ensure!(
         !directory.try_exists()?,
@@ -1020,6 +1021,10 @@ pub(crate) fn record_calibration(
     );
     if dry_run {
         println!("Calibration preflight passed. No files created or disc write attempted.");
+        return Ok(());
+    }
+    if !confirm(&before)? {
+        println!("Calibration paused. No files created or disc write attempted.");
         return Ok(());
     }
     let count = crate::calibrate::prepare_single(directory, capacity, device::cancelled)?;
@@ -1065,9 +1070,7 @@ pub(crate) fn record_calibration(
         author::digest(&path)? == digest,
         "calibration image changed during recording"
     );
-    let pending = directory.join("pending.json");
-    std::fs::hard_link(&pending, directory.join("single.json"))?;
-    std::fs::remove_file(pending)?;
+    crate::calibrate::complete_single(directory, &before, speed)?;
     console::success(format_args!(
         "Verified one finalized Mode 1 track at LBA 0..{count}. Target: {}",
         directory.display()

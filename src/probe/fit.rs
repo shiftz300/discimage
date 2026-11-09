@@ -69,14 +69,10 @@ impl Fit {
     }
 
     fn gradient(&self, lba: u32) -> Vector {
-        let derivative = |n: f64| {
-            let s = self.geometry.radius_squared(n).sqrt();
-            let a = n / (s + self.geometry.u);
-            [-2.0 * a / s, -a * a / (PI * s)]
-        };
-        let [a, b] = derivative(read_end_bits(lba) as f64);
-        let [ar, br] = derivative(self.reference);
-        [a - ar, b - br, 1.0]
+        let [a, b] = self
+            .geometry
+            .gradient(self.reference, read_end_bits(lba) as f64);
+        [a, b, 1.0]
     }
 
     fn lba_at_turns(&self, turns: f64) -> u32 {
@@ -198,6 +194,47 @@ impl Fit {
         self.covariance = covariance.map(|row| row.map(|x| x * self.chi2_per_dof.max(1.0)));
         Ok(())
     }
+}
+
+/// Data-only covariance, marginalizing each run's arbitrary phase offset.
+/// Do not let the spiral priors manufacture precision for weak measurements.
+pub(crate) fn covariance(
+    model: ChannelSpiral,
+    reference: u32,
+    samples: &[(u32, f64, f64)],
+) -> Result<[[f64; 2]; 2]> {
+    ensure!(samples.len() > 3, "too few samples for timing covariance");
+    let rows: Vec<Vector> = samples
+        .iter()
+        .map(|(lba, sigma, _)| {
+            let [u, v] =
+                model.gradient(read_end_bits(reference) as f64, read_end_bits(*lba) as f64);
+            [u / sigma, v / sigma, 1.0 / sigma]
+        })
+        .collect();
+    let scales: Vector =
+        std::array::from_fn(|i| rows.iter().map(|r| r[i] * r[i]).sum::<f64>().sqrt());
+    ensure!(
+        scales.iter().all(|s| s.is_finite() && *s > 0.0),
+        "unidentifiable timing geometry"
+    );
+    let mut gram = [[0.0; 3]; 3];
+    for row in rows {
+        for i in 0..3 {
+            for j in 0..3 {
+                gram[i][j] += row[i] * row[j] / (scales[i] * scales[j]);
+            }
+        }
+    }
+    let inverse =
+        inverse(gram).context("timing geometry is not identifiable from the measured span")?;
+    let chi2 =
+        samples.iter().map(|(_, s, r)| (r / s).powi(2)).sum::<f64>() / (samples.len() - 3) as f64;
+    // Overdispersion expands uncertainty; unusually quiet data never shrinks it.
+    let inflation = chi2.max(1.0);
+    Ok(std::array::from_fn(|i| {
+        std::array::from_fn(|j| inverse[i][j] * inflation / (scales[i] * scales[j]))
+    }))
 }
 
 pub(super) fn ladder(
@@ -330,8 +367,94 @@ pub(super) fn wrap(value: f64) -> f64 {
     (value + PI).rem_euclid(TAU) - PI
 }
 
-pub(super) fn median(mut values: Vec<f64>) -> f64 {
+pub(crate) fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     let n = values.len();
     (values[n / 2] + values[(n - 1) / 2]) / 2.0
+}
+
+#[cfg(test)]
+mod uncertainty_tests {
+    use super::*;
+    #[test]
+    fn noisy_spiral_fits_have_conservative_data_only_confidence_bands() {
+        let mut random = 0x18273u64;
+        let mut normal = || {
+            let mut uniform = || {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                ((random >> 11) as f64 + 0.5) / ((1u64 << 53) as f64)
+            };
+            (-2.0 * uniform().ln()).sqrt() * (TAU * uniform()).cos()
+        };
+        let truth = ChannelSpiral {
+            u: U * 1.002,
+            v: V * 0.997,
+        };
+        let reference = 180_000;
+        let mut total = 0;
+        // Independent, heteroscedastic data; also test underestimated read-pair noise.
+        for (noise_deg, excess) in [(0.05_f64, 1.0), (0.2, 1.0), (1.0, 1.0), (0.2, 2.0)] {
+            let mut outside = 0;
+            let mut worst_rms: f64 = 0.0;
+            let trials = 600;
+            for _ in 0..trials {
+                let mut f = Fit::new(reference);
+                f.geometry = truth;
+                for i in 0..36 {
+                    let lba = 2 + i * 10_000;
+                    let sigma = (noise_deg * (1.0 + f64::from(i % 4) * 0.3)).to_radians();
+                    let angle = truth
+                        .angle_between(read_end_bits(reference) as f64, read_end_bits(lba) as f64);
+                    let value = angle + 0.17 + sigma * excess * normal();
+                    f.points.push(Point {
+                        sample: Sample {
+                            lba,
+                            phase: wrap(value),
+                            sigma,
+                            spread: sigma,
+                            used: 32,
+                            period: 0.029,
+                        },
+                        predicted: angle,
+                        unwrapped: value,
+                    });
+                }
+                f.refit().unwrap();
+                let samples: Vec<_> = f
+                    .points
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.sample.lba,
+                            p.sample.sigma,
+                            p.unwrapped - f.predict(p.sample.lba),
+                        )
+                    })
+                    .collect();
+                let cov = covariance(f.geometry, reference, &samples).unwrap();
+                // Independently evaluate the nonlinear angular error at both extent ends.
+                let first = read_end_bits(reference) as f64;
+                for lba in [2, 350_002] {
+                    let last = read_end_bits(lba) as f64;
+                    let g = f.geometry.gradient(first, last);
+                    let variance = g[0] * g[0] * cov[0][0]
+                        + 2.0 * g[0] * g[1] * cov[0][1]
+                        + g[1] * g[1] * cov[1][1];
+                    let error =
+                        f.geometry.angle_between(first, last) - truth.angle_between(first, last);
+                    outside += usize::from(error.abs() > (-2.0 * 0.01_f64.ln() * variance).sqrt());
+                }
+                worst_rms = worst_rms.max(f.rms_deg);
+            }
+            let rate = outside as f64 / (2 * trials) as f64;
+            println!(
+                "noise_deg={noise_deg} excess={excess} nonlinear_band_outside={rate:.5} max_rms_deg={worst_rms:.3} fits={trials}"
+            );
+            assert!(rate < 0.025, "uncertainty band undercovers: {rate}");
+            total += trials;
+        }
+        assert_eq!(total, 2400);
+    }
 }

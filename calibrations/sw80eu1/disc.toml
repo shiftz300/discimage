@@ -45,3 +45,106 @@ media = "Verbatim SW80EU1 CD-RW"
 drive = "HL-DT-ST GX40N RQ00"
 requested_speed = 10
 status = "digital-readback"
+
+# Automatic two-round timing preset; artwork accepted after physical trial.
+[profiles.sw80eu1-auto]
+angle = 0.0
+calibration_target = false
+capacity_sectors = 359847
+data_reserve_sectors = 10000
+end_margin_sectors = 154
+inner_radius_mm = 24.830975207848226
+intertrack_gap_sectors = 150
+media = "cd-rw"
+outer_radius_mm = 58.0
+session_reserve_sectors = 11400
+velocity = 1199.1498556406523
+
+[profiles.sw80eu1-auto.timing]
+assumed_shift_frames = 108.0
+end_sector = 359693
+first_sector = 3
+repeat_sha256 = ["c2b7fd3b257ab732bcc3a0af38f7bc776510f1b625e22dd1d3595b3f53eb19cc"]
+summary_sha256 = "df3deb6b19f145f3119c860365ea6da3b4599b36ce7945367f7d13b9ca663ac8"
+
+[verification.sw80eu1-auto]
+absolute_orientation_measured = false
+drive = "Apple SuperDrive (2.00)"
+media = "cd-rw"
+phase_measured = false
+radial_scale = "assumed 58 mm outer recording radius; not measured"
+read_shift_frames = 108.0
+status = "visually-confirmed"
+verified_date = "2026-11-10"
+artwork_check = "User confirmed alignment after a four-track CD-RW trial"
+speed_selection = "automatic"
+recorded_data_start_lba = 141196
+recorded_data_sectors = 218497
+audio_readback = "all four tracks matched"
+data_readback = "verified; both sessions finalized"
+summary_sha256 = "df3deb6b19f145f3119c860365ea6da3b4599b36ce7945367f7d13b9ca663ac8"
+target_sha256 = "73a1cb9d889ceb850849b947dacbc98a62d21f8d04b397bcde493f621a9bfe0f"
+targets_sha256 = "aeaa75ec037bc7183f4874bfa434f91d9efb8aff1f5a2e8668575dc60426678e"
+timing_rms_deg = 0.30084973738357634
+
+[verification.sw80eu1-auto.quality]
+anchor_sector = 179848.0
+confidence_level = 0.99
+consistent = true
+encoding_range = [
+    3,
+    359693,
+]
+method = "data-only covariance; variance inflated for overdispersion; pairwise chi-square(2), Bonferroni 1% family-wise test; linearized model"
+selected = 1
+
+[[verification.sw80eu1-auto.quality.pairs]]
+consistent = true
+curve_max_deg = 0.06473013465361392
+curve_rms_deg = 0.02023094240771988
+first = 0
+limit = 9.210340371976182
+mahalanobis_squared = 0.04130465749924883
+second = 1
+
+[[verification.sw80eu1-auto.quality.rounds]]
+chi2_per_dof = 3.049844123099441
+covariance_uv = [
+    [
+    0.00025758881553488447,
+    -0.000000018817955861794573,
+],
+    [
+    -0.000000018817955861794573,
+    0.000000000001548017348687689,
+],
+]
+max_angle_sigma_deg = 0.2586266225450827
+max_confidence_band_deg = 0.7848941068623211
+measured_span_sigma_deg = 0.21101719204294084
+median_completion_jitter_us = 38.74322682507639
+median_phase_scatter_deg = 0.4859405
+residual_rms_deg = 0.34236581184137754
+summary_sha256 = "c2b7fd3b257ab732bcc3a0af38f7bc776510f1b625e22dd1d3595b3f53eb19cc"
+targets_sha256 = "32f97f8375d9041e089a222314a0d27ef856be25fce3d878165af6ad9bf10b6d"
+
+[[verification.sw80eu1-auto.quality.rounds]]
+chi2_per_dof = 2.466269637812488
+covariance_uv = [
+    [
+    0.00021100301034187463,
+    -0.000000015511616385450264,
+],
+    [
+    -0.000000015511616385450264,
+    0.000000000001281611443379095,
+],
+]
+max_angle_sigma_deg = 0.2327886241675878
+max_confidence_band_deg = 0.7064795474482809
+measured_span_sigma_deg = 0.18912812792372488
+median_completion_jitter_us = 38.92035872655694
+median_phase_scatter_deg = 0.4881605
+residual_rms_deg = 0.3008497225496846
+summary_sha256 = "df3deb6b19f145f3119c860365ea6da3b4599b36ce7945367f7d13b9ca663ac8"
+targets_sha256 = "aeaa75ec037bc7183f4874bfa434f91d9efb8aff1f5a2e8668575dc60426678e"

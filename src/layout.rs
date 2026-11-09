@@ -170,7 +170,7 @@ impl Plan {
 
     pub fn geometry_label(&self) -> &'static str {
         if self.disc.timing.is_some() {
-            "Timing candidate · assumed radial scale · physical validation pending"
+            "Timing candidate · verify radial scale and physical alignment"
         } else if self.disc.calibration.is_some() {
             "Radially calibrated · constant-pitch model"
         } else {

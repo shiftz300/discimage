@@ -10,4 +10,5 @@ path = "audio/01.wav"
 # mode = "disc"   # disc：方图裁切；strip：长条环绕
 # rotation = 0.0
 
-# 校准完成后，再按需要添加 [disc] 设置。省略时使用 CLI 默认值。
+# 标定后在文件最上方添加 preset 引用，见 docs/zhcn/calibration.md。
+# preset 与 [disc] 二选一；省略时使用标称几何。

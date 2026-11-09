@@ -29,6 +29,18 @@ impl ChannelSpiral {
         2.0 * (last - first)
             / (self.radius_squared(last).sqrt() + self.radius_squared(first).sqrt())
     }
+
+    /// Sensitivity of an anchor-relative angle to u and v (radians).
+    pub(crate) fn gradient(self, first: f64, last: f64) -> [f64; 2] {
+        let derivative = |n: f64| {
+            let s = self.radius_squared(n).sqrt();
+            let a = n / (s + self.u);
+            [-2.0 * a / s, -a * a / (PI * s)]
+        };
+        let a = derivative(first);
+        let b = derivative(last);
+        [b[0] - a[0], b[1] - a[1]]
+    }
 }
 
 pub(crate) struct Spiral {

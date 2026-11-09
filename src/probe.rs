@@ -1,6 +1,6 @@
 //! Read-only CD timing acquisition and validation shared by macOS and Windows.
 mod cache;
-mod fit;
+pub(crate) mod fit;
 mod period;
 pub(crate) mod transport;
 
@@ -60,6 +60,20 @@ pub fn inspect(id: &str) -> Result<Range<u32>> {
 }
 
 pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result<()> {
+    acquire_inner(id, requested, output, None)
+}
+
+/// Measure a specific recorded calibration target, checking it under the probe reservation.
+pub fn acquire_target(id: &str, output: &Path, target: &Path) -> Result<()> {
+    acquire_inner(id, None, output, Some(target))
+}
+
+fn acquire_inner(
+    id: &str,
+    requested: Option<Range<u32>>,
+    output: &Path,
+    target: Option<&Path>,
+) -> Result<()> {
     if let Some(range) = &requested {
         ensure!(
             range.end <= 360_000 && range.end.saturating_sub(range.start) > 1000,
@@ -69,11 +83,22 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
     ensure!(!output.try_exists()?, "use a new probe output directory");
     let resolved = device::probe_id(id)?;
     device::install_cancel_handler()?;
+    #[cfg(target_os = "macos")]
+    if let Some(target) = target {
+        crate::calibrate::single(target)?;
+        crate::macos::prepare_probe(&resolved)?;
+    }
     let mut link = Device::open(&resolved)?;
     let readable = disc_bounds(&mut link, true)?;
+    let target_hash = target
+        .map(|target| verify_target(&mut link, &readable, target))
+        .transpose()?;
     #[cfg(windows)]
     let _priority = transport::timing_priority();
     let Range { start: first, end } = requested.unwrap_or_else(|| {
+        if target.is_some() {
+            return readable.start + 2..readable.end.saturating_sub(2);
+        }
         let span = readable.end - readable.start - 1;
         readable.start + span * 3 / 100..readable.start + span * 85 / 100
     });
@@ -141,6 +166,12 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
         disc_bounds(&mut link, false)? == readable,
         "disc layout changed during measurement"
     );
+    if let Some(target) = target {
+        ensure!(
+            Some(verify_target(&mut link, &readable, target)?) == target_hash,
+            "calibration target changed during measurement"
+        );
+    }
     check_cancel()?;
     let measured = fit.points.iter().map(|p| p.sample.lba).chain([reference]);
     let lo = measured.clone().min().unwrap_or(reference);
@@ -162,6 +193,7 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
         "cache": cache,
         "rotation_check": rotation,
         "set_cd_speed": speed,
+        "calibration_sha256": target_hash,
     });
     let targets_path = output.join("targets.csv");
     let mut csv = BufWriter::new(fs::File::create(&targets_path)?);
@@ -205,6 +237,40 @@ pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result
     ));
     println!("Timing summary: {}", summary_path.display());
     Ok(())
+}
+
+fn verify_target(link: &mut dyn Link, readable: &Range<u32>, directory: &Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let receipt = crate::calibrate::single(directory)?;
+    ensure!(
+        readable.start == 0
+            && (readable.end == receipt.written_sectors
+                || readable.end.checked_add(2) == Some(receipt.written_sectors)),
+        "insert the recorded single-session calibration target"
+    );
+    let mut image = fs::File::open(directory.join("calibration.iso"))?;
+    for lba in [16, 300, readable.end - 1]
+        .into_iter()
+        .chain((1..8).map(|n| readable.end * n / 8))
+    {
+        check_cancel()?;
+        let reply = link
+            .command(Command::Read {
+                lba,
+                count: 1,
+                fua: false,
+                read12: false,
+            })?
+            .good()?;
+        let mut expected = [0; SECTOR_BYTES];
+        image.seek(SeekFrom::Start(u64::from(lba) * SECTOR_BYTES as u64))?;
+        image.read_exact(&mut expected)?;
+        ensure!(
+            reply.data == expected,
+            "insert the matching calibration target; mismatch at LBA {lba}"
+        );
+    }
+    crate::calibrate::digest(directory)
 }
 
 fn save(path: &Path, data: &Value) -> Result<()> {
@@ -441,6 +507,66 @@ mod tests {
     use super::transport::Reply;
     use super::*;
     use std::f64::consts::{PI, TAU};
+
+    #[test]
+    fn target_binding_checks_real_payload_and_never_reads_outside_the_data_track() {
+        use std::io::{Read, Seek, SeekFrom};
+        struct Reader {
+            image: fs::File,
+            corrupt: bool,
+            reads: Vec<u32>,
+        }
+        impl Link for Reader {
+            fn command(&mut self, command: Command) -> Result<Reply> {
+                let Command::Read {
+                    lba,
+                    count: 1,
+                    fua: false,
+                    read12: false,
+                } = command
+                else {
+                    panic!("target verification must only issue bounded READ(10)")
+                };
+                assert!(lba < 1850);
+                self.reads.push(lba);
+                let mut data = vec![0; SECTOR_BYTES];
+                self.image
+                    .seek(SeekFrom::Start(u64::from(lba) * SECTOR_BYTES as u64))?;
+                self.image.read_exact(&mut data)?;
+                if self.corrupt {
+                    data[0] ^= 1;
+                }
+                Ok(Reply {
+                    status: 0,
+                    sense: [0; 32],
+                    data,
+                    end: 0.0,
+                    duration: 0.01,
+                })
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("discimage-probe-target-{}", std::process::id()));
+        let result = (|| -> Result<()> {
+            crate::calibrate::prepare_single(&root, 2000, || false)?;
+            fs::rename(root.join("pending.json"), root.join("single.json"))?;
+            let mut reader = Reader {
+                image: fs::File::open(root.join("calibration.iso"))?,
+                corrupt: false,
+                reads: Vec::new(),
+            };
+            let hash = verify_target(&mut reader, &(0..1850), &root)?;
+            assert_eq!(hash, crate::calibrate::digest(&root)?);
+            assert_eq!(reader.reads.len(), 10);
+            assert!(verify_target(&mut reader, &(0..1853), &root).is_err());
+            assert_eq!(reader.reads.len(), 10);
+            reader.corrupt = true;
+            assert!(verify_target(&mut reader, &(0..1850), &root).is_err());
+            Ok(())
+        })();
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
 
     #[test]
     fn mode1_read_bounds_require_a_finalized_single_data_track() {

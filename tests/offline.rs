@@ -37,7 +37,8 @@ fn timing_import_roundtrips_candidate_and_rejects_changed_evidence() {
     let summary = json!({"fit": {"u":u,"v":v,"media":"cd","sector_bits":57624,
         "read_tail_frames":108,"residual_rms_deg":0.05,"angle_sigma_measured_span_deg":0.1,
         "reference_lba":12500},"cache":{"strategy":"fua","fua_reads_media":true},
-        "setup":{"readable_lba_range":[0,14000]}});
+        "setup":{"readable_lba_range":[0,14000]},
+        "rotation_check":{"checked":true,"looks_clv":false}});
     let timing = temp.0.join("summary.json");
     std::fs::write(&timing, summary.to_string()).unwrap();
     let targets = temp.0.join("targets.csv");

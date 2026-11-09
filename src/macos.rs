@@ -117,6 +117,55 @@ impl Drop for Recorder {
     }
 }
 
+/// Release only the selected optical filesystem before the target's read-only probe.
+/// diskutil is a macOS system tool; no forced unmount, eject or general disk scan.
+pub(crate) fn prepare_probe(id: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+    #[derive(serde::Deserialize, PartialEq)]
+    struct Node {
+        bsd_name: String,
+        media_id: u64,
+    }
+    let mut recorder = Recorder::new("");
+    let before: Node = recorder.request(json!({"op":"probe_node", "device":id}))?;
+    let bsd =
+        device::whole_bsd_name(&before.bsd_name).context("invalid optical whole-disc BSD name")?;
+    console::phase(
+        "probe",
+        format_args!(
+            "Unmounting only the selected optical volume ({bsd}) for exclusive read access"
+        ),
+    );
+    let mut child = Command::new("/usr/sbin/diskutil")
+        .args(["unmountDisk", bsd])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if device::cancelled() || started.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("optical unmount cancelled or timed out; no measurement started");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    ensure!(
+        status.success(),
+        "could not unmount selected optical volume {bsd}; close applications using that disc"
+    );
+    let after: Node = recorder.request(json!({"op":"probe_node", "device":id}))?;
+    ensure!(
+        before == after,
+        "selected optical medium changed while unmounting"
+    );
+    Ok(())
+}
+
 pub fn erase(id: &str, quick: bool, confirm: impl FnOnce(&Device) -> Result<bool>) -> Result<()> {
     let mut recorder = Recorder::new(id);
     // Reserve and identify this physical media before asking for confirmation.
@@ -156,6 +205,7 @@ pub fn record_calibration(
     id: Option<&str>,
     speed: Option<u32>,
     dry_run: bool,
+    confirm: impl FnOnce(&Device) -> Result<bool>,
 ) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Reserved {
@@ -172,12 +222,22 @@ pub fn record_calibration(
     console::phase(
         "calibration",
         format_args!(
-            "Reserved a blank CD-R in {} ({} available sectors)",
-            reserved.drive.name, reserved.capacity
+            "Reserved {} in {} ({} available sectors)",
+            reserved
+                .drive
+                .media
+                .as_ref()
+                .map_or("CD", |m| m.kind.as_str()),
+            reserved.drive.name,
+            reserved.capacity
         ),
     );
     if dry_run {
         println!("Calibration preflight passed. No disc write or output files.");
+        return Ok(());
+    }
+    if !confirm(&reserved.drive)? {
+        println!("Calibration paused. No files created or disc write attempted.");
         return Ok(());
     }
     let count = crate::calibrate::prepare_single(directory, reserved.capacity, device::cancelled)?;
@@ -199,7 +259,7 @@ pub fn record_calibration(
             "recorded drive identity changed"
         );
         if observed.media.as_ref().is_some_and(|m| {
-            matches!(m.kind.as_str(), "cd-r" | "cd-rom")
+            matches!(m.kind.as_str(), "cd-r" | "cd-rw" | "cd-rom")
                 && !m.blank
                 && !m.appendable
                 && m.sessions == 1
@@ -226,9 +286,7 @@ pub fn record_calibration(
         // Some drives exclude two readable sectors from the reported track size.
         recorder.verify_mode1_tail(&path, 0, count)?;
     }
-    let pending = directory.join("pending.json");
-    std::fs::hard_link(&pending, directory.join("single.json"))?;
-    std::fs::remove_file(pending)?;
+    crate::calibrate::complete_single(directory, &reserved.drive, speed)?;
     println!(
         "Verified one finalized Mode 1 track at LBA 0..{count}. Target: {}",
         directory.display()
@@ -454,6 +512,9 @@ mod tests {
         used["media"]["blank"] = json!(false);
         let mut rewritable = blank.clone();
         rewritable["media"]["kind"] = json!("cd-rw");
+        rewritable["capabilities"]["cdrw"] = json!(true);
+        let mut unsupported_rw = rewritable.clone();
+        unsupported_rw["capabilities"]["cdrw"] = json!(false);
         let mut unknown_capacity = blank.clone();
         unknown_capacity["media"]["free_sectors"] = Value::Null;
         let mut recorded_track = blank.clone();
@@ -467,7 +528,7 @@ mod tests {
                     {"media":null,"capabilities":{"cdrw":true}},
                     {"media":{"kind":"cd-rw"},"capabilities":{"cdrw":false}}
                 ],
-                "calibration_candidates":[blank,used,rewritable,unknown_capacity,recorded_track]
+                "calibration_candidates":[blank,used,rewritable,unknown_capacity,recorded_track,unsupported_rw]
             }))
             .unwrap();
         assert_eq!(
@@ -480,7 +541,11 @@ mod tests {
         assert_eq!(response["image_mode1"], true);
         assert_eq!(
             response["calibration_capacities"],
-            json!([333_000, null, null, null, null])
+            json!([333_000, null, null, null, null, null])
+        );
+        assert_eq!(
+            response["single_capacities"],
+            json!([333_000, null, 333_000, null, null, null])
         );
         assert_eq!(response["audio_sectors"], sectors);
         assert_eq!(response["nwa"], 11850);

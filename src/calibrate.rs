@@ -29,11 +29,15 @@ const END_MARGIN: u32 = 150;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SingleTarget {
+pub struct SingleTarget {
     format: String,
-    reference_sectors: u32,
-    written_sectors: u32,
+    pub reference_sectors: u32,
+    pub written_sectors: u32,
     iso_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive: Option<crate::device::Device>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u32>,
 }
 
 pub fn record_single(
@@ -42,6 +46,17 @@ pub fn record_single(
     speed: Option<u32>,
     dry_run: bool,
 ) -> Result<()> {
+    record_confirmed(directory, device, speed, dry_run, |_| Ok(true))
+}
+
+/// Confirmation runs with the selected blank media reserved, before file creation or writing.
+pub fn record_confirmed(
+    directory: &Path,
+    device: Option<&str>,
+    speed: Option<u32>,
+    dry_run: bool,
+    confirm: impl FnOnce(&crate::device::Device) -> Result<bool>,
+) -> Result<()> {
     ensure!(
         speed.is_none_or(|speed| (1..=64).contains(&speed)),
         "speed must be 1–64x"
@@ -49,16 +64,16 @@ pub fn record_single(
     #[cfg(target_os = "macos")]
     {
         let device = device.map(crate::device::resolve_id).transpose()?;
-        crate::macos::record_calibration(directory, device.as_deref(), speed, dry_run)
+        crate::macos::record_calibration(directory, device.as_deref(), speed, dry_run, confirm)
     }
     #[cfg(windows)]
     {
         let device = device.map(crate::device::resolve_id).transpose()?;
-        crate::windows::record_calibration(directory, device.as_deref(), speed, dry_run)
+        crate::windows::record_calibration(directory, device.as_deref(), speed, dry_run, confirm)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        let _ = (directory, device, speed, dry_run);
+        let _ = (directory, device, speed, dry_run, confirm);
         anyhow::bail!(
             "Calibration recording requires macOS or Windows; photo fitting works offline"
         )
@@ -105,12 +120,69 @@ pub(crate) fn prepare_single(
         reference_sectors: reference,
         written_sectors: written,
         iso_sha256: author::digest(&path)?,
+        drive: None,
+        speed: None,
     };
     write(
         &directory.join("pending.json"),
         &serde_json::to_vec_pretty(&receipt)?,
     )?;
     Ok(written)
+}
+
+/// Read a completed single-session receipt and verify its exact source image.
+pub fn single(directory: &Path) -> Result<SingleTarget> {
+    let path = directory.join("single.json");
+    let receipt = read_single(&path)?;
+    ensure!(
+        std::fs::metadata(directory.join("calibration.iso"))?.len()
+            == u64::from(receipt.written_sectors) * 2048,
+        "calibration image length does not match the recorded extent"
+    );
+    ensure!(
+        author::digest(&directory.join("calibration.iso"))? == receipt.iso_sha256,
+        "calibration image changed after recording"
+    );
+    Ok(receipt)
+}
+
+fn read_single(path: &Path) -> Result<SingleTarget> {
+    let file = File::open(path)?;
+    ensure!(
+        file.metadata()?.len() <= 64 * 1024,
+        "calibration receipt is too large"
+    );
+    let receipt: SingleTarget = serde_json::from_reader(file)?;
+    ensure!(
+        receipt.format == SINGLE_FORMAT
+            && receipt.reference_sectors <= 360_000
+            && receipt.reference_sectors.checked_sub(END_MARGIN) == Some(receipt.written_sectors)
+            && receipt.written_sectors > DRAWING_START + 1000,
+        "invalid single-session calibration receipt"
+    );
+    Ok(receipt)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn complete_single(
+    directory: &Path,
+    drive: &crate::device::Device,
+    speed: Option<u32>,
+) -> Result<()> {
+    let pending = directory.join("pending.json");
+    let mut receipt = read_single(&pending)?;
+    ensure!(
+        author::digest(&directory.join("calibration.iso"))? == receipt.iso_sha256,
+        "calibration image changed during recording"
+    );
+    receipt.drive = Some(drive.clone());
+    receipt.speed = speed;
+    write(
+        &directory.join("single.json"),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    std::fs::remove_file(pending)?;
+    Ok(())
 }
 
 /// Create a standalone project using the same multisession path as an album.
@@ -164,20 +236,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 fn bundle(directory: &Path) -> Result<(Target, u32, String)> {
     let single = directory.join("single.json");
     if single.try_exists()? {
-        let file = File::open(&single)?;
-        ensure!(
-            file.metadata()?.len() <= 4096,
-            "calibration receipt is too large"
-        );
-        let receipt: SingleTarget = serde_json::from_reader(file)?;
-        ensure!(
-            receipt.format == SINGLE_FORMAT
-                && receipt.reference_sectors <= 360_000
-                && receipt.reference_sectors.checked_sub(END_MARGIN)
-                    == Some(receipt.written_sectors)
-                && receipt.written_sectors > DRAWING_START + 1000,
-            "invalid single-session calibration receipt"
-        );
+        let receipt = self::single(directory)?;
         return Ok((
             Target::for_range(DRAWING_START..receipt.written_sectors),
             receipt.reference_sectors,
@@ -373,6 +432,14 @@ fn radial_fit(target: &Target, reference: u32, points: &Points) -> Result<(Profi
 }
 
 pub fn fit(directory: &Path, points: &Path, output: &Path) -> Result<Profile> {
+    let profile = fit_profile(directory, points)?;
+    let mut settings = String::from("[disc.calibration]\n");
+    settings.push_str(&toml::to_string_pretty(&profile)?);
+    write(output, settings.as_bytes())?;
+    Ok(profile)
+}
+
+pub fn fit_profile(directory: &Path, points: &Path) -> Result<Profile> {
     let (target, reference, digest) = bundle(directory)?;
     let points = File::open(points)?;
     ensure!(
@@ -385,9 +452,6 @@ pub fn fit(directory: &Path, points: &Path, output: &Path) -> Result<Profile> {
         "points belong to a different target bundle"
     );
     let (profile, errors) = radial_fit(&target, reference, &points)?;
-    let mut settings = String::from("[disc.calibration]\n");
-    settings.push_str(&toml::to_string_pretty(&profile)?);
-    write(output, settings.as_bytes())?;
     console::phase(
         "fit",
         format_args!("Band residuals (fitted minus observed, mm): {errors:+.3?}"),

@@ -4,7 +4,8 @@
 
 | 配置 / File | 预设 / Preset | 实盘结果 / Result |
 | --- | --- | --- |
-| [Verbatim SW80EU1 CD‑RW](sw80eu1/disc.toml) | `sw80eu1` | 盘面目视确认 / Artwork visually checked |
+| [Verbatim SW80EU1 CD‑RW](sw80eu1/disc.toml) | `sw80eu1` | 手动精修，保留 / Accepted manual refinement, retained |
+| [Verbatim SW80EU1 CD‑RW](sw80eu1/disc.toml) | `sw80eu1-auto` | 自动标定，试刻盘面确认 / Automatic calibration, trial artwork confirmed |
 | [Verbatim SW80EU1 CD‑RW](sw80eu1/disc.toml) | `sw80eu1-timing` | 时序试验，数据读回通过 / Experimental, digital readback passed |
 | [AZO Gold Vinyl](azo-gold-vinyl/disc.toml) | `azo-gold-vinyl` | 盘面目视对齐，数据读回通过 / Alignment confirmed, digital readback passed |
 
@@ -21,3 +22,11 @@ preset = { file = "../../calibrations/azo-gold-vinyl/disc.toml", name = "azo-gol
 `[profiles]` supplies the album settings. `[verification]` records the tested drive, firmware, and requested speed. `[measurements]` holds observations such as the photo fit. Recording uses the current drive's writable capacity and measured second-session start. When changing drive or speed, use the same-batch preset as a starting point and check artwork alignment and readback on the first disc.
 
 原始报告留在 Git 忽略的各介质 `evidence/` 目录。 Raw reports stay in each medium's Git-ignored `evidence/` directory.
+
+新批次运行 `discimage calibrate -o calibrations/my-batch`，自动导出该目录的 `disc.toml`。
+生成的 `record/`、`timing/`、照片和取点文件也会被 Git 忽略；先验收首件图案，再分享预设。
+For a new batch, the guided command exports `disc.toml`; generated evidence stays local.
+
+照片可后置精修实际半径尺度；外部 AI 可辅助取点，CLI 离线校验与拟合。
+Optional photos refine physical radius scale; external AI can assist point selection for offline fitting.
+[中文标定指南](../docs/zhcn/calibration.md) · [English guide](../docs/calibration.md)

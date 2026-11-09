@@ -19,8 +19,8 @@ discimage template projects/my-album/album.toml --output projects/my-album/outpu
 discimage preview projects/my-album/album.toml --output projects/my-album/output/preview.svg
 ```
 
-把模板目录里的 `layout.json` 导入网页编辑器。离线镜像和刻录作业也放在专辑自己的 `output/` 下，每次使用新的子目录。
-[完整参数示例](../examples/album.toml) · [标定配置](../calibrations/README.md) · [刻录流程](../docs/recording.md)
+把模板目录里的 `layout.json` 导入网页编辑器。离线成品也放在专辑自己的 `output/` 下，直接使用 build 的默认目录。
+[完整参数示例](../examples/album.toml) · [标定配置](../calibrations/README.md) · [中文刻录流程](../docs/zhcn/recording.md)
 
 制作成品时执行 `discimage build projects/my-album/album.toml`。
 默认成品是 `projects/my-album/output/album/`，内部平铺文件。用

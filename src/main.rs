@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use discimage::{
     author, burn, calibrate, console, device,
     layout::Plan,
@@ -132,14 +132,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Create a CD calibration target, mark a photo, or fit radial geometry.
+    /// Guide target recording, read-only measurement and media preset export.
+    Calibrate(Box<CalibrationOptions>),
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct CalibrationOptions {
+    #[command(flatten)]
+    guide: guide::Options,
     #[command(subcommand)]
-    Calibrate(Calibration),
+    command: Option<Calibration>,
 }
 
 #[derive(Subcommand)]
 enum Calibration {
-    /// Record a finalized single-session Mode 1 calibration target on a blank CD-R.
+    /// Record a finalized single-session Mode 1 target on a blank CD-R or CD-RW.
     Record {
         #[arg(short, long)]
         output: PathBuf,
@@ -208,7 +216,8 @@ enum Calibration {
         #[arg(long, default_value_t = 1024)]
         size: u32,
     },
-    /// Walk through target recording, photo measurements and fitting in one directory.
+    /// Compatibility entry for the calibration guide.
+    #[command(hide = true)]
     Guide(guide::Options),
     /// Generate a standalone three-band calibration project with a silent music track.
     Target {
@@ -247,111 +256,117 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Completions { shell } => {
             completions(shell, &mut std::io::stdout())?;
         }
-        Commands::Calibrate(command) => match command {
-            Calibration::Record {
-                output,
-                device,
-                speed,
-                dry_run,
-            } => {
-                let device = selection::preferred(device.as_deref())?;
-                calibrate::record_single(&output, device.as_deref(), speed, dry_run)?;
-            }
-            Calibration::Probe {
-                device,
-                check,
-                first,
-                end,
-                output,
-            } => {
-                let device = match selection::preferred(device.as_deref())? {
-                    Some(device) => device,
-                    None => {
-                        let drives = device::list()?;
-                        ensure!(
-                            drives.len() == 1,
-                            "expected one optical drive; run 'discimage select ID' or pass --device ID"
-                        );
-                        drives[0].id.clone()
+        Commands::Calibrate(options) => {
+            let options = *options;
+            match options.command {
+                None => guide::run(options.guide)?,
+                Some(command) => match command {
+                    Calibration::Record {
+                        output,
+                        device,
+                        speed,
+                        dry_run,
+                    } => {
+                        let device = selection::preferred(device.as_deref())?;
+                        calibrate::record_single(&output, device.as_deref(), speed, dry_run)?;
                     }
-                };
-                if check {
-                    let bounds = probe::inspect(&device)?;
-                    println!(
-                        "Recorded Mode 1 range: {}..{} (end exclusive)",
-                        bounds.start, bounds.end
-                    );
-                } else {
-                    let range = first.zip(end).map(|(a, b)| a..b);
-                    probe::acquire(
-                        &device,
-                        range,
-                        &output.context("missing probe output directory")?,
-                    )?;
-                }
+                    Calibration::Probe {
+                        device,
+                        check,
+                        first,
+                        end,
+                        output,
+                    } => {
+                        let device = match selection::preferred(device.as_deref())? {
+                            Some(device) => device,
+                            None => {
+                                let drives = device::list()?;
+                                ensure!(
+                                    drives.len() == 1,
+                                    "expected one optical drive; run 'discimage select ID' or pass --device ID"
+                                );
+                                drives[0].id.clone()
+                            }
+                        };
+                        if check {
+                            let bounds = probe::inspect(&device)?;
+                            println!(
+                                "Recorded Mode 1 range: {}..{} (end exclusive)",
+                                bounds.start, bounds.end
+                            );
+                        } else {
+                            let range = first.zip(end).map(|(a, b)| a..b);
+                            probe::acquire(
+                                &device,
+                                range,
+                                &output.context("missing probe output directory")?,
+                            )?;
+                        }
+                    }
+                    Calibration::Phase {
+                        timing,
+                        bundle,
+                        points,
+                        evidence,
+                        offset_frames,
+                        offset_evidence,
+                        output,
+                    } => phase::compare(
+                        &timing,
+                        &bundle,
+                        &points,
+                        evidence.as_deref(),
+                        offset_frames.zip(offset_evidence.as_deref()),
+                        &output,
+                    )?,
+                    Calibration::Import {
+                        project,
+                        timing: summary,
+                        phase,
+                        bundle,
+                        output,
+                        size,
+                    } => {
+                        timing::import(&project, &summary, &phase, &bundle, &output, size)?;
+                        println!(
+                            "Candidate: {}. Import {} in the website's timing comparison. Physical validation pending.",
+                            output.join("candidate.toml").display(),
+                            output.display()
+                        );
+                    }
+                    Calibration::Guide(options) => guide::run(options)?,
+                    Calibration::Target {
+                        output,
+                        capacity_sectors,
+                    } => {
+                        calibrate::create(&output, capacity_sectors)?;
+                        println!("Created {}", output.join("target.toml").display());
+                    }
+                    Calibration::Mark { bundle, output } => {
+                        calibrate::mark(&bundle, &output)?;
+                        println!(
+                            "Saved {} for the website's photo point picker.",
+                            output.display()
+                        );
+                    }
+                    Calibration::Fit {
+                        bundle,
+                        points,
+                        output,
+                    } => {
+                        let profile = calibrate::fit(&bundle, &points, &output)?;
+                        println!(
+                            "Saved {} · radii {:.4}–{:.4} mm at {} sectors · RMS {:.3} mm",
+                            output.display(),
+                            profile.inner_radius_mm,
+                            profile.outer_radius_mm,
+                            profile.reference_sectors,
+                            profile.rms_mm
+                        );
+                    }
+                },
             }
-            Calibration::Phase {
-                timing,
-                bundle,
-                points,
-                evidence,
-                offset_frames,
-                offset_evidence,
-                output,
-            } => phase::compare(
-                &timing,
-                &bundle,
-                &points,
-                evidence.as_deref(),
-                offset_frames.zip(offset_evidence.as_deref()),
-                &output,
-            )?,
-            Calibration::Import {
-                project,
-                timing: summary,
-                phase,
-                bundle,
-                output,
-                size,
-            } => {
-                timing::import(&project, &summary, &phase, &bundle, &output, size)?;
-                println!(
-                    "Candidate: {}. Import {} in the website's timing comparison. Physical validation pending.",
-                    output.join("candidate.toml").display(),
-                    output.display()
-                );
-            }
-            Calibration::Guide(options) => guide::run(options)?,
-            Calibration::Target {
-                output,
-                capacity_sectors,
-            } => {
-                calibrate::create(&output, capacity_sectors)?;
-                println!("Created {}", output.join("target.toml").display());
-            }
-            Calibration::Mark { bundle, output } => {
-                calibrate::mark(&bundle, &output)?;
-                println!(
-                    "Saved {} for the website's photo point picker.",
-                    output.display()
-                );
-            }
-            Calibration::Fit {
-                bundle,
-                points,
-                output,
-            } => {
-                let profile = calibrate::fit(&bundle, &points, &output)?;
-                println!(
-                    "Saved {} · radii {:.4}–{:.4} mm at {} sectors · RMS {:.3} mm",
-                    output.display(),
-                    profile.inner_radius_mm,
-                    profile.outer_radius_mm,
-                    profile.reference_sectors,
-                    profile.rms_mm
-                );
-            }
-        },
+        }
         Commands::Burn {
             directory,
             device,
@@ -518,6 +533,8 @@ fn completion_command(command: &clap::Command) -> clap::Command {
         .disable_help_flag(command.is_disable_help_flag_set())
         .disable_version_flag(command.is_disable_version_flag_set())
         .disable_help_subcommand(command.is_disable_help_subcommand_set())
+        .args_conflicts_with_subcommands(command.is_args_conflicts_with_subcommands_set())
+        .subcommand_negates_reqs(command.is_subcommand_negates_reqs_set())
         .visible_aliases(command.get_visible_aliases().map(str::to_owned))
         .groups(command.get_groups().cloned())
         .args(
@@ -760,6 +777,28 @@ mod tests {
             }
             assert!(!script.contains("--svg"));
         }
+    }
+
+    #[test]
+    fn calibrate_defaults_to_the_guide_and_keeps_advanced_commands_independent() {
+        let cli =
+            Cli::try_parse_from(["discimage", "calibrate", "-o", "calibrations/batch"]).unwrap();
+        assert!(matches!(cli.command, Commands::Calibrate(options) if options.command.is_none()));
+        for args in [
+            vec!["discimage", "calibrate", "probe", "--check"],
+            vec!["discimage", "calibrate", "record", "-o", "target"],
+            vec!["discimage", "calibrate", "guide", "-o", "batch"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["discimage", "calibrate"]).is_err());
+        assert!(
+            Cli::try_parse_from(["discimage", "calibrate", "candidate", "-o", "batch"]).is_err()
+        );
+        let visible = completion_command(&Cli::command());
+        let calibration = visible.find_subcommand("calibrate").unwrap();
+        assert!(calibration.find_subcommand("guide").is_none());
+        assert!(calibration.get_arguments().any(|a| a.get_id() == "output"));
     }
 
     #[cfg(target_os = "macos")]

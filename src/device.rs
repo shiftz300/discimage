@@ -14,8 +14,18 @@ pub fn cancelled() -> bool {
     CANCELLED.load(Ordering::Relaxed)
 }
 pub fn install_cancel_handler() -> Result<()> {
-    ctrlc::set_handler(|| CANCELLED.store(true, Ordering::Relaxed))
-        .context("cannot install optical operation cancellation handler")
+    static HANDLER: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| CANCELLED.store(true, Ordering::Relaxed))
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|error| {
+            anyhow::anyhow!("cannot install optical operation cancellation handler: {error}")
+        })?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
