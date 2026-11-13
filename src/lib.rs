@@ -10,13 +10,15 @@ pub mod iso;
 pub mod layout;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(any(windows, test))]
+#[cfg(any(target_os = "macos", windows, test))]
 mod mmc;
 pub mod package;
 pub mod phase;
 pub mod preview;
 pub mod probe;
 pub mod project;
+#[cfg(any(target_os = "macos", windows))]
+mod recorder;
 mod spiral;
 pub mod target;
 pub mod template;

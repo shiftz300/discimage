@@ -183,21 +183,17 @@ pub struct Music {
     pub path: PathBuf,
     pub sectors: u32,
     pub gap: u32,
+    pub tail: u32,
 }
 
 /// `music` closes the audio session and leaves the disc appendable.
-/// `verify_music` confirms its content before `data` writes, verifies and finalizes.
+/// `verify_music` checks PCM, silence and Q subchannel indexes before and after `data`
+/// writes, verifies and finalizes the disc.
 /// The recorder owns its media reservation until dropped.
 pub trait Recorder {
     fn inspect(&mut self) -> Result<Device>;
     fn preflight_speed(&mut self, _speed: Option<u32>) -> Result<()> {
         Ok(())
-    }
-    fn music_gap(&self, _drive: &Device, requested: u32) -> u32 {
-        requested
-    }
-    fn audio_sectors(&mut self, _path: &Path) -> Result<Option<u32>> {
-        Ok(None)
     }
     fn lock(&mut self) -> Result<()>;
     fn preflight_cd_text(&mut self, _title: &str, _text: &CdText) -> Result<()> {
@@ -209,7 +205,7 @@ pub trait Recorder {
         speed: Option<u32>,
         cd_text: Option<(&str, &CdText)>,
     ) -> Result<()>;
-    fn verify_music(&mut self, tracks: &[Music]) -> Result<()>;
+    fn verify_music(&mut self, tracks: &[Music], finalized: bool) -> Result<()>;
     fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: Option<u32>) -> Result<()>;
     fn verify_data_tail(&mut self, _path: &Path, _start: u32, _sectors: u32) -> Result<()> {
         anyhow::bail!("the recorder cannot verify unreported data tail sectors")
@@ -220,17 +216,9 @@ pub trait Recorder {
 }
 
 pub fn blank_cdr_recorder(id: Option<&str>, capacity: u32) -> Result<Box<dyn Recorder>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
-        let id = id.map(resolve_id).transpose()?;
-        Ok(Box::new(crate::macos::Recorder::reserve_blank_cdr(
-            id.as_deref(),
-            capacity,
-        )?))
-    }
-    #[cfg(windows)]
-    {
-        Ok(Box::new(crate::windows::Recorder::reserve_blank_cdr(
+        Ok(Box::new(crate::recorder::Recorder::reserve_blank_cdr(
             id, capacity,
         )?))
     }
@@ -242,13 +230,9 @@ pub fn blank_cdr_recorder(id: Option<&str>, capacity: u32) -> Result<Box<dyn Rec
 }
 
 pub fn recorder(id: &str) -> Result<Box<dyn Recorder>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
-        Ok(Box::new(crate::macos::Recorder::new(id)))
-    }
-    #[cfg(windows)]
-    {
-        Ok(Box::new(crate::windows::Recorder::new(id)?))
+        Ok(Box::new(crate::recorder::Recorder::new(id)?))
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -299,14 +283,7 @@ pub fn erase(
             return Ok(());
         }
         install_cancel_handler()?;
-        #[cfg(target_os = "macos")]
-        {
-            crate::macos::erase(&selected.id, quick, confirm)
-        }
-        #[cfg(windows)]
-        {
-            crate::windows::erase(&selected.id, quick, confirm)
-        }
+        crate::recorder::erase(selected, quick, confirm)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

@@ -1,4 +1,4 @@
-//! Bounded CD MMC encodings shared by the Windows recorder and offline tests.
+//! Bounded CD MMC encodings shared by the native recorders and offline tests.
 //! SAO/CUE and CD-Text follow MMC and the cdrecord reference (see NOTICE.md).
 use crate::{
     audio,
@@ -165,12 +165,13 @@ pub(crate) fn write_parameters(bytes: &[u8], sao: bool, appendable: bool) -> Res
     let page = bytes
         .get(offset..)
         .context("missing write parameters page")?;
+    let page_length = page.get(1).map(|n| usize::from(*n) + 2).unwrap_or(0);
     ensure!(
-        page.len() >= 52 && page[0] & 0x3f == 5 && usize::from(page[1]) + 2 <= page.len(),
+        (52..=page.len()).contains(&page_length) && page[0] & 0x3f == 5,
         "invalid write parameters page"
     );
     let mut out = vec![0; 8];
-    out.extend_from_slice(&page[..usize::from(page[1]) + 2]);
+    out.extend_from_slice(&page[..page_length]);
     let page = &mut out[8..];
     page[0] = 5; // Clear PS; MODE SELECT uses PF, not SP.
     page[2] = (page[2] & 0x40) | if sao { 2 } else { 1 }; // Keep supported BUFE; clear test-write.
@@ -184,7 +185,17 @@ pub(crate) fn write_parameters(bytes: &[u8], sao: bool, appendable: bool) -> Res
     Ok(out)
 }
 
-pub(crate) fn cue(tracks: &[Music], text: bool) -> Result<Vec<u8>> {
+#[cfg(any(target_os = "macos", windows, test))]
+pub(crate) fn leadin(msf: &[u8]) -> Option<i32> {
+    let &[m, s, f] = msf else { return None };
+    if !(90..100).contains(&m) || s >= 60 || f >= 75 {
+        return None;
+    }
+    let lba = (i32::from(m) * 60 + i32::from(s)) * 75 + i32::from(f) - 450_150;
+    (-45_000..=-4500).contains(&lba).then_some(lba)
+}
+
+pub(crate) fn cue(tracks: &[Music], text_leadin: Option<i32>) -> Result<Vec<u8>> {
     ensure!(
         !tracks.is_empty() && tracks.len() <= 98,
         "expected 1–98 audio tracks plus the data track"
@@ -212,14 +223,26 @@ pub(crate) fn cue(tracks: &[Music], text: bool) -> Result<Vec<u8>> {
         ]);
         Ok(())
     };
-    entry(0, 0, if text { 0x41 } else { 1 }, -150)?;
+    // Only the CD-Text lead-in uses a wrapped absolute MSF (e.g. 97:34:23).
+    if let Some(start) = text_leadin {
+        ensure!(
+            (-45_000..=-4500).contains(&start),
+            "invalid CD-Text lead-in"
+        );
+        entry(0, 0, 0x41, i64::from(start) + 450_000)?;
+    } else {
+        entry(0, 0, 1, -150)?;
+    }
     let mut end = 0i64;
     for (i, track) in tracks.iter().enumerate() {
         let start = end + if i == 0 { 0 } else { i64::from(track.gap) };
-        // Zero-length INDEX 00 entries are legal MMC; do not invent a one-sector gap.
-        entry(i as u8 + 1, 0, 0, start - i64::from(track.gap))?;
+        // A track without a pregap starts directly at INDEX 01. Some drives
+        // get stuck at INDEX 00 when both entries have the same address.
+        if track.gap > 0 {
+            entry(i as u8 + 1, 0, 0, start - i64::from(track.gap))?;
+        }
         entry(i as u8 + 1, 1, 0, start)?;
-        end = start + i64::from(track.sectors);
+        end = start + i64::from(track.sectors) + i64::from(track.tail);
     }
     entry(0xaa, 1, 1, end)?;
     Ok(out)
@@ -234,6 +257,62 @@ pub(crate) fn crc16(bytes: &[u8]) -> u16 {
         }
     }
     !crc
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
+pub(crate) fn verify_q<'a>(
+    frames: impl Iterator<Item = &'a [u8]>,
+    first: u32,
+    track: u8,
+    index: u8,
+    origin: u32,
+) -> Result<()> {
+    fn bcd(n: u32) -> u8 {
+        ((n / 10) as u8) << 4 | (n % 10) as u8
+    }
+    fn msf(n: u32) -> [u8; 3] {
+        [bcd(n / 4500), bcd(n / 75 % 60), bcd(n % 75)]
+    }
+    let mut total = 0u32;
+    let mut matched = 0;
+    for (offset, frame) in frames.enumerate() {
+        let lba = first + offset as u32;
+        total += 1;
+        let mut raw = [0; 12];
+        let q = if frame.len() == 96 {
+            for (out, bits) in raw.iter_mut().zip(frame.chunks_exact(8)) {
+                *out = bits.iter().fold(0, |byte, bit| byte << 1 | (bit >> 6 & 1));
+            }
+            &raw
+        } else {
+            ensure!(frame.len() == 16, "invalid Q subchannel transfer");
+            &frame[..12]
+        };
+        let crc = u16::from_be_bytes([q[10], q[11]]);
+        if (frame.len() == 96 || crc != 0) && crc16(&q[..10]) != crc {
+            continue;
+        }
+        if q[0] & 15 != 1 {
+            continue; // MCN/ISRC frames do not carry track position.
+        }
+        ensure!(
+            q[0] & 0xd0 == 0
+                && q[1..3] == [bcd(u32::from(track)), index]
+                && q[3..6] == msf(lba.abs_diff(origin))
+                && q[6] == 0
+                && q[7..10] == msf(lba + 150),
+            "Q subchannel mismatch at LBA {lba}: expected track {track:02} INDEX {index:02}, got {:02x}/{:02x} (relative {:02x?})",
+            q[1],
+            q[2],
+            &q[3..6]
+        );
+        matched += 1;
+    }
+    ensure!(
+        total > 0 && matched >= total.div_ceil(2),
+        "insufficient valid Q position frames at LBA {first}: {matched}/{total}"
+    );
+    Ok(())
 }
 
 /// One English ASCII block, title and performer, followed by three size packs.
@@ -333,7 +412,7 @@ pub(crate) fn text_symbols(packs: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn ranges(tracks: &[Music]) -> Vec<std::ops::Range<u32>> {
-    audio::track_ranges(tracks.iter().map(|t| (t.sectors, t.gap))).collect()
+    audio::track_ranges(tracks.iter().map(|t| (t.sectors + t.tail, t.gap))).collect()
 }
 
 #[cfg(test)]
@@ -394,20 +473,41 @@ mod tests {
     }
 
     #[test]
-    fn cue_retains_zero_and_custom_gaps_and_excludes_first_pregap_from_lba() {
+    fn cue_omits_empty_pregaps_and_preserves_track_addresses() {
         let tracks = [150, 0, 75].map(|gap| Music {
             path: "x.wav".into(),
             sectors: 300,
             gap,
+            tail: 0,
         });
-        let sheet = cue(&tracks, true).unwrap();
+        let sheet = cue(&tracks, leadin(&[97, 34, 23])).unwrap();
         let entries = sheet.as_chunks::<8>().0.iter().collect::<Vec<_>>();
-        assert_eq!(entries[0].as_slice(), [1, 0, 0, 0x41, 0, 0, 0, 0]);
+        assert_eq!(entries[0].as_slice(), [1, 0, 0, 0x41, 0, 97, 34, 23]);
+        assert_eq!(entries[1].as_slice(), [1, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(entries[2].as_slice(), [1, 1, 1, 0, 0, 0, 2, 0]);
-        assert_eq!(entries[3][5..], entries[4][5..]);
-        assert_eq!(entries[6].as_slice(), [1, 3, 1, 0, 0, 0, 11, 0]);
+        assert_eq!(entries[3].as_slice(), [1, 2, 1, 0, 0, 0, 6, 0]);
+        assert_eq!(entries[4].as_slice(), [1, 3, 0, 0, 0, 0, 10, 0]);
+        assert_eq!(entries[5].as_slice(), [1, 3, 1, 0, 0, 0, 11, 0]);
         assert_eq!(ranges(&tracks), [0..300, 300..600, 675..975]);
         assert_eq!(entries.last().unwrap()[5..], [0, 15, 0]);
+    }
+
+    #[test]
+    fn q_readback_rejects_the_real_stuck_index_even_with_a_valid_crc() {
+        let correct = [
+            0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x25, 0x0f, 0xa8, 0, 0, 0, 0,
+        ];
+        verify_q([correct.as_slice()].into_iter(), 13_450, 2, 1, 13_450).unwrap();
+        let mut wrong = correct;
+        wrong[2] = 0;
+        let crc = crc16(&wrong[..10]);
+        wrong[10..12].copy_from_slice(&crc.to_be_bytes());
+        assert!(
+            verify_q([wrong.as_slice()].into_iter(), 13_450, 2, 1, 13_450)
+                .unwrap_err()
+                .to_string()
+                .contains("Q subchannel mismatch")
+        );
     }
 
     #[test]

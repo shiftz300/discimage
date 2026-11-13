@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Narrow DiscRecording bridge. Rust owns policy, authoring, hashes and journaling.
+// DiscRecording supplies discovery metadata and BSD media nodes.
 #import <Foundation/Foundation.h>
 #import <DiscRecording/DiscRecording.h>
 #include <IOKit/scsi/SCSICmds_INQUIRY_Definitions.h>
-#include <unistd.h>
-#include <sys/stat.h>
 #include "registry.h"
 
 static void Require(BOOL ok, NSString *message) {
@@ -91,7 +89,7 @@ static NSDictionary *Snapshot(DRDevice *device) {
     id state=Media([device status],tracks)?:[NSNull null];
     return @{@"hardware":HardwareIdentity(info),@"id":info[DRDeviceIORegistryEntryPathKey]?:@"",
         @"name":[NSString stringWithFormat:@"%@ %@ (%@)",info[DRDeviceVendorNameKey]?:@"",info[DRDeviceProductNameKey]?:@"",info[DRDeviceFirmwareRevisionKey]?:@""],
-        @"backend":@"macos-discrecording",
+        @"backend":@"macos-iokit-mmc",
         @"capabilities":@{@"cdr":@([caps[DRDeviceCanWriteCDRKey] boolValue]),
             @"cdrw":@([caps[DRDeviceCanWriteCDRWKey] boolValue]),
             @"sao":@([caps[DRDeviceCanWriteCDSAOKey] boolValue]),@"tao":@([caps[DRDeviceCanWriteCDTAOKey] boolValue]),
@@ -118,78 +116,16 @@ static NSDictionary *ReadySnapshot(DRDevice *device, int (*cancelled)(void)) {
     return snapshot;
 }
 
-static NSDictionary *ReadbackMedia(DRDevice *device, BOOL requireReservation, int (*cancelled)(void)) {
-    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:10];
-    do {
-        Require(device.isValid,@"Optical drive disconnected");
-        Require(!cancelled || !cancelled(),@"Audio readback cancelled");
-        NSDictionary *status=[device status];
-        NSDictionary *media=status[DRDeviceMediaInfoKey]?:status;
-        if ([status[DRDeviceMediaStateKey] isEqual:DRDeviceMediaStateMediaPresent]) {
-            Require(!requireReservation || [media[DRDeviceMediaIsReservedKey] boolValue],@"CD reservation was lost");
-            NSString *node=media[DRDeviceMediaBSDNameKey];
-            if (node.length>0) return @{@"bsd_name":node};
-        }
-        Pump(0.2);
-    } while (deadline.timeIntervalSinceNow>0);
-    Require(NO,@"macOS has not exposed a raw device for the recorded CD");
-    return nil;
-}
-
-@interface DISession : NSObject
-@property(nonatomic,strong) DRDevice *device;
-@property(nonatomic,assign) BOOL reservation;
-@property(nonatomic,strong) NSNumber *blankCDMediaID;
-@property(nonatomic,strong) NSNumber *blankCDCapacity;
-@property(nonatomic,assign) BOOL calibrationJob;
-@property(nonatomic,strong) NSNumber *eraseMediaID;
-@end
-@implementation DISession
-- (void)dealloc { if (_reservation) [_device releaseMediaReservation]; }
-@end
-
-static DISession *Reserve(DRDevice *device, int (*cancelled)(void)) {
-    DISession *session=[DISession new];
-    session.device=device;
-    Require([Snapshot(device)[@"media"] isKindOfClass:[NSDictionary class]],@"No ready media in drive");
-    [device acquireMediaReservation];
-    session.reservation=YES;
-    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:5];
-    do {
-        Require(!cancelled || !cancelled(),@"Recording cancelled");
-        NSDictionary *snapshot=Snapshot(device);
-        id media=snapshot[@"media"];
-        if ([media isKindOfClass:[NSDictionary class]] && [media[@"reserved"] boolValue]) return session;
-        Pump(0.1);
-    } while (device.isValid && deadline.timeIntervalSinceNow>0);
-    Require(NO,@"Could not reserve the selected optical media");
-    return nil;
-}
-
-static NSNumber *BlankCDCapacity(NSDictionary *snapshot, BOOL allowRW) {
-    id media=snapshot[@"media"];
-    if (![media isKindOfClass:[NSDictionary class]]) return nil;
-    BOOL writable=([media[@"kind"] isEqual:@"cd-r"] && [snapshot[@"capabilities"][@"cdr"] boolValue]) ||
-        (allowRW && [media[@"kind"] isEqual:@"cd-rw"] && [snapshot[@"capabilities"][@"cdrw"] boolValue]);
-    if (!writable || ![media[@"blank"] boolValue] || [media[@"sessions"] unsignedIntValue]!=0 ||
-        [media[@"tracks"] unsignedIntValue]!=0 || ![snapshot[@"capabilities"][@"sao"] boolValue]) return nil;
-    for (NSDictionary *track in snapshot[@"tracks"]) if (![track[@"empty"] boolValue]) return nil;
-    id capacity=media[@"free_sectors"];
-    return [capacity isKindOfClass:[NSNumber class]] && [capacity longLongValue]>0 &&
-        [capacity unsignedLongLongValue]<=UINT32_MAX ? capacity : nil;
-}
-
 static bool DrivePathMatches(io_registry_entry_t entry, const void *drivePath) {
     io_string_t path;
     return IORegistryEntryGetPath(entry,kIOServicePlane,path)==KERN_SUCCESS && strcmp(path,drivePath)==0;
 }
 
-static NSNumber *OpticalMediaID(DRDevice *device) {
-    NSString *path=[device info][DRDeviceIORegistryEntryPathKey];
-    if (!device.isValid || path.length==0) return nil;
+static NSDictionary *OpticalMedium(NSString *path) {
+    if (path.length==0) return nil;
     io_iterator_t media;
     if (IOServiceGetMatchingServices(kIOMainPortDefault,IOServiceMatching("IOCDMedia"),&media)!=KERN_SUCCESS) return nil;
-    NSNumber *result=nil;
+    NSDictionary *result=nil;
     io_service_t item;
     while ((item=IOIteratorNext(media))) {
         uint64_t identifier;
@@ -197,377 +133,64 @@ static NSNumber *OpticalMediaID(DRDevice *device) {
         BOOL found=drive!=IO_OBJECT_NULL &&
             IORegistryEntryGetRegistryEntryID(item,&identifier)==KERN_SUCCESS;
         if (drive) IOObjectRelease(drive);
-        IOObjectRelease(item);
         if (found) {
-            if (result) { result=nil; break; }
-            result=@(identifier);
+            if (result) {
+                IOObjectRelease(item);
+                result=nil;
+                break;
+            }
+            id node=CFBridgingRelease(IORegistryEntryCreateCFProperty(item,CFSTR("BSD Name"),kCFAllocatorDefault,0));
+            result=@{@"media_id":@(identifier),@"bsd_name":[node isKindOfClass:[NSString class]]?node:[NSNull null]};
         }
+        IOObjectRelease(item);
     }
     IOObjectRelease(media);
     return result;
 }
 
-static void CheckBlankCD(DISession *session, NSNumber *sectors) {
-    NSDictionary *snapshot=Snapshot(session.device);
-    NSNumber *capacity=BlankCDCapacity(snapshot,session.calibrationJob);
-    Require(capacity && [snapshot[@"media"][@"reserved"] boolValue] &&
-        [capacity isEqual:session.blankCDCapacity] &&
-        [session.blankCDMediaID isEqual:OpticalMediaID(session.device)] &&
-        capacity.unsignedLongLongValue>=sectors.unsignedLongLongValue,
-        @"Selected blank CD changed or could not be verified under reservation");
-}
-
-static DISession *OpenBlankCD(NSString *identifier, NSNumber *expected, BOOL calibration, int (*cancelled)(void)) {
-    DRDevice *selected=nil;
-    NSNumber *capacity=nil;
-    for (DRDevice *device in [DRDevice devices]) {
-        NSDictionary *snapshot=Snapshot(device);
-        if (identifier && ![identifier isEqual:snapshot[@"id"]]) continue;
-        NSNumber *candidate=BlankCDCapacity(snapshot,calibration);
-        if (!candidate || (expected && ![expected isEqual:candidate]) ||
-            (!calibration && ![snapshot[@"capabilities"][@"tao"] boolValue])) continue;
-        Require(!selected,@"Multiple eligible blank CD drives; specify --device");
-        selected=device;
-        capacity=candidate;
-    }
-    Require(selected!=nil,@"No eligible blank CD with the required write support and capacity");
-    NSNumber *mediaID=OpticalMediaID(selected);
-    Require(mediaID!=nil,@"Cannot identify the current CD-R in the selected drive");
-    DISession *session=Reserve(selected,cancelled);
-    session.blankCDMediaID=mediaID;
-    session.blankCDCapacity=capacity;
-    session.calibrationJob=calibration;
-    CheckBlankCD(session,@0);
-    return session;
-}
-
-static DRTrack *DataTrack(NSString *path, uint32_t sectors) {
-    struct stat status;
-    Require(lstat(path.fileSystemRepresentation,&status)==0 && S_ISREG(status.st_mode) &&
-        (uint64_t)status.st_size==(uint64_t)sectors*2048,@"Data ISO is missing or has the wrong length");
-    id layout=[DRBurn layoutForImageFile:path];
-    Require([layout isKindOfClass:[DRTrack class]],@"DiscRecording could not open the ISO as a single data track");
-    DRTrack *track=layout;
-    Require([Number(track.properties[DRTrackLengthKey]) isEqual:@(sectors)],
-        @"DiscRecording changed the planned ISO length");
-    return track;
-}
-static DRTrack *CalibrationTrack(NSString *path, uint32_t sectors) {
-    DRTrack *track=DataTrack(path,sectors);
-    // The ISO producer fills in its format properties on the first production cycle.
-    Require([track testProductionSpeedForLength:16*2048]>0,@"Cannot read the calibration ISO");
-    NSMutableDictionary *properties=[track.properties mutableCopy];
-    Require([properties[DRBlockTypeKey] intValue]==kDRBlockTypeMode1Data &&
-        [properties[DRBlockSizeKey] intValue]==2048 &&
-        [properties[DRDataFormKey] intValue]==kDRDataFormMode1Data,
-        @"Calibration target must be cooked Mode 1");
-    [properties removeObjectForKey:DRMaxBurnSpeedKey];
-    [track setProperties:properties];
-    return track;
-}
-static DRTrack *OpenAudio(NSString *path) {
-    DRTrack *track=[DRTrack trackForAudioFile:path];
-    Require(track!=nil,@"DiscRecording could not open the normalized WAV");
-    return track;
-}
-static DRTrack *AudioTrack(NSDictionary *input, BOOL first) {
-    DRTrack *track=OpenAudio(input[@"path"]);
-    NSMutableDictionary *properties=[[track properties] mutableCopy];
-    NSNumber *expected=input[@"sectors"];
-    id reported=Number(properties[DRTrackLengthKey]);
-    NSString *path=input[@"path"];
-    Require([reported isEqual:expected],
-        [NSString stringWithFormat:@"System audio decoder changed the planned track length for %@ (%@ vs %@ sectors)",
-            path.lastPathComponent,reported,expected]);
-    properties[DRPreGapLengthKey]=first?@150:input[@"gap"];
-    properties[DRPreGapIsRequiredKey]=@YES;
-    properties[DRVerificationTypeKey]=DRVerificationTypeNone;
-    [track setProperties:properties];
-    return track;
-}
-static DRCDTextBlock *CDText(NSDictionary *request) {
-    NSDictionary *text=request[@"cd_text"];
-    NSString *artist=text[@"artist"];
-    NSMutableArray *rows=[NSMutableArray arrayWithObject:@{DRCDTextTitleKey:request[@"title"],
-        DRCDTextPerformerKey:artist}];
-    for (NSString *title in text[@"titles"])
-        [rows addObject:@{DRCDTextTitleKey:title,DRCDTextPerformerKey:artist}];
-    DRCDTextBlock *block=[DRCDTextBlock cdTextBlockWithLanguage:@"" encoding:DRCDTextEncodingASCII];
-    Require(block!=nil,@"DiscRecording could not create a CD-Text block");
-    [block setTrackDictionaries:rows];
-    Require([[block trackDictionaries] isEqualToArray:rows],@"DiscRecording changed the CD-Text fields");
-    Require([block flatten]==0,@"CD-Text is too long for one language block");
-    return block;
-}
-static int StatusPercent(id value) {
-    if (![value isKindOfClass:[NSNumber class]]) return -1;
-    double fraction=[value doubleValue];
-    return fraction>=0 && fraction<=1 ? (int)(fraction*100) : -1;
-}
-// DRErase and DRBurn share DiscRecording status keys. Only DRBurn has abort.
-static void Monitor(id operation, NSString *name, BOOL canAbort, int (*cancelled)(void),
-                    void (*progress)(const char *)) {
-    BOOL aborting=NO;
-    NSString *previous=@"";
-    int previousBucket=-2, previousTrack=-1, highPercent=-1;
-    double started=NSProcessInfo.processInfo.systemUptime, lastReport=started, lastChange=started;
-    for (;;) { @autoreleasepool {
-        NSDictionary *status=canAbort ? [(DRBurn *)operation status] : [(DRErase *)operation status]; NSString *state=status[DRStatusStateKey]?:@"unknown";
-        double now=NSProcessInfo.processInfo.systemUptime;
-        int percent=StatusPercent(status[DRStatusPercentCompleteKey]);
-        int bucket=percent<0 ? -1 : percent/5;
-        int track=[status[DRStatusCurrentTrackKey] intValue];
-        BOOL changed=![state isEqual:previous] || track!=previousTrack;
-        if (changed || percent>highPercent) { highPercent=percent; lastChange=now; }
-        if (changed || bucket>previousBucket || now-lastReport>=15) {
-            NSString *prefix=@"DRStatusState";
-            NSString *label=[state hasPrefix:prefix] ? [state substringFromIndex:prefix.length] : state;
-            NSNumber *rate=status[DRStatusProgressInfoKey][DRStatusProgressCurrentXFactor];
-            NSMutableString *message=[NSMutableString stringWithFormat:@"%@: %@",name,label];
-            if (track>0) [message appendFormat:@" | track %d",track];
-            if (percent>=0) [message appendFormat:@" | system %d%%",percent];
-            else [message appendString:@" | percent unavailable"];
-            if (rate.doubleValue>0) [message appendFormat:@" | %.1fx",rate.doubleValue];
-            [message appendFormat:@" | %lus elapsed",(unsigned long)(now-started)];
-            if (now-lastChange>=15) [message appendFormat:@" | unchanged for %lus",(unsigned long)(now-lastChange)];
-            progress(message.UTF8String);
-            previous=[state copy];
-            previousTrack=track;
-            previousBucket=changed ? bucket : MAX(previousBucket,bucket);
-            lastReport=now;
-        }
-        if ([state isEqual:DRStatusStateFailed]) {
-            Require(NO,[NSString stringWithFormat:@"DiscRecording failed: %@",status[DRErrorStatusKey]?:status]);
-        }
-        if ([state isEqual:DRStatusStateDone]) {
-            Require(!aborting || !canAbort,@"Recording aborted; inspect media before any further action"); break;
-        }
-        if (!aborting && cancelled && cancelled()) {
-            if (canAbort) {
-                progress("Cancellation requested; waiting for DiscRecording to stop");
-                [(DRBurn *)operation abort];
-            } else {
-                progress("Erase cannot be interrupted by DiscRecording; waiting for completion. Keep the drive connected.");
-            }
-            aborting=YES;
-        }
-        Pump(0.1);usleep(100000);
-    }}
-}
-
-static BOOL Erasable(NSDictionary *snapshot) {
-    id media=snapshot[@"media"];
-    return [media isKindOfClass:[NSDictionary class]] && [media[@"kind"] isEqual:@"cd-rw"] &&
-        [snapshot[@"capabilities"][@"cdrw"] boolValue];
-}
-
-static NSDictionary *Erase(DISession *session, BOOL quick, int (*cancelled)(void),
-                            void (*progress)(const char *)) {
-    DRDevice *device=session.device;
-    NSDictionary *before=Snapshot(device);
-    Require(device.isValid && Erasable(before) && [before[@"media"][@"reserved"] boolValue] &&
-        session.eraseMediaID && [session.eraseMediaID isEqual:OpticalMediaID(device)],
-        @"Selected CD-RW changed or reservation was lost; nothing erased");
-    Require(!cancelled || !cancelled(),@"Erase cancelled before starting");
-    DRErase *erase=[DRErase eraseForDevice:device];
-    Require(erase!=nil,@"Could not create the CD-RW erase operation");
-    [erase setEraseType:quick?DREraseTypeQuick:DREraseTypeComplete];
-    [erase start];
-    Monitor(erase,@"Erase",NO,cancelled,progress);
-    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:20];
-    do {
-        Pump(0.2);
-        NSDictionary *after=Snapshot(device);
-        id media=after[@"media"];
-        if (Erasable(after) && [media[@"blank"] boolValue] &&
-            [media[@"sessions"] unsignedIntValue]==0 && [media[@"tracks"] unsignedIntValue]==0 &&
-            [media[@"free_sectors"] isKindOfClass:[NSNumber class]] &&
-            [media[@"free_sectors"] unsignedLongLongValue]>0) return after;
-    } while (device.isValid && deadline.timeIntervalSinceNow>0);
-    Require(NO,@"Erase finished but blank CD-RW state was not confirmed; inspect the disc before retrying");
-    return nil;
-}
-
-// Omit DRBurnRequestedSpeedKey to use DiscRecording's documented native default.
-static NSNumber *RequestedSpeed(id value) {
-    if (!value || value==[NSNull null]) return nil;
-    Require([value isKindOfClass:[NSNumber class]] && [value doubleValue]>=1 &&
-        [value doubleValue]<=64 && [value doubleValue]==[value unsignedIntValue],
-        @"Recording speed must be a whole multiplier from 1 to 64");
-    return @([value doubleValue]*DRDeviceBurnSpeedCD1x);
-}
-
-static NSDictionary *Write(DISession *session, NSDictionary *request, int (*cancelled)(void),
-                           void (*progress)(const char *)) {
-    DRDevice *device=session.device;
-    Require(device.isValid,@"Optical drive disconnected");
-    NSDictionary *before=Snapshot(device),*media=before[@"media"],*caps=before[@"capabilities"];
-    Require([media isKindOfClass:[NSDictionary class]],@"A reserved, writable CD is required");
-    NSString *kind=media[@"kind"];
-    BOOL writable=([kind isEqual:@"cd-r"] && [caps[@"cdr"] boolValue]) ||
-        ([kind isEqual:@"cd-rw"] && [caps[@"cdrw"] boolValue]);
-    Require(writable && [media[@"reserved"] boolValue],@"A reserved, writable CD-R or CD-RW is required");
-    BOOL audio=[request[@"op"] isEqual:@"audio"];
-    BOOL calibration=[request[@"op"] isEqual:@"calibration_write"];
-    NSMutableArray *tracks=[NSMutableArray array];
-    if (audio) {
-        Require([media[@"blank"] boolValue] && [caps[@"sao"] boolValue],@"Audio requires a blank writable CD and SAO support");
-        NSArray *inputs=request[@"tracks"];
-        Require(inputs.count>=1 && inputs.count<=98,@"Invalid music track count");
-        for (NSDictionary *input in inputs) [tracks addObject:AudioTrack(input,tracks.count==0)];
-    } else if (calibration) {
-        Require(session.blankCDMediaID!=nil,@"A calibration reservation is required");
-        [tracks addObject:CalibrationTrack(request[@"path"],[request[@"sectors"] unsignedIntValue])];
-    } else {
-        Require(![media[@"blank"] boolValue] && [media[@"appendable"] boolValue] && [caps[@"tao"] boolValue],@"Data append requires an appendable CD and TAO support");
-        NSNumber *start=request[@"start"],*count=request[@"sectors"];
-        Require([media[@"nwa"] isEqual:start] && [media[@"free_sectors"] isKindOfClass:[NSNumber class]] &&
-            [media[@"free_sectors"] unsignedLongLongValue]>=count.unsignedLongLongValue,@"NWA changed or remaining capacity is insufficient");
-        [tracks addObject:DataTrack(request[@"path"],count.unsignedIntValue)];
-    }
-    NSNumber *speed=RequestedSpeed(request[@"speed"]);
-    Require(!cancelled || !cancelled(),@"Recording cancelled before write");
-    DRBurn *burn=[DRBurn burnForDevice:device];
-    NSMutableDictionary *properties=[@{DRBurnAppendableKey:@(audio),DRBurnOverwriteDiscKey:@NO,
-        DRBurnVerifyDiscKey:@(!audio),DRBurnTestingKey:@NO,DRBurnUnderrunProtectionKey:@YES,
-        DRBurnStrategyKey:(audio || calibration)?DRBurnStrategyCDSAO:DRBurnStrategyCDTAO,
-        DRBurnStrategyIsRequiredKey:@YES,DRBurnCompletionActionKey:DRBurnCompletionActionMount,
-        DRBurnFailureActionKey:DRBurnFailureActionNone} mutableCopy];
-    if (speed) properties[DRBurnRequestedSpeedKey]=speed;
-    if (audio && request[@"cd_text"]) {
-        Require([caps[@"cd_text"] boolValue],@"Selected drive cannot write CD-Text");
-        Require([request[@"cd_text"][@"titles"] count]==tracks.count,@"CD-Text track count mismatch");
-        properties[DRCDTextKey]=CDText(request);
-    }
-    [burn setProperties:properties];
-    if (calibration || (audio && session.blankCDMediaID))
-        CheckBlankCD(session,calibration?request[@"sectors"]:@0);
-    Require(!cancelled || !cancelled(),@"Recording cancelled before write");
-    [burn writeLayout:tracks];
-    Monitor(burn,audio?@"Music":calibration?@"Calibration":@"Data",YES,cancelled,progress);
-    Pump(1.0);
-    return @{ @"ok":@YES };
-}
-
-// Every result is owned by Rust and released with discimage_free.
-char *discimage_call(void **handle, const char *json, int (*cancelled)(void), void (*progress)(const char *)) {
+// Read-only bridge. Recording and timing use separate IOKit task handles.
+char *discimage_macos_query(const char *json, int (*cancelled)(void)) {
     @autoreleasepool { @try {
         NSData *bytes=[[NSString stringWithUTF8String:json] dataUsingEncoding:NSUTF8StringEncoding];
         NSDictionary *request=[NSJSONSerialization JSONObjectWithData:bytes options:0 error:NULL];
         Require([request isKindOfClass:[NSDictionary class]],@"Invalid native request");
-        NSString *op=request[@"op"]; NSDictionary *result=nil;
+        NSString *op=request[@"op"];
+        NSDictionary *result=nil;
         if ([op isEqual:@"list"]) {
             NSMutableArray *devices=[NSMutableArray array];
             for (DRDevice *device in [DRDevice devices]) [devices addObject:Snapshot(device)];
             result=@{@"devices":devices};
-        } else if ([op isEqual:@"probe"]) {
-            result=Snapshot(Find(request[@"device"]));
-        } else if ([op isEqual:@"probe_node"]) {
-            DRDevice *device=Find(request[@"device"]);
-            NSDictionary *snapshot=ReadySnapshot(device,cancelled);
-            NSDictionary *media=snapshot[@"media"];
-            NSArray *tracks=snapshot[@"tracks"];
-            Require([media isKindOfClass:[NSDictionary class]] &&
-                ![media[@"blank"] boolValue] && ![media[@"appendable"] boolValue] &&
-                [media[@"sessions"] unsignedIntValue]==1 && tracks.count==1 &&
-                ![tracks.firstObject[@"audio"] boolValue],@"Expected the finalized single-data-track target before unmounting");
-            NSNumber *mediaID=OpticalMediaID(device);
-            Require(mediaID!=nil,@"Cannot identify the selected optical medium");
-            result=@{@"bsd_name":ReadbackMedia(device,NO,cancelled)[@"bsd_name"],@"media_id":mediaID};
-        } else if ([op isEqual:@"audio_length"]) {
-            DRTrack *track=OpenAudio(request[@"path"]);
-            result=@{@"sectors":Number(track.properties[DRTrackLengthKey])};
-        } else if ([op isEqual:@"cd_text_check"]) {
-            DRCDTextBlock *block=CDText(request);
-            result=@{@"entries":@([block trackDictionaries].count)};
-        } else if ([op isEqual:@"calibration_open"] || [op isEqual:@"blank_cdr_open"]) {
-            Require(*handle==NULL,@"Recorder already open");
-            BOOL calibration=[op isEqual:@"calibration_open"];
-            Require(calibration || [request[@"capacity"] isKindOfClass:[NSNumber class]],@"Expected blank CD-R capacity is required");
-            DISession *session=OpenBlankCD(request[@"device"],request[@"capacity"],calibration,cancelled);
-            result=@{@"capacity":session.blankCDCapacity,@"drive":Snapshot(session.device)};
-            *handle=(__bridge_retained void *)session;
-        } else if ([op isEqual:@"erase_open"]) {
-            Require(*handle==NULL,@"Recorder already open");
-            DRDevice *device=Find(request[@"device"]);
-            NSDictionary *before=Snapshot(device);
-            Require(Erasable(before) && ![before[@"media"][@"reserved"] boolValue],@"An available CD-RW is required for erasing");
-            NSNumber *mediaID=OpticalMediaID(device);
-            Require(mediaID!=nil,@"Cannot identify the CD-RW in the selected drive");
-            DISession *session=Reserve(device,cancelled);
-            session.eraseMediaID=mediaID;
-            result=Snapshot(device);
-            Require(Erasable(result) && [mediaID isEqual:OpticalMediaID(device)],@"CD-RW changed while reserving; nothing erased");
-            *handle=(__bridge_retained void *)session;
-        } else if ([op isEqual:@"open"]) {
-            Require(*handle==NULL,@"Recorder already open");
-            DISession *session=Reserve(Find(request[@"device"]),cancelled);
-            *handle=(__bridge_retained void *)session;result=@{@"ok":@YES};
-        } else if ([op isEqual:@"close"]) {
-            if (*handle) { (void)CFBridgingRelease(*handle);*handle=NULL; }
-            result=@{@"ok":@YES};
-        } else if ([op isEqual:@"selftest"]) {
-            DRTrack *track=CalibrationTrack(request[@"path"],4);
-            DRTrack *audio=AudioTrack(@{@"path":request[@"audio"],@"sectors":request[@"audio_sectors"],@"gap":@0},YES);
-            const void *keys[]={(__bridge const void *)audio,(__bridge const void *)track};
-            NSDictionary *closed=@{DRBlockTypeKey:@(kDRBlockTypeAudio),DRTrackTypeKey:DRTrackTypeClosed,
-                DRNextWritableAddressKey:@(-145)};
-            NSDictionary *invisible=@{DRTrackTypeKey:DRTrackTypeInvisible,DRNextWritableAddressKey:@11850};
-            const void *values[]={(__bridge const void *)closed,(__bridge const void *)invisible};
-            NSDictionary *details=CFBridgingRelease(CFDictionaryCreate(NULL,keys,values,2,
-                &kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks));
-            NSDictionary *media=@{DRDeviceMediaTypeKey:DRDeviceMediaTypeCDRW,DRDeviceTrackRefsKey:@[audio,track],
-                DRDeviceTrackInfoKey:details};
-            NSMutableArray *tracks=[NSMutableArray array];
-            NSDictionary *parsed=Media(@{DRDeviceMediaStateKey:DRDeviceMediaStateMediaPresent,
-                DRDeviceMediaInfoKey:media},tracks);
-            NSMutableArray *capacities=[NSMutableArray array];
-            NSMutableArray *singleCapacities=[NSMutableArray array];
-            for (NSDictionary *snapshot in request[@"calibration_candidates"]) {
-                [capacities addObject:BlankCDCapacity(snapshot,NO)?:[NSNull null]];
-                [singleCapacities addObject:BlankCDCapacity(snapshot,YES)?:[NSNull null]];
-            }
-            NSMutableArray *erasable=[NSMutableArray array];
-            for (NSDictionary *snapshot in request[@"erase_candidates"])
-                [erasable addObject:@(Erasable(snapshot))];
-            result=@{@"single_capacities":singleCapacities,@"automatic_speed":@((BOOL)(RequestedSpeed(nil)==nil && RequestedSpeed([NSNull null])==nil)),
-                @"manual_speed":@((BOOL)([RequestedSpeed(@8) doubleValue]==8*DRDeviceBurnSpeedCD1x)),
-                @"erase_candidates":erasable,@"audio_sectors":Number(audio.properties[DRTrackLengthKey]),@"image_sectors":@(track.estimateLength),
-                @"image_mode1":@((BOOL)([track.properties[DRBlockTypeKey] intValue]==kDRBlockTypeMode1Data)),
-                @"calibration_capacities":capacities,
-                @"nwa":parsed[@"nwa"],@"audio_track":tracks.firstObject[@"audio"],
-                @"closed_track_nwa":tracks.firstObject[@"next_writable"],
-                @"status_percent":@[@(StatusPercent(nil)),@(StatusPercent(@(-1))),@(StatusPercent(@0.375))]};
         } else {
-            Require(*handle!=NULL,@"Recorder is not reserved");
-            DISession *session=(__bridge DISession *)*handle;
-            Require(session.device.isValid,@"Optical drive disconnected");
-            if ([op isEqual:@"status"]) result=ReadySnapshot(session.device,cancelled);
-            else if ([op isEqual:@"media_node"]) result=ReadbackMedia(session.device,YES,cancelled);
-            else if ([op isEqual:@"closed_media_node"]) {
-                id media=Snapshot(session.device)[@"media"];
-                Require([media isKindOfClass:[NSDictionary class]] && ![media[@"blank"] boolValue] &&
-                    ![media[@"appendable"] boolValue],@"Expected a finalized CD for readback");
-                result=ReadbackMedia(session.device,NO,cancelled);
-            }
-            else if ([op isEqual:@"erase"]) {
-                result=Erase(session,[request[@"quick"] boolValue],cancelled,progress);
-            }
-            else {
-                Require(!session.eraseMediaID,@"Erase session cannot write tracks");
-                BOOL calibration=[op isEqual:@"calibration_write"];
-                Require(calibration ? session.calibrationJob :
-                    (!session.calibrationJob && ([op isEqual:@"audio"] || [op isEqual:@"data"])),
-                    @"Unknown or incompatible recorder operation");
-                result=Write(session,request,cancelled,progress);
-            }
+            NSString *path=request[@"device"];
+            DRDevice *device=Find(path);
+            if ([op isEqual:@"probe"]) result=Snapshot(device);
+            else if ([op isEqual:@"media_node"] || [op isEqual:@"probe_node"]) {
+                BOOL timing=[op isEqual:@"probe_node"];
+                NSDictionary *snapshot=timing ? ReadySnapshot(device,cancelled) : Snapshot(device);
+                id media=snapshot[@"media"];
+                Require([media isKindOfClass:[NSDictionary class]],@"No ready optical medium");
+                if (timing) {
+                    NSArray *tracks=snapshot[@"tracks"];
+                    Require(![media[@"blank"] boolValue] && ![media[@"appendable"] boolValue] &&
+                        [media[@"sessions"] unsignedIntValue]==1 && tracks.count==1 &&
+                        ![tracks.firstObject[@"audio"] boolValue],
+                        @"Expected the finalized single-data-track target before unmounting");
+                }
+                result=OpticalMedium(path);
+                Require(result!=nil && (!timing || [result[@"bsd_name"] isKindOfClass:[NSString class]]),
+                    @"Cannot identify the selected optical medium");
+            } else Require(NO,@"Unknown optical metadata request");
         }
-        NSData *data=[NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
-        Require(data!=nil,@"Native response serialization failed");
-        return strdup([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding].UTF8String);
+        NSData *output=[NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
+        Require(output!=nil,@"Could not encode optical metadata");
+        NSString *response=[[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding];
+        return strdup(response.UTF8String);
     } @catch (NSException *exception) {
-        NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"error":exception.reason?:@"Native recording exception"} options:0 error:NULL];
-        return strdup([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding].UTF8String);
-    }}
+        NSData *output=[NSJSONSerialization dataWithJSONObject:@{@"error":exception.reason?:@"Native optical error"}
+            options:0 error:NULL];
+        NSString *response=[[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding];
+        return strdup(response.UTF8String);
+    } }
 }
+
 void discimage_free(char *value) { free(value); }

@@ -10,7 +10,7 @@ same geometry and encoding code; native device access stays behind platform adap
 | Inputs and layout | `project`, `audio`, `layout` | TOML, PCM validation, sector budgets and measured coverage |
 | Drawing | `spiral`, `art`, `target`, `codec` | Radius/angle mapping, image sampling, CIRC positions and Mode 1 framing |
 | Outputs | `iso`, `author`, `package`, `preview`, `template` | Filesystem, frozen packages, hashes and graphical exports |
-| Recording | `burn`, `device`, `macos`, `windows`, `mmc` | Reservation, two sessions, NWA, verification and finalization |
+| Recording | `burn`, `device`, `recorder`, `mmc` | Reservation, two sessions, NWA, verification and finalization |
 | Calibration | `guide`, `calibrate`, `probe`, `timing`, `phase` | Target recording, timing acquisition, uncertainty and photo fitting |
 | CLI | `main`, `selection`, `console` | Commands, drive defaults and terminal output |
 
@@ -51,7 +51,8 @@ preset. `layout` enforces its measured coverage during planning and NWA rebuilds
 Photo radial fitting scales radii and velocity together; phase fitting exports
 a separate candidate. [Criteria](timing.md).
 
-macOS uses DiscRecording for recording and an exclusive optical MMC user client
-for timing. Windows uses exclusive IMAPI2 sessions and synchronous MMC commands,
-with QPC timestamps for timing. Probe commands are bounded and cannot write media.
+The same MMC recorder handles burn, erase and calibration targets on macOS and
+Windows. macOS uses IOKit exclusive optical tasks and obtains discovery metadata
+from DiscRecording. Windows transports the same commands through IMAPI2. The
+timing probe has a separate bounded read interface on each platform.
 Linux supports offline authoring and discovery; recording is not implemented.

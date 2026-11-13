@@ -1,6 +1,6 @@
 [package]
 name = "discimage"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Enhanced CD authoring, outer-ring artwork and native recording"

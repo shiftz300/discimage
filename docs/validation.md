@@ -2,14 +2,17 @@
 
 [Guides](README.md) · [Calibration criteria](timing.md#uncertainty-and-repeatability)
 
-These results describe tested cases, not universal drive or player compatibility.
-The current local release checks are from 2026-11-10.
+The shared MMC writer and track-tail mode have software regression coverage.
+On macOS, the GX40N wrote and finalized a six-track CD-RW with track-tail
+silence. All audio and Mode 1 sectors matched on readback, and the Q indexes
+matched before and after the data append. Windows hardware validation of the
+shared writer is pending.
 
 ## Software checks
 
 | Check | Result |
 | --- | --- |
-| Test suite | 105 passed: 53 library, 7 CLI, 8 calibration, 13 offline, 24 recording |
+| Test suite | 110 passed on macOS: 57 library, 7 CLI, 8 calibration, 13 offline, 25 recording |
 | Clippy, warnings denied | Passed |
 | Release build | Passed |
 | 2,400 synthetic nonlinear spiral fits | Confidence-band checks passed across heterogeneous and underestimated-noise cases |

@@ -61,15 +61,9 @@ pub fn record_confirmed(
         speed.is_none_or(|speed| (1..=64).contains(&speed)),
         "speed must be 1–64x"
     );
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
-        let device = device.map(crate::device::resolve_id).transpose()?;
-        crate::macos::record_calibration(directory, device.as_deref(), speed, dry_run, confirm)
-    }
-    #[cfg(windows)]
-    {
-        let device = device.map(crate::device::resolve_id).transpose()?;
-        crate::windows::record_calibration(directory, device.as_deref(), speed, dry_run, confirm)
+        crate::recorder::record_calibration(directory, device, speed, dry_run, confirm)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

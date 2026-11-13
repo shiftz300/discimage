@@ -29,6 +29,113 @@ pub(crate) fn track_ranges(
     })
 }
 
+/// Compare CD-DA from LBA 0 through the end of the last track, including
+/// inter-track silence. The first track's pregap precedes LBA 0.
+#[cfg(any(target_os = "macos", windows, test))]
+pub(crate) fn verify_pcm(
+    tracks: &[crate::device::Music],
+    chunk_sectors: u32,
+    mut read: impl FnMut(u32, &mut [u8]) -> Result<()>,
+) -> Result<()> {
+    use crate::{console, device};
+    use std::time::{Duration, Instant};
+
+    let mut actual = vec![0; chunk_sectors as usize * RAW];
+    let mut expected = actual.clone();
+    let start = Instant::now();
+    let ranges = track_ranges(
+        tracks
+            .iter()
+            .map(|track| (track.sectors + track.tail, track.gap)),
+    );
+    for (i, (track, range)) in tracks.iter().zip(ranges).enumerate() {
+        let number = i + 1;
+        if i > 0 {
+            let mut lba = range.start - track.gap;
+            while lba < range.start {
+                ensure!(!device::cancelled(), "audio readback cancelled");
+                let count = (range.start - lba).min(chunk_sectors);
+                let bytes = &mut actual[..count as usize * RAW];
+                read(lba, bytes).with_context(|| {
+                    format!("cannot read pregap before track {number} at LBA {lba}")
+                })?;
+                if let Some(offset) = bytes
+                    .as_chunks::<RAW>()
+                    .0
+                    .iter()
+                    .position(|sector| sector.iter().any(|&byte| byte != 0))
+                {
+                    anyhow::bail!(
+                        "non-silent pregap before track {number} at LBA {}",
+                        lba + offset as u32
+                    );
+                }
+                lba += count;
+            }
+        }
+
+        let source = inspect(&track.path)?;
+        ensure!(
+            source.sectors == track.sectors && source.padding_sample_frames == 0,
+            "normalized WAV for track {number} has changed"
+        );
+        let mut wav = File::open(&track.path)?;
+        wav.seek(SeekFrom::Start(source.data_offset))?;
+        console::phase(
+            "readback",
+            format_args!(
+                "Track {number}/{} | {} sectors",
+                tracks.len(),
+                track.sectors
+            ),
+        );
+        let mut lba = range.start;
+        let mut reported = Instant::now();
+        let pcm_end = range.end - track.tail;
+        while lba < range.end {
+            ensure!(!device::cancelled(), "audio readback cancelled");
+            let count = (range.end - lba).min(chunk_sectors);
+            let len = count as usize * RAW;
+            let pcm_len = pcm_end.saturating_sub(lba).min(count) as usize * RAW;
+            wav.read_exact(&mut expected[..pcm_len])?;
+            expected[pcm_len..len].fill(0);
+            read(lba, &mut actual[..len])
+                .with_context(|| format!("cannot read track {number} at LBA {lba}"))?;
+            if let Some(offset) = actual[..len]
+                .as_chunks::<RAW>()
+                .0
+                .iter()
+                .zip(expected[..len].as_chunks::<RAW>().0)
+                .position(|(a, b)| a != b)
+            {
+                anyhow::bail!(
+                    "PCM differs from the WAV in track {number} at LBA {}",
+                    lba + offset as u32
+                );
+            }
+            lba += count;
+            if reported.elapsed() >= Duration::from_secs(15) {
+                console::phase(
+                    "readback",
+                    format_args!(
+                        "Track {number}/{} | {}/{} sectors | {}s elapsed",
+                        tracks.len(),
+                        lba - range.start,
+                        track.sectors,
+                        start.elapsed().as_secs()
+                    ),
+                );
+                reported = Instant::now();
+            }
+        }
+    }
+    console::success(format_args!(
+        "All {} audio tracks and planned silence matched byte-for-byte",
+        tracks.len()
+    ));
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioTrack {
     pub path: std::path::PathBuf,
@@ -125,6 +232,10 @@ fn inspect_riff(path: &Path) -> Result<(u32, u64)> {
 
 /// Copy PCM unchanged, normalize the RIFF container and explicitly zero-pad its tail.
 pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
+    export_with_tail(track, path, 0)
+}
+
+pub(crate) fn export_with_tail(track: &AudioTrack, path: &Path, tail: u32) -> Result<()> {
     let current = inspect(&track.path)?;
     ensure!(
         current.sample_frames == track.sample_frames && current.data_offset == track.data_offset,
@@ -135,7 +246,12 @@ pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
     input.seek(SeekFrom::Start(track.data_offset))?;
     let mut output =
         std::io::BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path)?);
-    let bytes = track.sectors * RAW as u32;
+    let bytes = track
+        .sectors
+        .checked_add(tail)
+        .and_then(|n| n.checked_mul(RAW as u32))
+        .filter(|&n| n <= u32::MAX - 36)
+        .context("padded WAV exceeds the RIFF size limit")?;
     header(&mut output, bytes)?;
     let expected = u64::from(track.sample_frames) * 4;
     ensure!(
@@ -144,6 +260,9 @@ pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
     );
     output.write_all(&vec![0; track.padding_sample_frames as usize * 4])?;
     output.flush()?;
+    if tail != 0 {
+        output.get_ref().set_len(44 + u64::from(bytes))?;
+    }
     Ok(())
 }
 
@@ -153,24 +272,6 @@ pub(crate) fn silence(path: &Path) -> Result<()> {
     header(&mut output, bytes)?;
     output.set_len(44 + u64::from(bytes))?;
     Ok(())
-}
-
-pub(crate) fn extend_normalized(path: &Path, sectors: u32) -> Result<()> {
-    let track = inspect(path)?;
-    let mut wav = OpenOptions::new().write(true).open(path)?;
-    ensure!(
-        track.data_offset == 44
-            && track.padding_sample_frames == 0
-            && wav.metadata()?.len() == 44 + u64::from(track.sectors) * RAW as u64
-            && sectors == track.sectors + 1,
-        "expected a normalized WAV and one additional sector"
-    );
-    let bytes = sectors
-        .checked_mul(RAW as u32)
-        .filter(|&size| size <= u32::MAX - 36)
-        .context("padded WAV exceeds the RIFF size limit")?;
-    wav.set_len(44 + u64::from(bytes))?;
-    header(&mut wav, bytes)
 }
 
 fn header(output: &mut impl Write, bytes: u32) -> Result<()> {
@@ -189,4 +290,51 @@ fn header(output: &mut impl Write, bytes: u32) -> Result<()> {
     output.write_all(b"data")?;
     output.write_all(&bytes.to_le_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::Music;
+
+    #[test]
+    fn pcm_readback_rejects_corruption_in_pregap_and_track() {
+        let path = std::env::temp_dir().join(format!("discimage-pcm-{}.wav", std::process::id()));
+        silence(&path).unwrap();
+        let track = |gap| Music {
+            path: path.clone(),
+            sectors: 300,
+            gap,
+            tail: 0,
+        };
+        let tracks = [track(150), track(75), track(0)];
+        let verify = |corrupt_at: Option<u32>| {
+            let mut end = 0;
+            let result = verify_pcm(&tracks, 24, |lba, bytes| {
+                assert_eq!(lba, end, "readback must cover the entire program area");
+                let count = (bytes.len() / RAW) as u32;
+                assert!((1..=24).contains(&count));
+                end = lba + count;
+                bytes.fill(0);
+                if let Some(bad) = corrupt_at.filter(|bad| (lba..end).contains(bad)) {
+                    bytes[(bad - lba) as usize * RAW + RAW - 1] = 1;
+                }
+                Ok(())
+            });
+            if result.is_ok() {
+                assert_eq!(end, 975);
+            }
+            result
+        };
+        verify(None).unwrap();
+        let error = verify(Some(374)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pregap before track 2 at LBA 374")
+        );
+        let error = verify(Some(674)).unwrap_err();
+        assert!(error.to_string().contains("track 2 at LBA 674"));
+        std::fs::remove_file(path).unwrap();
+    }
 }

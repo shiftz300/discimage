@@ -131,17 +131,6 @@ pub fn start(
     project
         .disc
         .limit_end(available.saturating_sub(project.disc.end_margin_sectors));
-    if project.tracks.len() > 1 {
-        let requested = project.disc.intertrack_gap_sectors;
-        let gap = backend.music_gap(&observed, requested);
-        if gap != requested {
-            console::warning(format_args!(
-                "Adjusted track gaps from {requested} to {gap} sectors for {}",
-                observed.name,
-            ));
-            project.disc.intertrack_gap_sectors = gap;
-        }
-    }
     let plan = Plan::from_project(&project, None)?;
     project.disc.capacity_sectors = plan.disc.capacity_sectors;
     let volume = author::volume(&project, &plan)?;
@@ -175,7 +164,6 @@ pub fn start(
             let path = PathBuf::from(audio::track_path(i));
             let frozen = snapshot.join(&path);
             audio::export(track, &frozen)?;
-            normalize_length(backend, &frozen, track.sectors)?;
             project.tracks.push(Input { path });
         }
         if project.files.is_some() {
@@ -205,35 +193,6 @@ pub fn start(
         Ok(())
     })();
     finish(&directory, journal, result)
-}
-
-pub(crate) fn normalize_length(
-    backend: &mut dyn Recorder,
-    path: &Path,
-    mut sectors: u32,
-) -> Result<()> {
-    // Some decoders round an exact CD frame boundary up by one sector.
-    let original = sectors;
-    while let Some(reported) = backend.audio_sectors(path)? {
-        if reported == sectors {
-            break;
-        }
-        ensure!(
-            reported == sectors + 1 && sectors - original < 4,
-            "{}: system decoder reports {reported} sectors for a {sectors}-sector WAV",
-            path.display()
-        );
-        audio::extend_normalized(path, reported)?;
-        sectors = reported;
-    }
-    if sectors != original {
-        console::warning(format_args!(
-            "{}: added {} silent tail sector(s) to match the system decoder",
-            path.display(),
-            sectors - original
-        ));
-    }
-    Ok(())
 }
 
 pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) -> Result<Journal> {
@@ -268,13 +227,6 @@ pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) 
         project
             .disc
             .limit_end(available.saturating_sub(project.disc.end_margin_sectors));
-        if project.tracks.len() > 1 {
-            project.disc.intertrack_gap_sectors =
-                backend.music_gap(&observed, project.disc.intertrack_gap_sectors);
-        }
-        for track in &project.tracks {
-            normalize_length(backend, &track.path, audio::inspect(&track.path)?.sectors)?;
-        }
         Plan::from_project(&project, None)?;
         package.project.disc = project.disc;
         package.refresh(&directory)?;
@@ -399,24 +351,31 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         checked_bundle(&planned, journal.planned_sha256.as_deref())?
     };
     inspect_job(backend, journal)?;
-    backend.preflight_speed(journal.speed)?;
     check_cancel(backend)?;
     backend.lock()?;
     journal.observed = inspect_job(backend, journal)?;
-    let gap = manifest.plan.disc.intertrack_gap_sectors;
+    backend.preflight_speed(journal.speed)?;
     let tracks = manifest
         .plan
         .tracks
         .iter()
         .enumerate()
-        .map(|(i, t)| Music {
-            path: planned.join(if flat {
-                package::audio_path(i)
-            } else {
-                audio::track_path(i)
-            }),
-            sectors: t.sectors,
-            gap: if i == 0 { 150 } else { gap },
+        .map(|(i, t)| {
+            let (gap, tail) = manifest
+                .plan
+                .disc
+                .track_silence(i, manifest.plan.tracks.len());
+            Music {
+                path: planned.join(if flat {
+                    package::audio_path(i)
+                } else {
+                    audio::track_path(i)
+                }),
+                gap: if i == 0 { 150 } else { gap },
+                // Legacy authored bundles already have the silence in their WAVs.
+                tail: if flat { tail } else { 0 },
+                sectors: if flat { t.sectors } else { t.sectors + tail },
+            }
         })
         .collect::<Vec<_>>();
     if journal.stage == Stage::Prepared {
@@ -431,19 +390,6 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
             available >= manifest.plan.estimated_art_end_sector,
             "blank CD is smaller than the prepared plan; create a new job"
         );
-        ensure!(
-            tracks.len() == 1 || backend.music_gap(&journal.observed, gap) == gap,
-            "prepared track gaps are incompatible with this drive; create a new job"
-        );
-        for track in &tracks {
-            ensure!(
-                backend
-                    .audio_sectors(&track.path)?
-                    .is_none_or(|reported| reported == track.sectors),
-                "{}: system decoder changed the prepared track length; create a new job",
-                track.path.display()
-            );
-        }
         check_cancel(backend)?;
         journal.advance(directory, Stage::MusicWriting)?;
         console::phase(
@@ -472,7 +418,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         format_args!("Drive reports next writable LBA {nwa} and {free} free sectors"),
     );
     backend
-        .verify_music(&tracks)
+        .verify_music(&tracks, false)
         .context("music readback failed before data append")?;
     let cached = if journal.stage == Stage::DataReady && journal.nwa == Some(nwa) {
         Some(if flat {
@@ -570,13 +516,13 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     )?;
     let observed = backend.inspect()?;
     if observed.media.as_ref().is_some_and(|m| m.kind == "cd-rom") {
+        check_drive(&observed, journal)?;
         ensure!(
-            observed.id == journal.device
-                && journal
-                    .observed
-                    .media
-                    .as_ref()
-                    .is_some_and(|m| m.kind == "cd-r"),
+            journal
+                .observed
+                .media
+                .as_ref()
+                .is_some_and(|m| m.kind == "cd-r"),
             "unexpected read-only medium after finalization"
         );
     } else {
@@ -592,6 +538,13 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     if short {
         backend.verify_data_tail(&iso, actual.session_start, actual.data_sectors)?;
     }
+    console::phase(
+        "readback",
+        format_args!("Checking audio on the finalized disc"),
+    );
+    backend
+        .verify_music(&tracks, true)
+        .context("music readback failed after disc finalization")?;
     journal.advance(directory, Stage::Complete)
 }
 
@@ -627,13 +580,7 @@ fn inspect_job(backend: &mut dyn Recorder, journal: &Journal) -> Result<Device> 
 }
 
 fn check_device(device: &Device, journal: &Journal) -> Result<()> {
-    ensure!(device.id == journal.device, "recording drive changed");
-    if let Some(expected) = journal.observed.hardware_id() {
-        ensure!(
-            device.hardware_id().as_ref() == Some(&expected),
-            "recording drive hardware identity changed or cannot be verified; native paths and Windows drive letters may be reused"
-        );
-    }
+    check_drive(device, journal)?;
     let media = writable_cd(device)?;
     ensure!(
         journal
@@ -643,6 +590,16 @@ fn check_device(device: &Device, journal: &Journal) -> Result<()> {
             .is_some_and(|m| m.kind == media.kind),
         "CD media type changed during the recording job"
     );
+    Ok(())
+}
+fn check_drive(device: &Device, journal: &Journal) -> Result<()> {
+    ensure!(device.id == journal.device, "recording drive changed");
+    if let Some(expected) = journal.observed.hardware_id() {
+        ensure!(
+            device.hardware_id().as_ref() == Some(&expected),
+            "recording drive hardware identity changed or cannot be verified; native paths and Windows drive letters may be reused"
+        );
+    }
     Ok(())
 }
 fn check_medium(project: &Project, device: &Device) -> Result<()> {

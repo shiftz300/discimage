@@ -20,6 +20,10 @@ tracks = [{ path = "audio/01.wav" }, { path = "audio/02.wav" }]
 Use the preset from [calibration](calibration.md) for the actual medium/batch.
 The track array controls playing order. Put top-level fields before any table.
 Keep CD-R and CD-RW settings in separate TOMLs; they can share audio and artwork.
+Set top-level `intertrack_gap_position = "tail"` to put the preset's silence at
+the end of each track except the last. With `[disc]`, set
+`intertrack_gap_sectors = 150` for two seconds. Track starts and the planned data
+address are identical to those with the same duration in a pregap.
 
 ## 2. Design the artwork
 
@@ -77,9 +81,10 @@ discimage burn projects/my-album/output/cdrw
 discimage devices
 ```
 
-Speed is automatic unless explicitly set with `--speed N`. The program writes
-and checks audio, reads actual NWA, generates and writes data, then verifies
-and closes the disc. Keep the drive connected throughout.
+Speed is automatic unless explicitly set with `--speed N`. The program checks
+the audio samples, silence and Q subchannel track indexes before appending data
+at the actual NWA, then repeats the audio checks after finalization. The drive
+must support raw P–W or formatted Q readback. Keep it connected throughout.
 
 Success requires successful audio/data readback and a closed disc with two
 sessions: N audio tracks and one data track. Inspect the artwork and audition

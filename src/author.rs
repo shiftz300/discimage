@@ -252,17 +252,15 @@ fn music(plan: &Plan, output: &Path) -> Result<Vec<String>> {
         String::from("REM SESSION 1 ONLY - write appendable; see manifest.json for session 2\n");
     for (i, track) in plan.tracks.iter().enumerate() {
         let name = audio::track_path(i);
-        audio::export(track, &output.join(&name))?;
+        let (gap, tail) = plan.disc.track_silence(i, plan.tracks.len());
+        audio::export_with_tail(track, &output.join(&name), tail)?;
         assets.push(name.clone());
         cue.push_str(&format!(
             "FILE \"{name}\" WAVE\n  TRACK {:02} AUDIO\n",
             i + 1
         ));
-        if i > 0 && plan.disc.intertrack_gap_sectors > 0 {
-            cue.push_str(&format!(
-                "    PREGAP {}\n",
-                msf(plan.disc.intertrack_gap_sectors)
-            ));
+        if gap > 0 {
+            cue.push_str(&format!("    PREGAP {}\n", msf(gap)));
         }
         cue.push_str("    INDEX 01 00:00:00\n");
     }
@@ -502,8 +500,13 @@ pub(crate) fn verify_manifest(directory: &Path, manifest: &Manifest, music: bool
             let name = audio::track_path(i);
             ensure!(seen.contains(name.as_str()), "missing audio asset {name}");
             let exported = audio::inspect(&directory.join(name))?;
+            let (_, tail) = manifest
+                .plan
+                .disc
+                .track_silence(i, manifest.plan.tracks.len());
+            let sectors = track.sectors + tail;
             ensure!(
-                exported.sample_frames == track.sectors * 588 && exported.sectors == track.sectors,
+                exported.sample_frames == sectors * 588 && exported.sectors == sectors,
                 "exported music duration does not match the session layout"
             );
         }

@@ -164,8 +164,10 @@ impl Plan {
     }
 
     pub(crate) fn music_ranges(&self) -> impl Iterator<Item = std::ops::Range<u32>> + '_ {
-        let gap = self.disc.intertrack_gap_sectors;
-        audio::track_ranges(self.tracks.iter().map(move |track| (track.sectors, gap)))
+        audio::track_ranges(self.tracks.iter().enumerate().map(|(i, track)| {
+            let (gap, tail) = self.disc.track_silence(i, self.tracks.len());
+            (track.sectors + tail, gap)
+        }))
     }
 
     pub fn geometry_label(&self) -> &'static str {

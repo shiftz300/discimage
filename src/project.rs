@@ -186,6 +186,8 @@ pub struct Disc {
     pub inner_radius_mm: f64,
     pub outer_radius_mm: f64,
     pub intertrack_gap_sectors: u32,
+    #[serde(skip_serializing_if = "GapPosition::is_pregap")]
+    pub intertrack_gap_position: GapPosition,
     pub session_reserve_sectors: u32,
     pub data_reserve_sectors: u32,
     pub end_margin_sectors: u32,
@@ -209,6 +211,7 @@ impl Default for Disc {
             inner_radius_mm: 25.0,
             outer_radius_mm: 58.0,
             intertrack_gap_sectors: 0,
+            intertrack_gap_position: GapPosition::Pregap,
             session_reserve_sectors: 11_400,
             data_reserve_sectors: 10_000,
             end_margin_sectors: 150,
@@ -222,7 +225,31 @@ impl Default for Disc {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GapPosition {
+    #[default]
+    Pregap,
+    Tail,
+}
+
+impl GapPosition {
+    fn is_pregap(&self) -> bool {
+        *self == Self::Pregap
+    }
+}
+
 impl Disc {
+    /// (Pregap, track tail) within the program area. The first track's
+    /// mandatory 150-sector pregap precedes LBA 0 and is handled separately.
+    pub(crate) fn track_silence(&self, index: usize, count: usize) -> (u32, u32) {
+        let gap = self.intertrack_gap_sectors;
+        match self.intertrack_gap_position {
+            GapPosition::Pregap => (if index > 0 { gap } else { 0 }, 0),
+            GapPosition::Tail => (0, if index + 1 < count { gap } else { 0 }),
+        }
+    }
+
     /// Restrict the write extent without changing the reference spiral.
     pub(crate) fn limit_end(&mut self, end: u32) {
         let capacity = self
@@ -257,6 +284,11 @@ impl Project {
             .with_context(|| format!("cannot read project {}", path.display()))?;
         let base = path.parent().unwrap_or(Path::new("."));
         let mut settings: toml::Table = toml::from_str(&text).context("invalid project TOML")?;
+        let gap_position = settings
+            .remove("intertrack_gap_position")
+            .map(toml::Value::try_into::<GapPosition>)
+            .transpose()
+            .context("intertrack_gap_position must be 'pregap' or 'tail'")?;
         if let Some(preset) = settings.remove("preset") {
             ensure!(
                 !settings.contains_key("disc"),
@@ -268,6 +300,9 @@ impl Project {
         let mut project: Self = toml::Value::Table(settings)
             .try_into()
             .context("invalid project TOML")?;
+        if let Some(position) = gap_position {
+            project.disc.intertrack_gap_position = position;
+        }
         ensure!(!project.title.trim().is_empty(), "title must not be empty");
         // 99 total tracks, reserving one for the data session.
         ensure!(

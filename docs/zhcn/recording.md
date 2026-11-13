@@ -18,6 +18,8 @@ tracks = [{ path = "audio/01.wav" }, { path = "audio/02.wav" }]
 
 引用对应盘型、批次的[标定预设](calibration.md)。数组顺序就是播放顺序，顶层字段放在所有表之前。
 CD-R 与 CD-RW 分别保存配置，可以共享音频和图案。
+在顶层写 `intertrack_gap_position = "tail"`，可将预设的曲间静音放进上一曲末尾，最后一曲不补。
+使用 `[disc]` 时，`intertrack_gap_sectors = 150` 表示两秒。静音时长相同时，曲目起点和预计数据会话地址一致。
 
 ## 2. 设计图案
 
@@ -71,7 +73,8 @@ discimage burn projects/my-album/output/cdrw
 discimage devices
 ```
 
-省略 `--speed` 自动选速。程序写音乐并回读，取得实际 NWA 后生成、写入、校验数据，再封盘。
+省略 `--speed` 自动选速。程序在追加数据前回读音频采样、曲间静音和 Q 子通道换轨标记，按实际 NWA 写入并校验数据，封盘后再检查一次音频。
+光驱需支持读取原始 P–W 或格式化 Q 子通道。
 全程保持光驱连接。成功应包含音频和数据回读通过，以及封盘的两个会话：N 首歌的 N 条音轨加一条数据轨。
 查看盘面并试听；`verify` 只查本地文件，不代替实盘回读。刻下一张前重新 build 同一配置。
 
