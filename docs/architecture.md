@@ -19,14 +19,16 @@ same geometry and encoding code; native device access stays behind platform adap
 ```text
 TOML + WAV + artwork → Plan → frozen package
                                   ↓ burn
-              audio → PCM verification → actual NWA
+           audio SAO → data TAO → actual NWA → audio readback
                                   ↓
-                data encoding → write → verification → close
+              data encoding → write → close → data and audio readback
 ```
 
 `build` freezes one flat input set without accessing a drive. ISO/RAW export is
-optional. `burn` regenerates the data image after the drive reports NWA;
-filesystem extents and artwork positions use absolute disc LBAs.
+optional. The recorder inspects the disc without changing its write mode. After
+checking the recorded audio layout, `burn` explicitly selects data TAO and reads
+the actual next writable address (NWA). It rebuilds the data image using
+absolute disc LBAs and checks the address and capacity again before writing.
 
 The journal records write intent before native calls. Package locking prevents
 concurrent modification. Uncertain writes stop; confirmed intermediate states

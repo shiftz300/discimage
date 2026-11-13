@@ -3,7 +3,7 @@ use crate::{
     codec::COOKED,
     console,
     device::Device,
-    probe::transport::Reply,
+    mmc::Reply,
     recorder::{Recorder, Transport},
 };
 use anyhow::{Context, Result, ensure};

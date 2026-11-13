@@ -411,6 +411,9 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     }
     check_cancel(backend)?;
     let observed = inspect_job(backend, journal)?;
+    appendable_music(&observed, &manifest.plan)?;
+    let observed = backend.prepare_append()?;
+    check_device(&observed, journal)?;
     let (nwa, free) = next(&observed, &manifest.plan)?;
     journal.observed = observed;
     console::phase(
@@ -750,7 +753,7 @@ fn music_layout(tracks: &[&Track], plan: &Plan) -> Result<()> {
     }
     Ok(())
 }
-fn next(device: &Device, plan: &Plan) -> Result<(u32, u32)> {
+fn appendable_music<'a>(device: &'a Device, plan: &Plan) -> Result<&'a Media> {
     let media = writable_cd(device)?;
     ensure!(
         !media.blank && media.appendable && media.reserved,
@@ -770,6 +773,11 @@ fn next(device: &Device, plan: &Plan) -> Result<(u32, u32)> {
         !device.tracks.iter().any(|t| !t.closed && !t.empty),
         "partially written track present; will not append"
     );
+    Ok(media)
+}
+
+fn next(device: &Device, plan: &Plan) -> Result<(u32, u32)> {
+    let media = appendable_music(device, plan)?;
     let nwa = media
         .nwa
         .context("drive did not expose an unambiguous next writable LBA")?;

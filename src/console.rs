@@ -67,7 +67,7 @@ pub fn devices(devices: &[crate::device::Device]) -> String {
                 );
             }
         } else {
-            let status = if drive.backend == "macos-discrecording" {
+            let status = if drive.capabilities.is_some() {
                 "no ready media"
             } else {
                 "not reported by this backend"
@@ -180,7 +180,7 @@ mod tests {
             hardware: None,
             id: id.clone(),
             name: "Test drive".into(),
-            backend: "macos-discrecording".into(),
+            backend: "macos-iokit-mmc".into(),
             capabilities: Some(Capabilities {
                 cdr: true,
                 cdrw: true,
@@ -238,7 +238,10 @@ mod tests {
                     == ["7", "2", "data", "-150", "12345", "yes", "no", "0"])
         );
         drive.media.as_mut().unwrap().free_sectors = None;
-        assert!(devices(&[drive]).contains("Free space    unknown sectors"));
+        assert!(devices(std::slice::from_ref(&drive)).contains("Free space    unknown sectors"));
+        drive.media = None;
+        drive.tracks.clear();
+        assert!(devices(&[drive]).contains("Disc          no ready media"));
     }
 
     #[test]

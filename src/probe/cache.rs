@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! CD cache strategy adapted from DiscProbe timing.py and geo.py.
+use crate::mmc::Reply;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{
-    Command, Probe, READ_CHUNK, SECTOR_BYTES, check_cancel, console,
-    transport::{READ_SPEED_KBPS, Reply},
+    Command, Probe, READ_CHUNK, SECTOR_BYTES, check_cancel, console, transport::READ_SPEED_KBPS,
 };
 
 const CACHE_HIT_US: f64 = 3000.0;

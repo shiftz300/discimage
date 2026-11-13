@@ -191,7 +191,12 @@ pub struct Music {
 /// writes, verifies and finalizes the disc.
 /// The recorder owns its media reservation until dropped.
 pub trait Recorder {
+    /// Observe the drive and media without changing the write mode.
     fn inspect(&mut self) -> Result<Device>;
+    /// Configure the reserved appendable disc for data writing and report its NWA.
+    fn prepare_append(&mut self) -> Result<Device> {
+        self.inspect()
+    }
     fn preflight_speed(&mut self, _speed: Option<u32>) -> Result<()> {
         Ok(())
     }
@@ -212,20 +217,6 @@ pub trait Recorder {
     }
     fn cancelled(&self) -> bool {
         cancelled()
-    }
-}
-
-pub fn blank_cdr_recorder(id: Option<&str>, capacity: u32) -> Result<Box<dyn Recorder>> {
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        Ok(Box::new(crate::recorder::Recorder::reserve_blank_cdr(
-            id, capacity,
-        )?))
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let _ = (id, capacity);
-        bail!("Recording is implemented for macOS and Windows")
     }
 }
 
@@ -378,9 +369,9 @@ mod tests {
     #[test]
     fn selectors_have_one_format_across_backends_and_accept_unique_models() {
         for (backend, id) in [
-            ("macos-discrecording", "IOService:/USB/Optical"),
+            ("macos-iokit-mmc", "IOService:/USB/Optical"),
             ("linux-sysfs", "/dev/sr0"),
-            ("windows-cim", "E:"),
+            ("windows-imapi2-mmc", "E:"),
         ] {
             let mut drive = disc(id, "cd-rw");
             drive.backend = backend.into();

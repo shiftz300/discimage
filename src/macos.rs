@@ -2,7 +2,7 @@
 use crate::{
     console,
     device::{self, Device},
-    probe::transport::Reply,
+    mmc::Reply,
     recorder::Transport,
 };
 use anyhow::{Context, Result, ensure};

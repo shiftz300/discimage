@@ -3,9 +3,8 @@ use crate::{
     audio, author,
     codec::{COOKED, RAW},
     console,
-    device::{self, Device, Identity, Music},
-    mmc,
-    probe::transport::Reply,
+    device::{self, Device, Identity, Media, Music},
+    mmc::{self, Reply},
     project::CdText,
 };
 use anyhow::{Context, Result, ensure};
@@ -499,23 +498,11 @@ impl Recorder {
         speed: Option<u32>,
     ) -> Result<()> {
         ensure!(self.locked, "drive must be reserved before data recording");
-        let before = device::Recorder::inspect(self)?;
-        let media = before.media.as_ref().context("no media")?;
+        let before = self.observe()?;
+        let media = data_media(&before)?;
         ensure!(
-            matches!(media.kind.as_str(), "cd-r" | "cd-rw")
-                && media.reserved
-                && (media.blank || media.appendable)
-                && ((media.blank && start == 0) || media.nwa == Some(start))
-                && media.free_sectors.is_some_and(|n| n >= sectors)
-                && before.capabilities.as_ref().is_some_and(|caps| {
-                    caps.tao
-                        && if media.kind == "cd-r" {
-                            caps.cdr
-                        } else {
-                            caps.cdrw
-                        }
-                }),
-            "data NWA, capacity or reservation changed; no write attempted"
+            media.blank == (start == 0),
+            "data image start does not match the medium state; no write attempted"
         );
         let mut file = File::open(path)?;
         ensure!(
@@ -530,6 +517,10 @@ impl Recorder {
         ensure!(
             mmc::track(&confirmed)?.next_writable == Some(start),
             "NWA changed after data setup; no write attempted"
+        );
+        ensure!(
+            (sectors..=360_000).contains(&mmc::be32(&confirmed, 16)?),
+            "remaining capacity changed after data setup; no write attempted"
         );
         let mut relative = 0;
         let mut reported = Instant::now();
@@ -551,17 +542,13 @@ impl Recorder {
         self.verify_data(path, start, sectors)
     }
 
-    pub(crate) fn reserve_blank_cdr(id: Option<&str>, capacity: u32) -> Result<Self> {
-        Self::reserve_blank_cd(id, capacity, false)
-    }
-
-    fn reserve_blank_cd(id: Option<&str>, capacity: u32, rewritable: bool) -> Result<Self> {
+    fn reserve_blank_cd(id: Option<&str>, capacity: u32) -> Result<Self> {
         use device::Recorder as _;
         let drives = device::list()?;
         let selected = if let Some(id) = id {
             device::resolve(&drives, id)?
         } else {
-            let eligible = drives.iter().filter(|d| blank_cd(d, capacity, rewritable));
+            let eligible = drives.iter().filter(|d| blank_cd(d, capacity));
             let candidates = eligible.collect::<Vec<_>>();
             ensure!(
                 candidates.len() == 1,
@@ -570,7 +557,7 @@ impl Recorder {
             candidates[0]
         };
         ensure!(
-            blank_cd(selected, capacity, rewritable),
+            blank_cd(selected, capacity),
             "selected drive needs a supported blank CD with sufficient writable capacity"
         );
         let mut recorder = Self::new(&selected.id)?;
@@ -578,7 +565,7 @@ impl Recorder {
         let locked = recorder.observe()?;
         ensure!(
             same_drive(selected, &locked)
-                && blank_cd(&locked, capacity, rewritable)
+                && blank_cd(&locked, capacity)
                 && locked
                     .media
                     .as_ref()
@@ -597,20 +584,20 @@ impl device::Recorder for Recorder {
         {
             return Ok(drive);
         }
-        let drive = self.observe()?;
-        if self.locked
-            && drive
-                .media
-                .as_ref()
-                .is_some_and(|m| !m.blank && m.appendable)
-        {
-            // NWA is write-mode dependent. After audio SAO, select data TAO
-            // before reporting the address used to author the second session.
-            self.parameters(false, false, false)?;
-            self.observe()
-        } else {
-            Ok(drive)
-        }
+        self.observe()
+    }
+
+    fn prepare_append(&mut self) -> Result<Device> {
+        ensure!(self.locked, "data append requires a reservation");
+        let before = self.observe()?;
+        let media = data_media(&before)?;
+        ensure!(
+            !media.blank && media.appendable,
+            "data append requires a recorded, appendable CD"
+        );
+        // After audio SAO, select data TAO before reading the NWA for authoring.
+        self.parameters(false, false, false)?;
+        self.observe()
     }
     fn preflight_speed(&mut self, speed: Option<u32>) -> Result<()> {
         if self.locked || !self.link.requires_reservation_for_reads() {
@@ -817,16 +804,31 @@ fn check_cancel() -> Result<()> {
     Ok(())
 }
 
-fn blank_cd(drive: &Device, capacity: u32, rewritable: bool) -> bool {
-    let (Some(caps), Some(media)) = (&drive.capabilities, &drive.media) else {
+fn supports_tao(drive: &Device, media: &Media) -> bool {
+    drive.capabilities.as_ref().is_some_and(|caps| {
+        caps.tao
+            && match media.kind.as_str() {
+                "cd-r" => caps.cdr,
+                "cd-rw" => caps.cdrw,
+                _ => false,
+            }
+    })
+}
+
+fn data_media(drive: &Device) -> Result<&Media> {
+    let media = drive.media.as_ref().context("no media")?;
+    ensure!(
+        media.reserved && (media.blank || media.appendable) && supports_tao(drive, media),
+        "data recording requires a reserved writable CD and TAO support"
+    );
+    Ok(media)
+}
+
+fn blank_cd(drive: &Device, capacity: u32) -> bool {
+    let Some(media) = &drive.media else {
         return false;
     };
-    caps.tao
-        && match media.kind.as_str() {
-            "cd-r" => caps.cdr,
-            "cd-rw" => rewritable && caps.cdrw,
-            _ => false,
-        }
+    supports_tao(drive, media)
         && media.blank
         && media.sessions == 0
         && media.tracks == 0
@@ -909,7 +911,7 @@ pub(crate) fn record_calibration(
         "use a new calibration output directory"
     );
     device::install_cancel_handler()?;
-    let mut recorder = Recorder::reserve_blank_cd(id, 1451, true)?;
+    let mut recorder = Recorder::reserve_blank_cd(id, 1451)?;
     let before = recorder.observe()?;
     let capacity = before
         .media

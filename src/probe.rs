@@ -504,8 +504,8 @@ fn looks_clv(ratio: f64, expected: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::transport::Reply;
     use super::*;
+    use crate::mmc::Reply;
     use std::f64::consts::{PI, TAU};
 
     #[test]

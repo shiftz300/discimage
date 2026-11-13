@@ -193,7 +193,8 @@ impl Disc {
                     b[2] = self.tracks.len() as u8 + 1;
                     b[3] = if self.phase == 0 { 1 } else { 2 };
                     b[6] = 0x41;
-                    b[7] = 1;
+                    // After audio SAO, the drive only reports NWA in data TAO.
+                    b[7] = u8::from(!(self.phase == 1 && self.sao));
                     b[8..12].copy_from_slice(&self.nwa().to_be_bytes());
                     b[12..16].copy_from_slice(&self.nwa().to_be_bytes());
                     b[16..20].copy_from_slice(&(16_300 - self.nwa()).to_be_bytes());
@@ -387,13 +388,40 @@ fn calibration_reuse_requires_the_matching_cd_media_write_capability() {
         locked: false,
     };
     let mut drive = recorder.observe().unwrap();
-    assert!(blank_cd(&drive, 14000, false));
-    assert!(!blank_cd(&drive, 20000, true));
+    assert!(blank_cd(&drive, 14000));
+    assert!(!blank_cd(&drive, 20000));
     drive.media.as_mut().unwrap().kind = "cd-rw".into();
-    assert!(!blank_cd(&drive, 14000, false));
-    assert!(blank_cd(&drive, 14000, true));
+    assert!(blank_cd(&drive, 14000));
     drive.capabilities.as_mut().unwrap().cdrw = false;
-    assert!(!blank_cd(&drive, 14000, true));
+    assert!(!blank_cd(&drive, 14000));
+}
+
+#[test]
+fn inspecting_appendable_media_keeps_audio_mode_until_data_is_prepared() {
+    use device::Recorder as _;
+    let disk = Rc::new(RefCell::new(Disc {
+        phase: 1,
+        sao: true,
+        tracks: vec![(0, 675)],
+        lead_out: 675,
+        ..Disc::default()
+    }));
+    let mut recorder = Recorder {
+        id: "D:".into(),
+        link: Box::new(Simulated(disk.clone())),
+        locked: false,
+    };
+    assert!(recorder.prepare_append().is_err());
+    recorder.lock().unwrap();
+    let media = recorder.inspect().unwrap().media.unwrap();
+    assert!(media.appendable);
+    assert_eq!(media.nwa, None);
+    assert!(disk.borrow().sao);
+    let media = recorder.prepare_append().unwrap().media.unwrap();
+    assert_eq!(media.nwa, Some(12_075));
+    assert_eq!(media.free_sectors, Some(4_225));
+    assert!(!disk.borrow().sao);
+    assert_eq!(disk.borrow().writes, 0);
 }
 
 #[test]
