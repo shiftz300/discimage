@@ -65,6 +65,10 @@ impl Package {
             value.project.files.is_none(),
             "package file tree must use frozen attachments"
         );
+        ensure!(
+            value.project.disc.track_lead_in_sectors == 0,
+            "package WAVs must contain the authored track lead-in"
+        );
         for path in value
             .project
             .tracks
@@ -368,10 +372,12 @@ pub fn build(
         project.tracks.clear();
         for (index, track) in plan.tracks.iter().enumerate() {
             let path = audio_path(index);
-            audio::export(track, &temporary.join(&path))?;
+            let (_, head, _) = plan.disc.track_silence(index, plan.tracks.len());
+            audio::export_with_silence(track, &temporary.join(&path), head, 0)?;
             inputs.push(author::asset(&temporary, &path)?);
             project.tracks.push(Track { path: path.into() });
         }
+        project.disc.freeze_track_lead_in();
         if let Some(artwork) = &mut project.artwork {
             art::load(artwork)?.save(temporary.join("artwork.png"))?;
             artwork.path = "artwork.png".into();
@@ -508,6 +514,7 @@ pub fn migrate(directory: &Path) -> Result<()> {
     let mut package = Package::load(&temporary)?;
     let result = (|| -> Result<()> {
         package.project.disc = original.plan.disc.clone();
+        package.project.disc.freeze_track_lead_in();
         package.project.disc.media =
             journal
                 .observed
@@ -519,6 +526,10 @@ pub fn migrate(directory: &Path) -> Result<()> {
                     _ => None,
                 });
         let mut image = original;
+        if image.plan.disc.track_lead_in_sectors != 0 {
+            image.plan =
+                Plan::from_project(&package.project(&temporary), Some(image.session_start))?;
+        }
         image.assets.clear();
         fs::copy(actual.join("session2.iso"), temporary.join("session2.iso"))?;
         image

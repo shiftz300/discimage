@@ -13,13 +13,18 @@ macOS 可直接刻录，Windows 刻录仍属实验性，Linux 可制作离线成
 ```toml
 title = "我的专辑"
 preset = { file = "../../calibrations/my-batch/disc.toml", name = "my-batch" }
+intertrack_gap_position = "tail"
+intertrack_gap_sectors = 150
+track_lead_in_sectors = 10
 tracks = [{ path = "audio/01.wav" }, { path = "audio/02.wav" }]
 ```
 
 引用对应盘型、批次的[标定预设](calibration.md)。数组顺序就是播放顺序，顶层字段放在所有表之前。
 CD-R 与 CD-RW 分别保存配置，可以共享音频和图案。
-在顶层写 `intertrack_gap_position = "tail"`，可将预设的曲间静音放进上一曲末尾，最后一曲不补。
-使用 `[disc]` 时，`intertrack_gap_sectors = 150` 表示两秒。静音时长相同时，曲目起点和预计数据会话地址一致。
+这个配置把曲间两秒分为上一曲末尾的 140 个扇区和下一曲 INDEX 01 后的
+10 个扇区（约 133 ms）。音乐起点和预计数据会话地址与原本 150 扇区的曲尾静音一致。
+`build` 将 10 个扇区的留白写入成品 WAV。连续专辑可把静音和留白都设为 0。
+首轨在 LBA 0 之前有独立前导。[ITU-R BR.1385 §4](https://www.itu.int/rec/R-REC-BR.1385-0-199812-W/en)。
 
 ## 2. 设计图案
 

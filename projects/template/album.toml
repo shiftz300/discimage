@@ -1,4 +1,7 @@
 title = "My album"
+intertrack_gap_position = "tail"
+intertrack_gap_sectors = 150
+track_lead_in_sectors = 10
 
 # 按播放顺序添加或删除曲目；路径相对本文件。
 [[tracks]]

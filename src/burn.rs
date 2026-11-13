@@ -361,7 +361,7 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let (gap, tail) = manifest
+            let (gap, head, tail) = manifest
                 .plan
                 .disc
                 .track_silence(i, manifest.plan.tracks.len());
@@ -374,7 +374,11 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
                 gap: if i == 0 { 150 } else { gap },
                 // Legacy authored bundles already have the silence in their WAVs.
                 tail: if flat { tail } else { 0 },
-                sectors: if flat { t.sectors } else { t.sectors + tail },
+                sectors: if flat {
+                    t.sectors
+                } else {
+                    head + t.sectors + tail
+                },
             }
         })
         .collect::<Vec<_>>();

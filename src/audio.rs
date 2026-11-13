@@ -232,10 +232,15 @@ fn inspect_riff(path: &Path) -> Result<(u32, u64)> {
 
 /// Copy PCM unchanged, normalize the RIFF container and explicitly zero-pad its tail.
 pub fn export(track: &AudioTrack, path: &Path) -> Result<()> {
-    export_with_tail(track, path, 0)
+    export_with_silence(track, path, 0, 0)
 }
 
-pub(crate) fn export_with_tail(track: &AudioTrack, path: &Path, tail: u32) -> Result<()> {
+pub(crate) fn export_with_silence(
+    track: &AudioTrack,
+    path: &Path,
+    head: u32,
+    tail: u32,
+) -> Result<()> {
     let current = inspect(&track.path)?;
     ensure!(
         current.sample_frames == track.sample_frames && current.data_offset == track.data_offset,
@@ -248,11 +253,16 @@ pub(crate) fn export_with_tail(track: &AudioTrack, path: &Path, tail: u32) -> Re
         std::io::BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path)?);
     let bytes = track
         .sectors
-        .checked_add(tail)
+        .checked_add(head)
+        .and_then(|n| n.checked_add(tail))
         .and_then(|n| n.checked_mul(RAW as u32))
         .filter(|&n| n <= u32::MAX - 36)
         .context("padded WAV exceeds the RIFF size limit")?;
     header(&mut output, bytes)?;
+    std::io::copy(
+        &mut std::io::repeat(0).take(u64::from(head) * RAW as u64),
+        &mut output,
+    )?;
     let expected = u64::from(track.sample_frames) * 4;
     ensure!(
         std::io::copy(&mut input.take(expected), &mut output)? == expected,

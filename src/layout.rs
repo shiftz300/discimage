@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     audio::{self, AudioTrack},
-    project::{Disc, Project},
+    project::{Disc, GapPosition, Project},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +94,12 @@ impl Plan {
             disc.data_reserve_sectors >= 300,
             "reserve at least 300 sectors for filesystem/content (estimate only)"
         );
+        ensure!(
+            disc.track_lead_in_sectors == 0
+                || (disc.intertrack_gap_position == GapPosition::Tail
+                    && disc.track_lead_in_sectors <= disc.intertrack_gap_sectors),
+            "track_lead_in_sectors requires tail gaps and cannot exceed intertrack_gap_sectors"
+        );
         let (music, gaps) = music_budget(&tracks, disc.intertrack_gap_sectors);
         let start = music
             + gaps
@@ -165,8 +171,8 @@ impl Plan {
 
     pub(crate) fn music_ranges(&self) -> impl Iterator<Item = std::ops::Range<u32>> + '_ {
         audio::track_ranges(self.tracks.iter().enumerate().map(|(i, track)| {
-            let (gap, tail) = self.disc.track_silence(i, self.tracks.len());
-            (track.sectors + tail, gap)
+            let (gap, head, tail) = self.disc.track_silence(i, self.tracks.len());
+            (head + track.sectors + tail, gap)
         }))
     }
 

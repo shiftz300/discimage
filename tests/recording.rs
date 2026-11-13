@@ -627,6 +627,43 @@ fn legacy_authoring_exports_tail_silence_without_shifting_the_data_layout() {
 }
 
 #[test]
+fn track_lead_in_moves_the_index_without_moving_music_or_data() {
+    let work = Work::new();
+    let config = std::fs::read_to_string(&work.project)
+        .unwrap()
+        .replace("[disc]", "[disc]\ncapacity_sectors = 14000");
+    std::fs::write(
+        &work.project,
+        format!("intertrack_gap_position = 'tail'\ntrack_lead_in_sectors = 10\n{config}"),
+    )
+    .unwrap();
+    let second = work.root.join("two.wav");
+    let mut pcm = std::fs::read(&second).unwrap();
+    pcm[44..48].copy_from_slice(&[1, 2, 3, 4]);
+    std::fs::write(&second, &pcm).unwrap();
+    discimage::package::build(&work.project, &work.job, None, None).unwrap();
+    let package = discimage::package::Package::load(&work.job).unwrap();
+    let plan = package.verify_inputs(&work.job).unwrap();
+    assert_eq!(plan.disc.track_lead_in_sectors, 0);
+    assert_eq!(plan.gap_sectors, 65);
+    assert_eq!(plan.music_sectors, 620);
+    assert_eq!(plan.tracks[0].sectors + plan.gap_sectors, 365);
+    assert_eq!(plan.session_start(), 12_085);
+    let frozen = std::fs::read(work.job.join("02.wav")).unwrap();
+    assert!(frozen[44..44 + 10 * 2352].iter().all(|&byte| byte == 0));
+    assert_eq!(&frozen[44 + 10 * 2352..], &pcm[44..]);
+
+    let legacy = work.root.join("legacy");
+    author::build_images(&work.project, &legacy, None, author::Images::Iso).unwrap();
+    let manifest = author::verify(&legacy).unwrap();
+    assert_eq!(manifest.session_start, 12_085);
+    let exported = std::fs::read(legacy.join("audio/02.wav")).unwrap();
+    assert_eq!(exported, frozen);
+    let first = std::fs::read(legacy.join("audio/01.wav")).unwrap();
+    assert_eq!(first.len(), 44 + 365 * 2352);
+}
+
+#[test]
 fn changing_nwa_blocks_data_and_resume_reauthors_at_the_new_address() {
     let work = Work::new();
     let mut drive = Drive::new(&work, Fault::MovingNwa);

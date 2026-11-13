@@ -14,16 +14,21 @@ Create `projects/my-album/cdrw.toml` and put the WAVs in its `audio/` directory:
 ```toml
 title = "My album"
 preset = { file = "../../calibrations/my-batch/disc.toml", name = "my-batch" }
+intertrack_gap_position = "tail"
+intertrack_gap_sectors = 150
+track_lead_in_sectors = 10
 tracks = [{ path = "audio/01.wav" }, { path = "audio/02.wav" }]
 ```
 
 Use the preset from [calibration](calibration.md) for the actual medium/batch.
 The track array controls playing order. Put top-level fields before any table.
 Keep CD-R and CD-RW settings in separate TOMLs; they can share audio and artwork.
-Set top-level `intertrack_gap_position = "tail"` to put the preset's silence at
-the end of each track except the last. With `[disc]`, set
-`intertrack_gap_sectors = 150` for two seconds. Track starts and the planned data
-address are identical to those with the same duration in a pregap.
+The example keeps 140 sectors of silence at the end of each track except the
+last. The next track starts with 10 sectors (133 ms) of silence after INDEX 01.
+The music starts and the planned data address stay at the same positions as
+with a 150-sector tail. Build writes the 10 sectors into the package WAVs.
+Use zero lead-in and zero gap for a continuous album. The first track has its
+own pre-gap before LBA 0. [ITU-R BR.1385 §4](https://www.itu.int/rec/R-REC-BR.1385-0-199812-W/en).
 
 ## 2. Design the artwork
 

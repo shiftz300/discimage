@@ -188,6 +188,8 @@ pub struct Disc {
     pub intertrack_gap_sectors: u32,
     #[serde(skip_serializing_if = "GapPosition::is_pregap")]
     pub intertrack_gap_position: GapPosition,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub track_lead_in_sectors: u32,
     pub session_reserve_sectors: u32,
     pub data_reserve_sectors: u32,
     pub end_margin_sectors: u32,
@@ -212,6 +214,7 @@ impl Default for Disc {
             outer_radius_mm: 58.0,
             intertrack_gap_sectors: 0,
             intertrack_gap_position: GapPosition::Pregap,
+            track_lead_in_sectors: 0,
             session_reserve_sectors: 11_400,
             data_reserve_sectors: 10_000,
             end_margin_sectors: 150,
@@ -239,15 +242,30 @@ impl GapPosition {
     }
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 impl Disc {
-    /// (Pregap, track tail) within the program area. The first track's
+    /// (Pregap, silence after INDEX 01, track tail) within the program area. The first track's
     /// mandatory 150-sector pregap precedes LBA 0 and is handled separately.
-    pub(crate) fn track_silence(&self, index: usize, count: usize) -> (u32, u32) {
+    pub(crate) fn track_silence(&self, index: usize, count: usize) -> (u32, u32, u32) {
         let gap = self.intertrack_gap_sectors;
+        let head = self.track_lead_in_sectors;
         match self.intertrack_gap_position {
-            GapPosition::Pregap => (if index > 0 { gap } else { 0 }, 0),
-            GapPosition::Tail => (0, if index + 1 < count { gap } else { 0 }),
+            GapPosition::Pregap => (if index > 0 { gap } else { 0 }, 0, 0),
+            GapPosition::Tail => (
+                0,
+                if index > 0 { head } else { 0 },
+                if index + 1 < count { gap - head } else { 0 },
+            ),
         }
+    }
+
+    /// The frozen WAVs already contain the silence after INDEX 01.
+    pub(crate) fn freeze_track_lead_in(&mut self) {
+        self.intertrack_gap_sectors -= self.track_lead_in_sectors;
+        self.track_lead_in_sectors = 0;
     }
 
     /// Restrict the write extent without changing the reference spiral.
@@ -289,6 +307,8 @@ impl Project {
             .map(toml::Value::try_into::<GapPosition>)
             .transpose()
             .context("intertrack_gap_position must be 'pregap' or 'tail'")?;
+        let gap_sectors = settings.remove("intertrack_gap_sectors");
+        let lead_in = settings.remove("track_lead_in_sectors");
         if let Some(preset) = settings.remove("preset") {
             ensure!(
                 !settings.contains_key("disc"),
@@ -302,6 +322,12 @@ impl Project {
             .context("invalid project TOML")?;
         if let Some(position) = gap_position {
             project.disc.intertrack_gap_position = position;
+        }
+        if let Some(gap) = gap_sectors {
+            project.disc.intertrack_gap_sectors = gap.try_into()?;
+        }
+        if let Some(lead_in) = lead_in {
+            project.disc.track_lead_in_sectors = lead_in.try_into()?;
         }
         ensure!(!project.title.trim().is_empty(), "title must not be empty");
         // 99 total tracks, reserving one for the data session.
