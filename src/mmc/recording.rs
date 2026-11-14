@@ -278,7 +278,7 @@ pub(crate) fn verify_q<'a>(
         total += 1;
         let mut raw = [0; 12];
         let q = if frame.len() == 96 {
-            for (out, bits) in raw.iter_mut().zip(frame.chunks_exact(8)) {
+            for (out, bits) in raw.iter_mut().zip(frame.as_chunks::<8>().0) {
                 *out = bits.iter().fold(0, |byte, bit| byte << 1 | (bit >> 6 & 1));
             }
             &raw

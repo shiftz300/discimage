@@ -3,7 +3,7 @@ use anyhow::{Result, ensure};
 
 #[cfg(any(target_os = "macos", windows, test))]
 mod recording;
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) use recording::*;
 
 pub(crate) struct Reply {
