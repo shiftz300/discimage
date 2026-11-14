@@ -30,6 +30,15 @@ pub enum Stage {
     Complete,
 }
 
+impl Stage {
+    pub fn resumable(self) -> bool {
+        matches!(
+            self,
+            Self::Prepared | Self::MusicWritten | Self::DataReady | Self::DataWriting
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
     pub format: String,
@@ -196,13 +205,26 @@ pub fn start(
 }
 
 pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) -> Result<Journal> {
+    record_with_speed(backend, directory, speed, false)
+}
+
+pub fn record_slowest(backend: &mut dyn Recorder, directory: &Path) -> Result<Journal> {
+    record_with_speed(backend, directory, None, true)
+}
+
+fn record_with_speed(
+    backend: &mut dyn Recorder,
+    directory: &Path,
+    speed: Option<u32>,
+    slowest: bool,
+) -> Result<Journal> {
     ensure!(
         speed.is_none_or(|v| (1..=64).contains(&v)),
         "speed must be 1–64x"
     );
     if !directory.join("manifest.toml").try_exists()? {
         ensure!(
-            speed.is_none(),
+            speed.is_none() && !slowest,
             "legacy recording jobs use their saved speed"
         );
         return resume(backend, directory);
@@ -211,6 +233,10 @@ pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) 
     let _lock = package::lock(&directory)?;
     let mut package = Package::load(&directory)?;
     let mut journal = if let Some(journal) = package.journal {
+        ensure!(
+            !slowest || journal.stage == Stage::Prepared || journal.speed.is_some(),
+            "recording started with automatic speed; resume without --slowest"
+        );
         ensure!(
             speed.is_none_or(|v| journal.speed == Some(v)),
             "recording already started; its speed is frozen"
@@ -247,14 +273,11 @@ pub fn record(backend: &mut dyn Recorder, directory: &Path, speed: Option<u32>) 
         journal
     };
     ensure!(
-        matches!(
-            journal.stage,
-            Stage::Prepared | Stage::MusicWritten | Stage::DataReady
-        ),
+        journal.stage.resumable(),
         "stage {:?} cannot be resumed automatically; no write attempted",
         journal.stage
     );
-    let result = run(backend, &directory, &mut journal);
+    let result = run_with_speed(backend, &directory, &mut journal, slowest);
     finish(&directory, journal, result)
 }
 
@@ -263,10 +286,7 @@ pub fn resume(backend: &mut dyn Recorder, directory: &Path) -> Result<Journal> {
     let _lock = job_lock(&directory)?;
     let mut journal = Journal::load(&directory)?;
     ensure!(
-        matches!(
-            journal.stage,
-            Stage::Prepared | Stage::MusicWritten | Stage::DataReady
-        ),
+        journal.stage.resumable(),
         "stage {:?} cannot be resumed automatically; no write attempted",
         journal.stage
     );
@@ -313,6 +333,15 @@ fn finish(directory: &Path, mut journal: Journal, result: Result<()>) -> Result<
 }
 
 fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> Result<()> {
+    run_with_speed(backend, directory, journal, false)
+}
+
+fn run_with_speed(
+    backend: &mut dyn Recorder,
+    directory: &Path,
+    journal: &mut Journal,
+    slowest: bool,
+) -> Result<()> {
     ensure!(
         journal.speed.is_none_or(|speed| (1..=64).contains(&speed)),
         "invalid saved recording speed"
@@ -350,11 +379,6 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     } else {
         checked_bundle(&planned, journal.planned_sha256.as_deref())?
     };
-    inspect_job(backend, journal)?;
-    check_cancel(backend)?;
-    backend.lock()?;
-    journal.observed = inspect_job(backend, journal)?;
-    backend.preflight_speed(journal.speed)?;
     let tracks = manifest
         .plan
         .tracks
@@ -382,6 +406,31 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
             }
         })
         .collect::<Vec<_>>();
+    if journal.stage == Stage::DataWriting {
+        return verify_interrupted_data(backend, directory, journal, &manifest.plan, &tracks);
+    }
+    inspect_job(backend, journal)?;
+    check_cancel(backend)?;
+    backend.lock()?;
+    journal.observed = inspect_job(backend, journal)?;
+    if slowest {
+        if journal.stage == Stage::Prepared {
+            let speed = backend.slowest_speed()?;
+            ensure!((1..=64).contains(&speed), "invalid lowest write speed");
+            journal.speed = Some(speed);
+            journal.save(directory)?;
+            console::phase(
+                "speed",
+                format_args!("Using the lowest reported write speed: {speed}x"),
+            );
+        } else if let Some(speed) = journal.speed {
+            console::phase(
+                "speed",
+                format_args!("Resuming at the saved write speed: {speed}x"),
+            );
+        }
+    }
+    backend.preflight_speed(journal.speed)?;
     if journal.stage == Stage::Prepared {
         let available = blank(&journal.observed, true)?;
         let project = if flat {
@@ -552,6 +601,63 @@ fn run(backend: &mut dyn Recorder, directory: &Path, journal: &mut Journal) -> R
     backend
         .verify_music(&tracks, true)
         .context("music readback failed after disc finalization")?;
+    journal.advance(directory, Stage::Complete)
+}
+
+fn verify_interrupted_data(
+    backend: &mut dyn Recorder,
+    directory: &Path,
+    journal: &mut Journal,
+    plan: &Plan,
+    tracks: &[Music],
+) -> Result<()> {
+    let nwa = journal.nwa.context("missing saved data session start")?;
+    let actual_dir = journal.actual(directory);
+    let image = if journal.format == "discimage-burn-v2" {
+        let image = Package::load(directory)?
+            .image
+            .context("missing saved data image")?;
+        author::verify_manifest(directory, &image, false)?;
+        image
+    } else {
+        checked_bundle(&actual_dir, journal.actual_sha256.as_deref())?
+    };
+    ensure!(
+        image.session_start == nwa
+            && image.plan.music_sectors == plan.music_sectors
+            && image.plan.gap_sectors == plan.gap_sectors,
+        "saved data image does not match the recording layout"
+    );
+    let check_disc = |observed: &Device| -> Result<()> {
+        if let Some(expected) = journal.observed.hardware_id() {
+            ensure!(
+                observed.hardware_id().as_ref() == Some(&expected),
+                "recording drive hardware identity changed"
+            );
+        } else {
+            check_drive(observed, journal)?;
+        }
+        closed(observed, plan, nwa, image.data_sectors)
+            .context("cannot recover an unfinished write; a finalized matching disc is required")?;
+        Ok(())
+    };
+    let before = backend.inspect()?;
+    check_disc(&before)?;
+    check_cancel(backend)?;
+    backend.lock()?;
+    let observed = backend.inspect()?;
+    check_disc(&observed)?;
+    ensure!(
+        observed.id == before.id,
+        "verification drive changed during reservation"
+    );
+    console::phase(
+        "readback",
+        format_args!("Resuming verification of the finalized disc"),
+    );
+    backend.verify_data(&actual_dir.join("session2.iso"), nwa, image.data_sectors)?;
+    backend.verify_music(tracks, true)?;
+    journal.observed = observed;
     journal.advance(directory, Stage::Complete)
 }
 

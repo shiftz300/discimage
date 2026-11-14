@@ -60,12 +60,17 @@ pub fn inspect(id: &str) -> Result<Range<u32>> {
 }
 
 pub fn acquire(id: &str, requested: Option<Range<u32>>, output: &Path) -> Result<()> {
-    acquire_inner(id, requested, output, None)
+    acquire_inner(id, requested, output, None, false)
 }
 
 /// Measure a specific recorded calibration target, checking it under the probe reservation.
 pub fn acquire_target(id: &str, output: &Path, target: &Path) -> Result<()> {
-    acquire_inner(id, None, output, Some(target))
+    acquire_inner(id, None, output, Some(target), false)
+}
+
+/// Measure the readable prefix of an interrupted target without closing the disc.
+pub fn acquire_partial(id: &str, output: &Path, target: &Path) -> Result<()> {
+    acquire_inner(id, None, output, Some(target), true)
 }
 
 fn acquire_inner(
@@ -73,6 +78,7 @@ fn acquire_inner(
     requested: Option<Range<u32>>,
     output: &Path,
     target: Option<&Path>,
+    partial: bool,
 ) -> Result<()> {
     if let Some(range) = &requested {
         ensure!(
@@ -83,24 +89,47 @@ fn acquire_inner(
     ensure!(!output.try_exists()?, "use a new probe output directory");
     let resolved = device::probe_id(id)?;
     device::install_cancel_handler()?;
+    let pending = partial
+        .then(|| crate::calibrate::pending(target.context("missing partial target")?))
+        .transpose()?;
     #[cfg(target_os = "macos")]
     if let Some(target) = target {
-        crate::calibrate::single(target)?;
-        crate::macos::prepare_probe(&resolved)?;
+        if !partial {
+            crate::calibrate::single(target)?;
+        }
+        crate::macos::prepare_probe(&resolved, partial)?;
     }
     let mut link = Device::open(&resolved)?;
-    let readable = disc_bounds(&mut link, true)?;
+    let bounds = |link: &mut dyn Link, initial| match &pending {
+        Some(receipt) => partial_bounds(link, receipt.written_sectors, initial),
+        None => disc_bounds(link, initial),
+    };
+    let verify = |link: &mut dyn Link, readable: &Range<u32>, target: &Path| {
+        if let Some(receipt) = &pending {
+            verify_target_samples(link, readable, target)?;
+            Ok(receipt.image_digest().to_owned())
+        } else {
+            verify_target(link, readable, target)
+        }
+    };
+    let reported = bounds(&mut link, true)?;
+    let readable = if partial {
+        readable_prefix(&mut link, reported.clone(), |link| bounds(link, true))?
+    } else {
+        reported.clone()
+    };
     let target_hash = target
-        .map(|target| verify_target(&mut link, &readable, target))
+        .map(|target| verify(&mut link, &readable, target))
         .transpose()?;
     #[cfg(windows)]
     let _priority = transport::timing_priority();
     let Range { start: first, end } = requested.unwrap_or_else(|| {
-        if target.is_some() {
+        if target.is_some() && !partial {
             return readable.start + 2..readable.end.saturating_sub(2);
         }
         let span = readable.end - readable.start - 1;
-        readable.start + span * 3 / 100..readable.start + span * 85 / 100
+        let outer_percent = if partial { 95 } else { 85 };
+        readable.start + span * 3 / 100..readable.start + span * outer_percent / 100
     });
     ensure!(
         readable.start <= first && end <= readable.end,
@@ -159,16 +188,16 @@ fn acquire_inner(
         "drive appears to use constant linear velocity across this range; geometry timing needs stable constant rotation"
     );
     probe.settle()?;
-    let fit = fit::ladder(first..end, reference, |lba| probe.measure(lba))?;
+    let fit = fit::ladder(first..end, reference, partial, |lba| probe.measure(lba))?;
     let method = if probe.read12 { "read12" } else { "read10" };
     let period_ms = probe.period.map(|seconds| seconds * 1000.0);
     ensure!(
-        disc_bounds(&mut link, false)? == readable,
+        bounds(&mut link, false)? == reported,
         "disc layout changed during measurement"
     );
     if let Some(target) = target {
         ensure!(
-            Some(verify_target(&mut link, &readable, target)?) == target_hash,
+            Some(verify(&mut link, &readable, target)?) == target_hash,
             "calibration target changed during measurement"
         );
     }
@@ -176,7 +205,7 @@ fn acquire_inner(
     let measured = fit.points.iter().map(|p| p.sample.lba).chain([reference]);
     let lo = measured.clone().min().unwrap_or(reference);
     let hi = measured.max().unwrap_or(reference);
-    let summary = json!({
+    let mut summary = json!({
         "fit": {
             "media": "cd", "sector_bits": SECTOR_BITS, "read_tail_frames": READ_TAIL_FRAMES,
             "read_completion_model_measured": false, "u": fit.geometry.u, "v": fit.geometry.v,
@@ -189,12 +218,16 @@ fn acquire_inner(
             "family": "cd", "read_method": method,
             "readable_lba_range": [readable.start, readable.end],
             "experiment_range": [first, end],
+            "rejected_lbas": fit.rejected,
         },
         "cache": cache,
         "rotation_check": rotation,
         "set_cd_speed": speed,
         "calibration_sha256": target_hash,
     });
+    if partial {
+        summary["partial_target"] = json!(true);
+    }
     let targets_path = output.join("targets.csv");
     let mut csv = BufWriter::new(fs::File::create(&targets_path)?);
     writeln!(
@@ -240,7 +273,6 @@ fn acquire_inner(
 }
 
 fn verify_target(link: &mut dyn Link, readable: &Range<u32>, directory: &Path) -> Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
     let receipt = crate::calibrate::single(directory)?;
     ensure!(
         readable.start == 0
@@ -248,6 +280,16 @@ fn verify_target(link: &mut dyn Link, readable: &Range<u32>, directory: &Path) -
                 || readable.end.checked_add(2) == Some(receipt.written_sectors)),
         "insert the recorded single-session calibration target"
     );
+    verify_target_samples(link, readable, directory)?;
+    crate::calibrate::digest(directory)
+}
+
+fn verify_target_samples(
+    link: &mut dyn Link,
+    readable: &Range<u32>,
+    directory: &Path,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
     let mut image = fs::File::open(directory.join("calibration.iso"))?;
     for lba in [16, 300, readable.end - 1]
         .into_iter()
@@ -270,7 +312,7 @@ fn verify_target(link: &mut dyn Link, readable: &Range<u32>, directory: &Path) -
             "insert the matching calibration target; mismatch at LBA {lba}"
         );
     }
-    crate::calibrate::digest(directory)
+    Ok(())
 }
 
 fn save(path: &Path, data: &Value) -> Result<()> {
@@ -283,7 +325,7 @@ fn check_cancel() -> Result<()> {
     Ok(())
 }
 
-fn disc_bounds(link: &mut dyn Link, initial: bool) -> Result<Range<u32>> {
+fn ready(link: &mut dyn Link, initial: bool) -> Result<()> {
     check_cancel()?;
     let ready = link.command(Command::Ready)?;
     if initial && ready.status != 0 && ready.key() == 6 {
@@ -292,6 +334,106 @@ fn disc_bounds(link: &mut dyn Link, initial: bool) -> Result<Range<u32>> {
     } else {
         ready.good()?;
     }
+    Ok(())
+}
+
+fn partial_bounds(link: &mut dyn Link, planned: u32, initial: bool) -> Result<Range<u32>> {
+    ready(link, initial)?;
+    let config = link.command(Command::Configuration)?.good()?.data;
+    ensure!(
+        matches!(config.get(6..8), Some([0, 9..=10])),
+        "expected CD-R or CD-RW"
+    );
+    let disc = declared(link.command(Command::Disc)?.good()?.data)?;
+    let track = declared(link.command(Command::TrackNumber(1))?.good()?.data)?;
+    if disc.get(6) == Some(&2) {
+        let next = declared(link.command(Command::TrackNumber(2))?.good()?.data)?;
+        ensure!(
+            next.len() >= 32 && next[2..4] == [2, 1] && next[6] & 0x40 != 0,
+            "recovery requires only one recorded track"
+        );
+    }
+    partial_track_bounds(&disc, &track, planned)
+}
+
+fn partial_track_bounds(disc: &[u8], track: &[u8], planned: u32) -> Result<Range<u32>> {
+    ensure!(
+        disc.len() >= 24
+            && disc[2] & 3 == 1
+            && disc[3] == 1
+            && disc[4] == 1
+            && disc[5] == 1
+            && matches!(disc[6], 1 | 2)
+            && disc[9..12] == [0; 3],
+        "recovery requires an unfinalized first CD session"
+    );
+    ensure!(
+        track.len() >= 32
+            && track[2..4] == [1, 1]
+            && (track.len() < 34 || track[32..34] == [0, 0])
+            && track[8..12] == [0; 4]
+            && track[7] & 1 == 0
+            && track[5] & 4 != 0
+            && track[6] & 0x4f == 1,
+        "recovery requires a closed Mode 1 data track starting at LBA 0"
+    );
+    let mut end = u32::from_be_bytes(track[24..28].try_into()?);
+    ensure!(end < planned, "expected a partially recorded target");
+    if track[7] & 2 != 0 {
+        let last = u32::from_be_bytes(track[28..32].try_into()?);
+        end = end.min(last.saturating_add(1));
+    }
+    ensure!(end > 1300, "too little recorded data for recovery");
+    Ok(0..end)
+}
+
+fn readable_prefix(
+    link: &mut dyn Link,
+    reported: Range<u32>,
+    recheck: impl Fn(&mut dyn Link) -> Result<Range<u32>>,
+) -> Result<Range<u32>> {
+    // A failed write can leave the last reported sectors unreadable. Keep
+    // timing reads away from that area and validate the chosen bound.
+    for margin in [1024, 4096, 8192, 16384, 32768, 49152, 65536, 98304] {
+        check_cancel()?;
+        let end = reported.end.saturating_sub(margin);
+        if end <= 1300 {
+            break;
+        }
+        let reply = link.command(Command::Read {
+            lba: end - 1,
+            count: 1,
+            fua: false,
+            read12: false,
+        })?;
+        if reply.status == 0 && reply.data.len() == SECTOR_BYTES {
+            console::phase(
+                "probe",
+                format_args!(
+                    "Reported track ends at {}; using LBA 0..{end}",
+                    reported.end
+                ),
+            );
+            return Ok(0..end);
+        }
+        if reply.key() == 6 && reply.asc() == (0x29, 0) {
+            ensure!(
+                recheck(link)? == reported,
+                "partial target changed after drive reset"
+            );
+        } else if matches!(reply.key(), 2 | 4 | 6) {
+            reply.good()?;
+        }
+        console::phase(
+            "probe",
+            format_args!("LBA {end} boundary could not be read; moving inward"),
+        );
+    }
+    anyhow::bail!("could not establish a readable partial target boundary")
+}
+
+fn disc_bounds(link: &mut dyn Link, initial: bool) -> Result<Range<u32>> {
+    ready(link, initial)?;
     let config = link.command(Command::Configuration)?.good()?.data;
     ensure!(
         matches!(config.get(6..8), Some([0, 8..=10])),
@@ -300,7 +442,7 @@ fn disc_bounds(link: &mut dyn Link, initial: bool) -> Result<Range<u32>> {
     let cap = link.command(Command::Capacity)?.good()?.data;
     let toc = declared(link.command(Command::Toc)?.good()?.data)?;
     let disc = declared(link.command(Command::Disc)?.good()?.data)?;
-    let track = declared(link.command(Command::Track)?.good()?.data)?;
+    let track = declared(link.command(Command::TrackNumber(1))?.good()?.data)?;
     bounds(&cap, &toc, &disc, &track)
 }
 
@@ -604,6 +746,28 @@ mod tests {
     }
 
     #[test]
+    fn partial_bounds_use_the_recorded_track_and_reject_other_layouts() {
+        let mut disc = [0; 34];
+        disc[2..7].copy_from_slice(&[5, 1, 1, 1, 2]);
+        let mut track = [0; 36];
+        track[1] = 34;
+        track[2..4].copy_from_slice(&[1, 1]);
+        track[5] = 4;
+        track[6] = 1;
+        track[24..28].copy_from_slice(&335_232u32.to_be_bytes());
+        assert_eq!(
+            partial_track_bounds(&disc, &track, 359_697).unwrap(),
+            0..335_232
+        );
+        assert!(partial_track_bounds(&disc, &track, 335_232).is_err());
+        track[7] = 1;
+        assert!(partial_track_bounds(&disc, &track, 359_697).is_err());
+        track[7] = 0;
+        disc[4] = 2;
+        assert!(partial_track_bounds(&disc, &track, 359_697).is_err());
+    }
+
+    #[test]
     fn identity_commands_request_only_standard_read_only_metadata() {
         for (serial, expected) in [
             (false, [0x12, 0, 0, 0, 36, 0]),
@@ -816,7 +980,7 @@ mod tests {
             .collect();
         let rotation = period::estimate(&period_samples, None).unwrap();
         assert!((rotation.seconds - period).abs() < 1e-7);
-        let result = fit::ladder(1500..359_440, reference, |lba| {
+        let measure = |lba| {
             let n = read_end_bits(lba) as f64;
             let phase = (2.0 * (n - n0) / (radius(n) + radius(n0)) + 0.08).rem_euclid(TAU);
             let times: Vec<_> = (0..32)
@@ -835,12 +999,31 @@ mod tests {
                 period,
                 sigma: 0.2_f64.to_radians(),
             }))
-        })
-        .unwrap();
+        };
+        let result = fit::ladder(1500..359_440, reference, false, measure).unwrap();
         assert_eq!(result.points.len(), 36);
         assert!((result.geometry.u - u).abs() < 0.1);
         assert!((result.geometry.v - v).abs() < 1e-4);
         assert!(result.rms_deg < 0.05);
         assert!(result.span_sigma_deg(1500, 359_439) < 0.5);
+
+        let mut attempts = 0;
+        let outlier = result.points[6].sample.lba;
+        let recovered = fit::ladder(1500..359_440, reference, true, |lba| {
+            let sample = measure(lba)?;
+            Ok(sample.map(|mut sample| {
+                if lba == outlier {
+                    sample.phase += PI;
+                    attempts += 1;
+                }
+                sample
+            }))
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(recovered.rejected, [outlier]);
+        assert_eq!(recovered.points.len(), 36);
+        assert!((recovered.geometry.u - u).abs() < 0.1);
+        assert!((recovered.geometry.v - v).abs() < 1e-4);
     }
 }

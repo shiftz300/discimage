@@ -24,6 +24,11 @@ RMS 只提示质量，不是固定成功线。
 中断后重跑同一条命令继续。完成的标靶不重刻；不确定的写入会停止。
 复测不一致会保留旧预设和全部报告。主动增加一轮只读测量时才加 `--remeasure`。
 
+如果标靶刻到一半失败，保留原盘和 `record/`，执行
+`discimage calibrate -o calibrations/my-batch --partial`。两轮只读测量一致后，
+临时预设保存在 `partial/disc.toml`。正式刻录在两轮共同测得的范围内再留出最外侧的 2%，
+给封盘和同批盘片的差异留余量。
+
 ## 2. 用到专辑里
 
 在 `projects/my-album/cdrw.toml` 最上方、任何表之前添加：

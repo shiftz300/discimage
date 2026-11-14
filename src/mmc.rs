@@ -31,10 +31,18 @@ impl Reply {
 
     pub fn good(self) -> Result<Self> {
         let (asc, ascq) = self.asc();
-        let detail = if self.key() == 3 && (asc, ascq) == (0x73, 3) {
-            "; drive reported a power calibration area error"
-        } else {
-            ""
+        if cfg!(target_os = "macos") && self.status == 0x05 {
+            anyhow::bail!(
+                "macOS SCSI task delivery failed (status 05); check the drive connection"
+            );
+        }
+        let detail = match (self.key(), asc, ascq) {
+            (3, 0x73, 3) => "; power calibration area error",
+            (3, 0x0c, 0) => {
+                "; medium write error, the drive may have advanced to a new writable address"
+            }
+            (3, 0x0c, 9) => "; write error after loss of streaming",
+            _ => "",
         };
         ensure!(
             self.status == 0,

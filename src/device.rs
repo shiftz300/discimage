@@ -200,6 +200,9 @@ pub trait Recorder {
     fn preflight_speed(&mut self, _speed: Option<u32>) -> Result<()> {
         Ok(())
     }
+    fn slowest_speed(&mut self) -> Result<u32> {
+        anyhow::bail!("this recorder cannot determine the lowest supported write speed")
+    }
     fn lock(&mut self) -> Result<()>;
     fn preflight_cd_text(&mut self, _title: &str, _text: &CdText) -> Result<()> {
         anyhow::bail!("this recording backend does not support CD-Text")
@@ -212,6 +215,9 @@ pub trait Recorder {
     ) -> Result<()>;
     fn verify_music(&mut self, tracks: &[Music], finalized: bool) -> Result<()>;
     fn data(&mut self, path: &Path, start: u32, sectors: u32, speed: Option<u32>) -> Result<()>;
+    fn verify_data(&mut self, _path: &Path, _start: u32, _sectors: u32) -> Result<()> {
+        anyhow::bail!("the recorder cannot verify a finalized data track")
+    }
     fn verify_data_tail(&mut self, _path: &Path, _start: u32, _sectors: u32) -> Result<()> {
         anyhow::bail!("the recorder cannot verify unreported data tail sectors")
     }

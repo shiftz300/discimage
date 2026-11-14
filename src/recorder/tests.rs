@@ -90,7 +90,113 @@ fn automatic_speed_uses_highest_descriptor_or_mmc_maximum() {
             locked: false,
         };
         recorder.speed(None).unwrap();
+        recorder.locked = true;
+        if recorder.link.write_speeds().unwrap().is_empty() {
+            assert!(device::Recorder::slowest_speed(&mut recorder).is_err());
+        } else {
+            assert_eq!(device::Recorder::slowest_speed(&mut recorder).unwrap(), 4);
+        }
+        recorder.locked = false;
     }
+}
+
+#[test]
+fn write_retries_only_a_definitely_unaccepted_command() {
+    struct Writer {
+        replies: std::collections::VecDeque<Option<(u8, usize)>>,
+        attempts: Rc<RefCell<usize>>,
+    }
+    impl Transport for Writer {
+        fn reserve(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn execute(&mut self, cdb: &[u8], _: &mut [u8], _: bool, _: u32) -> Result<Reply> {
+            // Drop releases the tray reservation.
+            if cdb[0] == 0x1e {
+                return Ok(Reply {
+                    data: Vec::new(),
+                    status: 0,
+                    sense: [0; 32],
+                    end: 0.0,
+                    duration: 0.0,
+                });
+            }
+            assert_eq!(cdb[0], 0x2a);
+            assert_eq!(&cdb[2..6], &2000u32.to_be_bytes());
+            *self.attempts.borrow_mut() += 1;
+            let (status, transferred) = self
+                .replies
+                .pop_front()
+                .unwrap()
+                .context("transport timeout")?;
+            let mut sense = [0; 32];
+            if status == 2 {
+                sense[0] = 0x70;
+                sense[2] = 3;
+                sense[12] = 0x0c;
+            }
+            Ok(Reply {
+                data: vec![0; transferred],
+                status,
+                sense,
+                end: 0.0,
+                duration: 0.0,
+            })
+        }
+    }
+    for (replies, attempts, succeeds) in [
+        (
+            vec![Some((8, 0)), Some((0x28, 0)), Some((0, COOKED))],
+            3,
+            true,
+        ),
+        (vec![Some((8, 1))], 1, false),
+        (vec![Some((5, 0))], 1, false),
+        (vec![Some((2, 0))], 1, false),
+        (vec![None], 1, false),
+    ] {
+        let seen = Rc::new(RefCell::new(0));
+        let mut recorder = Recorder {
+            id: "D:".into(),
+            link: Box::new(Writer {
+                replies: replies.into(),
+                attempts: seen.clone(),
+            }),
+            locked: true,
+        };
+        let result = recorder.write_blocks(2000, 1, &mut [0; COOKED]);
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(*seen.borrow(), attempts);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn delivery_failure_retries_cooked_read_at_the_same_lba() {
+    struct Reader(bool);
+    impl Transport for Reader {
+        fn reserve(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn execute(&mut self, cdb: &[u8], bytes: &mut [u8], write: bool, _: u32) -> Result<Reply> {
+            assert!(!write);
+            assert_eq!(cdb, [0x28, 0, 0, 0, 7, 208, 0, 0, 1, 0]);
+            let retry = std::mem::replace(&mut self.0, true);
+            Ok(Reply {
+                data: if retry { vec![42; bytes.len()] } else { vec![] },
+                status: if retry { 0 } else { 5 },
+                sense: [0; 32],
+                end: 0.0,
+                duration: 0.0,
+            })
+        }
+    }
+    let mut recorder = Recorder {
+        id: "fixture-drive".into(),
+        link: Box::new(Reader(false)),
+        locked: false,
+    };
+    assert_eq!(recorder.cooked(2000, 1).unwrap(), vec![42; COOKED]);
 }
 
 #[derive(Default)]
@@ -505,7 +611,11 @@ fn mmc_checks_cd_text_gaps_q_pcm_nwa_and_uncertain_job_state() {
             link: Box::new(Simulated(disk.clone())),
             locked: false,
         };
-        let result = burn::record(&mut recorder, &job, Some(if fault == 4 { 5 } else { 8 }));
+        let result = if fault == 0 {
+            burn::record_slowest(&mut recorder, &job)
+        } else {
+            burn::record(&mut recorder, &job, Some(if fault == 4 { 5 } else { 8 }))
+        };
         if fault == 4 {
             assert!(result.is_err());
             assert!(package::Package::load(&job).unwrap().journal.is_none());
@@ -515,6 +625,7 @@ fn mmc_checks_cd_text_gaps_q_pcm_nwa_and_uncertain_job_state() {
             continue;
         }
         let journal = Journal::load(&job).unwrap();
+        assert_eq!(journal.speed, Some(if fault == 0 { 4 } else { 8 }));
         if !matches!(fault, 0 | 5 | 7) {
             assert!(
                 result

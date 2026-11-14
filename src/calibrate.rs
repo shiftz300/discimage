@@ -127,7 +127,19 @@ pub(crate) fn prepare_single(
 /// Read a completed single-session receipt and verify its exact source image.
 pub fn single(directory: &Path) -> Result<SingleTarget> {
     let path = directory.join("single.json");
-    let receipt = read_single(&path)?;
+    verified_receipt(directory, &path)
+}
+
+pub(crate) fn pending(directory: &Path) -> Result<SingleTarget> {
+    ensure!(
+        !directory.join("single.json").try_exists()?,
+        "calibration target is complete; use normal calibration"
+    );
+    verified_receipt(directory, &directory.join("pending.json"))
+}
+
+fn verified_receipt(directory: &Path, path: &Path) -> Result<SingleTarget> {
+    let receipt = read_single(path)?;
     ensure!(
         std::fs::metadata(directory.join("calibration.iso"))?.len()
             == u64::from(receipt.written_sectors) * 2048,
@@ -138,6 +150,12 @@ pub fn single(directory: &Path) -> Result<SingleTarget> {
         "calibration image changed after recording"
     );
     Ok(receipt)
+}
+
+impl SingleTarget {
+    pub(crate) fn image_digest(&self) -> &str {
+        &self.iso_sha256
+    }
 }
 
 fn read_single(path: &Path) -> Result<SingleTarget> {

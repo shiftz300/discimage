@@ -30,6 +30,7 @@ pub(super) struct Sample {
     pub period: f64,
 }
 
+#[derive(Clone)]
 pub(super) struct Point {
     pub sample: Sample,
     pub predicted: f64,
@@ -39,6 +40,7 @@ pub(super) struct Point {
 type Vector = [f64; 3];
 type Matrix = [Vector; 3];
 
+#[derive(Clone)]
 pub(super) struct Fit {
     pub geometry: ChannelSpiral,
     pub offset: f64,
@@ -47,6 +49,7 @@ pub(super) struct Fit {
     pub points: Vec<Point>,
     pub rms_deg: f64,
     pub chi2_per_dof: f64,
+    pub rejected: Vec<u32>,
 }
 
 impl Fit {
@@ -59,6 +62,7 @@ impl Fit {
             points: Vec::new(),
             rms_deg: 0.0,
             chi2_per_dof: 0.0,
+            rejected: Vec::new(),
         }
     }
 
@@ -122,6 +126,13 @@ impl Fit {
             unwrapped: predicted + difference,
         });
         self.refit()
+    }
+
+    fn try_add(&mut self, sample: Sample) -> Result<()> {
+        let mut trial = self.clone();
+        trial.add(sample)?;
+        *self = trial;
+        Ok(())
     }
 
     fn equations(&self) -> Result<(Vector, Matrix)> {
@@ -240,6 +251,7 @@ pub(crate) fn covariance(
 pub(super) fn ladder(
     range: Range<u32>,
     reference: u32,
+    partial: bool,
     mut measure: impl FnMut(u32) -> Result<Option<Sample>>,
 ) -> Result<Fit> {
     let mut fit = Fit::new(reference);
@@ -313,8 +325,23 @@ pub(super) fn ladder(
         }
         .context("no reachable CD timing rung")?;
         tried.insert(lba);
-        if let Some(sample) = measure(lba)? {
-            fit.add(sample)?;
+        let before = fit.points.len();
+        for attempt in 1..=if partial { 2 } else { 1 } {
+            if let Some(sample) = measure(lba)? {
+                if !partial {
+                    fit.add(sample)?;
+                    break;
+                }
+                match fit.try_add(sample) {
+                    Ok(()) => break,
+                    Err(error) => console::phase(
+                        "probe",
+                        format_args!("LBA {lba}, attempt {attempt}: {error}"),
+                    ),
+                }
+            }
+        }
+        if fit.points.len() > before {
             console::phase(
                 "probe",
                 format_args!(
@@ -323,6 +350,9 @@ pub(super) fn ladder(
                     fit.rms_deg
                 ),
             );
+        } else if partial {
+            fit.rejected.push(lba);
+            console::warning(format_args!("Excluding LBA {lba} after remeasurement"));
         }
     }
     ensure!(

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use discimage::{
     author,
     burn::{self, Journal, Stage},
-    device::{Capabilities, Device, Media, Music, Recorder, Track},
+    device::{Capabilities, Device, Identity, Media, Music, Recorder, Track},
     project::CdText,
 };
 use std::{
@@ -238,6 +238,17 @@ impl Recorder for Drive {
         self.status
             .tracks
             .push(track(3, 2, i64::from(observed), length, false));
+        Ok(())
+    }
+    fn verify_data(&mut self, path: &Path, start: u32, sectors: u32) -> Result<()> {
+        assert_eq!(Journal::load(&self.job)?.stage, Stage::DataWriting);
+        assert!(!self.media().appendable);
+        assert_eq!(
+            self.status.tracks.last().unwrap().start,
+            Some(i64::from(start))
+        );
+        assert_eq!(path.metadata()?.len(), u64::from(sectors) * 2048);
+        self.calls.push("verify_data");
         Ok(())
     }
     fn verify_data_tail(&mut self, path: &Path, start: u32, sectors: u32) -> Result<()> {
@@ -942,4 +953,32 @@ fn flat_uncertain_writes_are_protected_from_retry_and_rebuild() {
         assert!(package::build(&work.project, &work.job, None, None).is_err());
         assert_eq!(calls, drive.calls.len());
     }
+}
+
+#[test]
+fn finalized_job_recovers_with_readback_after_the_same_drive_reconnects() {
+    let work = Work::new();
+    discimage::package::build(&work.project, &work.job, None, None).unwrap();
+    let mut drive = Drive::new(&work, Fault::FinalAudioReadback);
+    drive.status.hardware = Some(Identity {
+        vendor: "Fixture".into(),
+        product: "Optical drive".into(),
+        serial: "XYZ012345".into(),
+    });
+    assert!(burn::record(&mut drive, &work.job, Some(8)).is_err());
+    let saved = Journal::load(&work.job).unwrap();
+    assert_eq!(saved.stage, Stage::DataWriting);
+    let writes = drive.writes();
+    drive.status.id = "reconnected-drive".into();
+    drive.fault = Fault::None;
+    let recovered = burn::record(&mut drive, &work.job, None).unwrap();
+    assert_eq!(recovered.stage, Stage::Complete);
+    assert_eq!(recovered.device, saved.device);
+    assert_eq!(recovered.observed.id, drive.status.id);
+    assert_eq!(drive.writes(), writes);
+    assert!(
+        drive
+            .calls
+            .ends_with(&["lock", "verify_data", "verify_final_music"])
+    );
 }

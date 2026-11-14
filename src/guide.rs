@@ -25,6 +25,9 @@ pub struct Options {
     /// Repeat only the read-only measurement, preserving previous reports.
     #[arg(long, conflicts_with = "timing")]
     remeasure: bool,
+    /// Measure an interrupted target in place, using only its readable prefix.
+    #[arg(long, conflicts_with_all = ["bundle", "timing", "speed", "write", "photo", "points"])]
+    partial: bool,
     /// Requested CD speed multiplier; omit for the drive-selected maximum.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
     speed: Option<u32>,
@@ -81,6 +84,15 @@ pub fn run(options: Options) -> Result<()> {
     } else {
         crate::selection::preferred(options.device.as_deref())?
     };
+    if options.partial {
+        return partial(
+            &directory,
+            &bundle,
+            &name,
+            selected.as_deref(),
+            options.remeasure,
+        );
+    }
     if !bundle.try_exists()? {
         ensure!(
             options.bundle.is_none() && options.timing.is_empty(),
@@ -136,7 +148,7 @@ pub fn run(options: Options) -> Result<()> {
     }
     ensure!(
         bundle.join("single.json").try_exists()?,
-        "Target write is not confirmed complete; no erase or rewrite attempted. Inspect the disc and {}",
+        "Target write is not confirmed complete; no erase or rewrite attempted. Keep the original disc and rerun with --partial to attempt read-only recovery. Target files: {}",
         bundle.display()
     );
     let recording = calibrate::single(&bundle)?;
@@ -209,6 +221,56 @@ pub fn run(options: Options) -> Result<()> {
             "Without photo points, the length scale assumes a 58 mm outer recording radius. Photo refinement preserves the timing-derived angular mapping."
         );
     }
+    Ok(())
+}
+
+fn partial(
+    directory: &Path,
+    bundle: &Path,
+    name: &str,
+    selector: Option<&str>,
+    remeasure: bool,
+) -> Result<()> {
+    let drives = device::list()?;
+    let drive = match selector {
+        Some(selector) => device::resolve(&drives, selector)?,
+        None => {
+            let [drive] = drives.as_slice() else {
+                anyhow::bail!("select the drive holding the interrupted target");
+            };
+            drive
+        }
+    };
+    let work = directory.join("partial");
+    std::fs::create_dir_all(&work)?;
+    let measurement = work.join("timing");
+    let mut force = remeasure;
+    let reports = loop {
+        let reports = measurements(&work)?;
+        if reports.len() >= 2 && !force {
+            break reports;
+        }
+        if measurement.try_exists()? {
+            archive(&measurement)?;
+        }
+        println!(
+            "[probe] Partial target on {} | read-only round {}",
+            drive.name,
+            reports.len() + 1
+        );
+        probe::acquire_partial(&drive.id, &measurement, bundle)?;
+        force = false;
+    };
+    let output = work.join("disc.toml");
+    timing::partial_preset(&reports, bundle, name, drive, &output)?;
+    println!(
+        "Provisional preset saved to {}, name {:?}.",
+        output.display(),
+        name
+    );
+    println!(
+        "Recording stays within the common measured range with extra outer-edge clearance. Check physical artwork on the first disc."
+    );
     Ok(())
 }
 

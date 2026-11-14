@@ -288,28 +288,59 @@ pub fn preset(
     points: Option<&Path>,
     output: &Path,
 ) -> Result<()> {
+    export_preset(summaries, target, name, points, output, None)
+}
+
+/// Export only the common measured span of an interrupted target.
+pub fn partial_preset(
+    summaries: &[std::path::PathBuf],
+    target: &Path,
+    name: &str,
+    drive: &crate::device::Device,
+    output: &Path,
+) -> Result<()> {
+    export_preset(summaries, target, name, None, output, Some(drive))
+}
+
+fn export_preset(
+    summaries: &[std::path::PathBuf],
+    target: &Path,
+    name: &str,
+    points: Option<&Path>,
+    output: &Path,
+    partial_drive: Option<&crate::device::Device>,
+) -> Result<()> {
     use crate::project::{Disc, Medium, Profile};
     use std::io::Write;
     ensure!(
         !name.trim().is_empty() && name.len() <= 128,
         "expected a medium name of 1–128 bytes"
     );
-    let recording = crate::calibrate::single(target)?;
-    let drive = recording
-        .drive
-        .as_ref()
+    let recording = if partial_drive.is_some() {
+        crate::calibrate::pending(target)?
+    } else {
+        crate::calibrate::single(target)?
+    };
+    let drive = partial_drive
+        .or(recording.drive.as_ref())
         .context("target receipt has no media identity; use a newly recorded target")?;
     let medium = match drive.media.as_ref().map(|m| m.kind.as_str()) {
         Some("cd-r") => Medium::Cdr,
         Some("cd-rw") => Medium::Cdrw,
         _ => anyhow::bail!("target receipt must identify CD-R or CD-RW"),
     };
-    let target_hash = crate::calibrate::digest(target)?;
+    let target_hash = if partial_drive.is_some() {
+        recording.image_digest().to_owned()
+    } else {
+        crate::calibrate::digest(target)?
+    };
     let assessment = assess(summaries)?;
     for path in summaries {
+        let round = measurement(path)?;
         ensure!(
-            measurement(path)?.bounds[1] < recording.written_sectors,
-            "repeat measurement extends outside the recorded target"
+            round.bounds[1] < recording.written_sectors
+                && (round.summary["partial_target"] == true) == partial_drive.is_some(),
+            "repeat measurement does not match the calibration target mode or extent"
         );
     }
     for (i, round) in assessment.rounds.iter().enumerate() {
@@ -398,6 +429,13 @@ pub fn preset(
     let shift = f64::from(READ_TAIL_FRAMES);
     // read_end(lba)=(lba+1)*B+108*F; with K=108 the encoder coordinate is lba+1.
     let [first, end] = assessment.encoding_range;
+    // Keep additional room for session finalization and batch variation when
+    // the source target already exhibited an outer-disc write failure.
+    let write_end = if partial_drive.is_some() {
+        end - (end - first).div_ceil(50)
+    } else {
+        end
+    };
     let old = Disc {
         media: Some(medium),
         capacity_sectors: recording.reference_sectors,
@@ -409,7 +447,12 @@ pub fn preset(
     let mut verification = toml::Table::new();
     verification.insert(
         "status".into(),
-        "timing-derived; physical validation pending".into(),
+        if partial_drive.is_some() {
+            "provisional from a partial target; physical validation pending"
+        } else {
+            "timing-derived; physical validation pending"
+        }
+        .into(),
     );
     verification.insert("drive".into(), drive.name.clone().into());
     verification.insert("media".into(), medium.kind().into());
@@ -420,6 +463,9 @@ pub fn preset(
     verification.insert("summary_sha256".into(), summary_hash.clone().into());
     verification.insert("targets_sha256".into(), targets_hash.into());
     verification.insert("timing_rms_deg".into(), fit.residual_rms_deg.into());
+    if partial_drive.is_some() {
+        verification.insert("write_end_sector".into(), i64::from(write_end).into());
+    }
     verification.insert("quality".into(), toml::Value::try_from(&assessment)?);
     if let Some(speed) = recording.speed {
         verification.insert("requested_speed".into(), i64::from(speed).into());
@@ -489,7 +535,7 @@ pub fn preset(
             .map(|(_, r)| r.summary_sha256.clone())
             .collect(),
     });
-    disc.limit_end(end);
+    disc.limit_end(write_end);
     let table = |value| toml::Value::Table(toml::Table::from_iter([(name.into(), value)]));
     let mut catalog = toml::Table::from_iter([
         ("format".into(), "discimage-timing-preset-v1".into()),

@@ -86,8 +86,42 @@ impl Recorder {
     }
 
     fn raw(&mut self, cdb: &[u8], capacity: usize, timeout: u32) -> Result<Reply> {
-        self.link
-            .execute(cdb, &mut vec![0; capacity], false, timeout)
+        self.command(cdb, &mut vec![0; capacity], false, timeout)
+    }
+
+    fn command(
+        &mut self,
+        cdb: &[u8],
+        bytes: &mut [u8],
+        write: bool,
+        timeout: u32,
+    ) -> Result<Reply> {
+        for delay in [Some(100), Some(250), Some(500), None] {
+            let reply = self.link.execute(cdb, bytes, write, timeout)?;
+            // BUSY and TASK SET FULL leave the command unaccepted. A delivery
+            // failure leaves a write's outcome uncertain, but a read can be repeated.
+            let Some(delay) = delay.filter(|_| {
+                (matches!(reply.status, 0x08 | 0x28)
+                    || (cfg!(target_os = "macos")
+                        && !write
+                        && matches!(cdb[0], 0x28 | 0xbe)
+                        && reply.status == 0x05))
+                    && reply.data.is_empty()
+                    && !device::cancelled()
+            }) else {
+                return Ok(reply);
+            };
+            console::phase(
+                "retry",
+                format_args!(
+                    "MMC command {:02x} returned status {:02x}; retrying in {delay} ms",
+                    cdb[0], reply.status
+                ),
+            );
+            std::thread::sleep(Duration::from_millis(delay));
+            check_cancel()?;
+        }
+        unreachable!("final attempt always returns")
     }
 
     fn read(&mut self, cdb: &[u8], capacity: usize) -> Result<Vec<u8>> {
@@ -98,7 +132,7 @@ impl Recorder {
     }
 
     fn send(&mut self, cdb: &[u8], bytes: &mut [u8], timeout: u32) -> Result<()> {
-        let reply = self.link.execute(cdb, bytes, true, timeout)?;
+        let reply = self.command(cdb, bytes, true, timeout)?;
         let reply = reply.good().with_context(|| {
             format!(
                 "MMC command {:02x} on {}; inspect the saved job before retrying",
@@ -309,8 +343,6 @@ impl Recorder {
         cdb[0] = 0x2a;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[7..9].copy_from_slice(&(blocks as u16).to_be_bytes());
-        // A failed / uncertain write is never resent, even if the driver reports
-        // BUSY or unit attention. The journal remains in its writing stage.
         self.send(&cdb, bytes, 120)
             .with_context(|| format!("WRITE(10) at LBA {lba}, {blocks} sectors"))
     }
@@ -371,7 +403,9 @@ impl Recorder {
         cdb[0] = 0x28;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[7..9].copy_from_slice(&(count as u16).to_be_bytes());
-        let bytes = self.read(&cdb, count as usize * COOKED)?;
+        let bytes = self
+            .read(&cdb, count as usize * COOKED)
+            .with_context(|| format!("READ(10) at LBA {lba}, {count} sectors"))?;
         ensure!(
             bytes.len() == count as usize * COOKED,
             "short data readback at LBA {lba}"
@@ -606,6 +640,19 @@ impl device::Recorder for Recorder {
         Ok(())
     }
 
+    fn slowest_speed(&mut self) -> Result<u32> {
+        ensure!(self.locked, "speed discovery requires the reserved disc");
+        let sectors =
+            self.link.write_speeds()?.into_iter().min().context(
+                "drive did not report supported write speeds; specify a verified --speed",
+            )?;
+        ensure!(
+            (75..=4800).contains(&sectors) && sectors.is_multiple_of(75),
+            "lowest write speed is {sectors} sectors/s and cannot be expressed as an integer CD speed"
+        );
+        Ok(sectors / 75)
+    }
+
     fn lock(&mut self) -> Result<()> {
         if !self.locked {
             self.link.reserve()?;
@@ -773,6 +820,11 @@ impl device::Recorder for Recorder {
         self.write_data(path, start, sectors, speed)
     }
 
+    fn verify_data(&mut self, path: &Path, start: u32, sectors: u32) -> Result<()> {
+        ensure!(self.locked, "data verification requires a reserved disc");
+        Recorder::verify_data(self, path, start, sectors)
+    }
+
     fn verify_data_tail(&mut self, path: &Path, start: u32, sectors: u32) -> Result<()> {
         ensure!(sectors >= 2, "invalid tail extent");
         let mut file = File::open(path)?;
@@ -934,7 +986,14 @@ pub(crate) fn record_calibration(
     let count = crate::calibrate::prepare_single(directory, capacity, device::cancelled)?;
     let path = directory.join("calibration.iso");
     let digest = author::digest(&path)?;
-    recorder.write_data(&path, 0, count, speed)?;
+    if let Err(error) = recorder.write_data(&path, 0, count, speed) {
+        if let Err(save) = std::fs::write(directory.join("error.txt"), format!("{error:#}\n")) {
+            console::warning(format_args!(
+                "Could not save the target write error: {save}"
+            ));
+        }
+        return Err(error).context("target write stopped; keep the original disc and use calibrate --partial for read-only recovery");
+    }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let after = recorder.observe()?;

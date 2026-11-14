@@ -67,6 +67,9 @@ enum Commands {
         /// Write speed multiplier; frozen once recording starts. Omit for automatic.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
         speed: Option<u32>,
+        /// Use the lowest write speed reported for the reserved disc and drive.
+        #[arg(long, conflicts_with = "speed")]
+        slowest: bool,
     },
     /// Export disc/strip artwork templates from the album's actual WAV lengths.
     Template {
@@ -371,7 +374,8 @@ fn run(cli: Cli) -> Result<()> {
             directory,
             device,
             speed,
-        } => resume_job(&directory, device.as_deref(), speed)?,
+            slowest,
+        } => resume_job(&directory, device.as_deref(), speed, slowest)?,
         Commands::Template {
             project,
             output,
@@ -585,7 +589,7 @@ fn completions(shell: clap_complete::Shell, output: &mut impl std::io::Write) ->
     Ok(())
 }
 
-fn resume_job(directory: &Path, id: Option<&str>, speed: Option<u32>) -> Result<()> {
+fn resume_job(directory: &Path, id: Option<&str>, speed: Option<u32>, slowest: bool) -> Result<()> {
     let flat = directory.join("manifest.toml").try_exists()?;
     let saved = if flat {
         Package::load(directory)?.journal
@@ -599,24 +603,33 @@ fn resume_job(directory: &Path, id: Option<&str>, speed: Option<u32>) -> Result<
     };
     if let Some(saved) = &saved {
         ensure!(
-            matches!(
-                saved.stage,
-                burn::Stage::Prepared | burn::Stage::MusicWritten | burn::Stage::DataReady
-            ),
+            saved.stage.resumable(),
             "stage {:?} cannot be resumed automatically; no write attempted",
             saved.stage
         );
     }
     let selected = if let Some(saved) = &saved {
-        if let Some(id) = id {
+        if saved.stage == burn::Stage::DataWriting
+            && let Some(hardware) = saved.observed.hardware_id()
+        {
+            let drives = device::list()?;
+            let drive = device::resolve(&drives, id.unwrap_or(&hardware))?;
             ensure!(
+                drive.hardware_id().as_ref() == Some(&hardware),
+                "--device does not match the saved recording drive hardware ID"
+            );
+            drive.id.clone()
+        } else {
+            if let Some(id) = id {
+                ensure!(
                 device::resolve_id(id).context(
                     "--device does not match the recording job's saved drive or is not connected"
                 )? == saved.device,
                 "--device does not match the recording's saved drive"
             );
+            }
+            saved.device.clone()
         }
-        saved.device.clone()
     } else {
         let selector = selection::preferred(id)?;
         let drives = device::list()?;
@@ -628,7 +641,11 @@ fn resume_job(directory: &Path, id: Option<&str>, speed: Option<u32>) -> Result<
     };
     let mut recorder = device::recorder(&selected)?;
     device::install_cancel_handler()?;
-    let journal = burn::record(&mut *recorder, directory, speed)?;
+    let journal = if slowest {
+        burn::record_slowest(&mut *recorder, directory)?
+    } else {
+        burn::record(&mut *recorder, directory, speed)?
+    };
     recording_complete(&journal, directory);
     Ok(())
 }
@@ -842,6 +859,11 @@ mod tests {
 
     #[test]
     fn recording_speed_defaults_to_auto_and_validates_explicit_values() {
+        assert!(Cli::try_parse_from(["discimage", "burn", "job", "--slowest"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["discimage", "burn", "job", "--slowest", "--speed", "10"])
+                .is_err()
+        );
         for (value, valid) in [("0", false), ("65", false), ("10", true)] {
             assert_eq!(
                 Cli::try_parse_from(["discimage", "burn", "job", "--speed", value]).is_ok(),

@@ -86,7 +86,10 @@ discimage burn projects/my-album/output/cdrw
 discimage devices
 ```
 
-Speed is automatic unless explicitly set with `--speed N`. The program checks
+Use `--slowest` to request the lowest write speed reported for the inserted disc,
+or `--speed N` for a known supported speed. With neither option, speed is automatic.
+If the drive does not report supported speeds, `--slowest` stops before writing.
+The program checks
 the audio samples, silence and Q subchannel track indexes before appending data
 at the actual NWA, then repeats the audio checks after finalization. The drive
 must support raw P–W or formatted Q readback. Keep it connected throughout.
@@ -98,12 +101,17 @@ For another blank disc, rebuild the album before burning again.
 
 ## Recovery
 
+The recorder retries commands explicitly rejected as busy or queue full, with
+a bounded backoff. A medium write error or an unknown command outcome stops the
+job and preserves its journal.
+
 | Situation | Action |
 | --- | --- |
 | No blank writable disc | Replace CD-R, or explicitly erase CD-RW |
 | Wrong media preset | Select the matching configuration; do not bypass the check |
 | Confirmed intermediate state | Keep the same disc/drive/package and rerun `burn PACKAGE` |
-| `music_writing` / `data_writing` uncertain | Preserve the journal and inspect the disc before retrying |
+| `data_writing` interrupted after finalization | Keep the same disc and rerun `burn PACKAGE` to verify all data and audio without writing |
+| Interrupted write without a matching finalized disc | Preserve the journal and inspect the disc |
 | Build refuses replacement | Check for an unfinished recording or extra files; preserve recovery evidence |
 
 ## Image export, local checks and CD-Text

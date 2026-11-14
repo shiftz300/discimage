@@ -164,9 +164,10 @@ char *discimage_macos_query(const char *json, int (*cancelled)(void)) {
             NSString *path=request[@"device"];
             DRDevice *device=Find(path);
             if ([op isEqual:@"probe"]) result=Snapshot(device);
-            else if ([op isEqual:@"media_node"] || [op isEqual:@"probe_node"]) {
+            else if ([op isEqual:@"media_node"] || [op isEqual:@"probe_node"] || [op isEqual:@"partial_probe_node"]) {
                 BOOL timing=[op isEqual:@"probe_node"];
-                NSDictionary *snapshot=timing ? ReadySnapshot(device,cancelled) : Snapshot(device);
+                BOOL probing=timing || [op isEqual:@"partial_probe_node"];
+                NSDictionary *snapshot=probing ? ReadySnapshot(device,cancelled) : Snapshot(device);
                 id media=snapshot[@"media"];
                 Require([media isKindOfClass:[NSDictionary class]],@"No ready optical medium");
                 if (timing) {

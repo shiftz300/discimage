@@ -128,8 +128,15 @@ fn unmount(id: &str, op: &str) -> Result<Node> {
     Ok(after)
 }
 
-pub(crate) fn prepare_probe(id: &str) -> Result<()> {
-    unmount(id, "probe_node")?;
+pub(crate) fn prepare_probe(id: &str, partial: bool) -> Result<()> {
+    unmount(
+        id,
+        if partial {
+            "partial_probe_node"
+        } else {
+            "probe_node"
+        },
+    )?;
     Ok(())
 }
 

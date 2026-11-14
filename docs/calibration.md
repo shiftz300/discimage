@@ -28,6 +28,12 @@ Rerun the same command to continue. Completed targets are not rewritten.
 Uncertain writes stop. Disagreement preserves the previous preset and reports.
 Use `--remeasure` only to request one additional read-only round.
 
+If target writing stopped partway, keep the same disc and run
+`discimage calibrate -o calibrations/my-batch --partial`. If two independent
+measurements agree, `partial/disc.toml` contains a provisional preset. It leaves
+an additional 2% of the shared measured span unused at the outer edge for
+finalization and batch variation. Keep `record/` with the original image and receipt.
+
 ## 2. Use the preset
 
 At the top of `projects/my-album/cdrw.toml`, before any table:

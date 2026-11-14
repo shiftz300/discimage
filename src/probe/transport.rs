@@ -20,7 +20,7 @@ pub(crate) enum Command {
     Capacity,
     Toc,
     Disc,
-    Track,
+    TrackNumber(#[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))] u8),
     Speed,
     Flush(u32),
     Read {
@@ -63,16 +63,16 @@ impl Command {
                 bytes[0] = 0x25;
                 (10, 8)
             }
-            Self::Toc | Self::Disc | Self::Track => {
+            Self::Toc | Self::Disc | Self::TrackNumber(_) => {
                 let (op, length) = match self {
                     Self::Toc => (0x43, 2048u16),
                     Self::Disc => (0x51, 34),
                     _ => (0x52, 48),
                 };
                 bytes[0] = op;
-                if matches!(self, Self::Track) {
+                if let Self::TrackNumber(number) = self {
                     bytes[1] = 1; // Address is a track number.
-                    bytes[5] = 1;
+                    bytes[5] = number;
                 }
                 bytes[7..9].copy_from_slice(&length.to_be_bytes());
                 (10, usize::from(length))
