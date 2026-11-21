@@ -78,11 +78,20 @@ pub(crate) struct Recorder {
 
 impl Recorder {
     pub(crate) fn new(id: &str) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::with_transport(id, open_transport(id)?))
+    }
+
+    fn with_transport(id: &str, link: Box<dyn Transport>) -> Self {
+        Self {
             id: native_id(id),
-            link: open_transport(id)?,
+            link,
             locked: false,
-        })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn read_metadata(id: &str, link: Box<dyn Transport>) -> Result<Device> {
+        Self::with_transport(id, link).observe()
     }
 
     fn raw(&mut self, cdb: &[u8], capacity: usize, timeout: u32) -> Result<Reply> {

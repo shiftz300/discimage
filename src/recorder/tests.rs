@@ -445,6 +445,37 @@ impl Disc {
 
 struct Simulated(Rc<RefCell<Disc>>);
 
+#[cfg(target_os = "macos")]
+#[test]
+fn registry_fallback_reads_blank_media_without_reserving_it() {
+    struct ReadOnly(Simulated);
+
+    impl Transport for ReadOnly {
+        fn reserve(&mut self) -> Result<()> {
+            panic!("drive discovery must not reserve the medium");
+        }
+
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            bytes: &mut [u8],
+            write: bool,
+            timeout: u32,
+        ) -> Result<Reply> {
+            assert!(!write);
+            assert!(matches!(cdb[0], 0 | 0x12 | 0x46 | 0x51 | 0x52));
+            self.0.execute(cdb, bytes, write, timeout)
+        }
+    }
+
+    let id = "IOService:/fixture/optical";
+    let disc = Rc::new(RefCell::new(Disc::default()));
+    let drive = Recorder::read_metadata(id, Box::new(ReadOnly(Simulated(disc.clone())))).unwrap();
+    assert_eq!(drive.id, id);
+    assert_eq!(burn::select_blank(&[drive]).unwrap().id, id);
+    assert!(!disc.borrow().reserved);
+}
+
 impl Transport for Simulated {
     fn write_speeds(&mut self) -> Result<Vec<u32>> {
         Ok(vec![300, 600, 750])

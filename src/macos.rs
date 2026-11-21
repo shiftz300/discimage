@@ -3,7 +3,7 @@ use crate::{
     console,
     device::{self, Device},
     mmc::Reply,
-    recorder::Transport,
+    recorder::{Recorder, Transport},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -18,6 +18,18 @@ unsafe extern "C" {
     fn discimage_macos_query(json: *const c_char, cancelled: extern "C" fn() -> i32)
     -> *mut c_char;
     fn discimage_free(value: *mut c_char);
+    fn discimage_probe_open(path: *const c_char, error: *mut i32, exclusive: bool) -> *mut c_void;
+    fn discimage_read_metadata(
+        handle: *mut c_void,
+        cdb: *const u8,
+        length: u8,
+        data: *mut u8,
+        capacity: u32,
+        used: *mut u32,
+        status: *mut u8,
+        sense: *mut u8,
+        times: *mut u64,
+    ) -> i32;
     fn discimage_record_open(path: *const c_char, error: *mut i32) -> *mut c_void;
     fn discimage_probe_close(handle: *mut c_void);
     fn discimage_record_command(
@@ -62,22 +74,49 @@ fn identify(drive: &mut Device) {
     }
 }
 
+#[derive(Deserialize)]
+struct Discovery {
+    #[serde(flatten)]
+    drive: Device,
+    #[serde(default)]
+    iokit_only: bool,
+}
+
+impl Discovery {
+    fn observe(&mut self) -> Result<()> {
+        if self.iokit_only {
+            let id = &self.drive.id;
+            let link = MetadataLink::open(id)?;
+            let mut drive = Recorder::read_metadata(id, Box::new(link))?;
+            drive.hardware = drive.hardware.or_else(|| self.drive.hardware.clone());
+            self.drive = drive;
+        } else {
+            identify(&mut self.drive);
+        }
+        Ok(())
+    }
+}
+
 fn snapshot(id: &str) -> Result<Device> {
-    let mut drive = query(json!({"op":"probe","device":id}))?;
-    identify(&mut drive);
-    Ok(drive)
+    let mut item: Discovery = query(json!({"op":"probe","device":id}))?;
+    item.observe()?;
+    Ok(item.drive)
 }
 
 pub(crate) fn devices() -> Result<Vec<Device>> {
     #[derive(Deserialize)]
     struct Devices {
-        devices: Vec<Device>,
+        devices: Vec<Discovery>,
     }
-    let mut drives = query::<Devices>(json!({"op":"list"}))?.devices;
-    for drive in &mut drives {
-        identify(drive);
-    }
-    Ok(drives)
+    let discovered = query::<Devices>(json!({"op":"list"}))?.devices;
+    Ok(discovered
+        .into_iter()
+        .map(|mut item| {
+            // Keep a busy registry drive visible, but report no guessed capabilities.
+            let _ = item.observe();
+            item.drive
+        })
+        .collect())
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -86,11 +125,39 @@ struct Node {
     media_id: u64,
 }
 
+#[derive(Deserialize)]
+struct DiscoveredNode {
+    #[serde(flatten)]
+    node: Node,
+    #[serde(default)]
+    iokit_only: bool,
+}
+
 // Unmount only the selected disc. Recheck its I/O Registry identity before
 // opening the exclusive user client; never unmount a replacement volume.
 fn unmount(id: &str, op: &str) -> Result<Node> {
     let request = json!({"op":op,"device":id});
-    let before: Node = query(request.clone())?;
+    let DiscoveredNode {
+        node: before,
+        iokit_only,
+    } = query(request.clone())?;
+    if iokit_only {
+        let drive = snapshot(id)?;
+        let media = drive.media.as_ref().context("No ready optical medium")?;
+        if op == "probe_node" {
+            ensure!(
+                !media.blank
+                    && !media.appendable
+                    && media.sessions == 1
+                    && matches!(drive.tracks.as_slice(), [track] if !track.audio),
+                "Expected the finalized single-data-track target before unmounting"
+            );
+        }
+        ensure!(
+            before == query::<Node>(request.clone())?,
+            "selected optical medium changed before unmounting"
+        );
+    }
     if let Some(name) = &before.bsd_name {
         let bsd = device::whole_bsd_name(name).context("invalid optical whole-disc BSD name")?;
         console::phase(
@@ -138,6 +205,82 @@ pub(crate) fn prepare_probe(id: &str, partial: bool) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+struct MetadataLink(*mut c_void);
+
+impl MetadataLink {
+    fn open(id: &str) -> Result<Self> {
+        let path = CString::new(id)?;
+        let mut error = 0;
+        let handle = unsafe { discimage_probe_open(path.as_ptr(), &mut error, false) };
+        ensure!(
+            !handle.is_null(),
+            "cannot query optical drive {id} (IOKit 0x{:08x})",
+            error as u32
+        );
+        Ok(Self(handle))
+    }
+}
+
+impl Transport for MetadataLink {
+    fn reserve(&mut self) -> Result<()> {
+        anyhow::bail!("optical metadata access cannot reserve media")
+    }
+
+    fn execute(&mut self, cdb: &[u8], bytes: &mut [u8], write: bool, _: u32) -> Result<Reply> {
+        ensure!(
+            !write && matches!(cdb.len(), 6 | 10) && bytes.len() <= 4096,
+            "invalid read-only MMC metadata request"
+        );
+        let (mut used, mut status, mut sense, mut times) = (0, 0, [0; 32], [0; 2]);
+        let error = unsafe {
+            discimage_read_metadata(
+                self.0,
+                cdb.as_ptr(),
+                cdb.len() as u8,
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                &mut used,
+                &mut status,
+                sense.as_mut_ptr(),
+                times.as_mut_ptr(),
+            )
+        };
+        ensure!(
+            error == 0,
+            "macOS IOKit metadata command {:02x} failed (0x{:08x})",
+            cdb[0],
+            error as u32
+        );
+        response(bytes, used, status, sense, times)
+    }
+}
+
+impl Drop for MetadataLink {
+    fn drop(&mut self) {
+        unsafe { discimage_probe_close(self.0) };
+    }
+}
+
+fn response(
+    bytes: &[u8],
+    used: u32,
+    status: u8,
+    sense: [u8; 32],
+    times: [u64; 2],
+) -> Result<Reply> {
+    ensure!(
+        used as usize <= bytes.len() && times[1] >= times[0],
+        "invalid MMC response"
+    );
+    Ok(Reply {
+        data: bytes[..used as usize].to_vec(),
+        status,
+        sense,
+        end: times[1] as f64 * 1e-9,
+        duration: (times[1] - times[0]) as f64 * 1e-9,
+    })
 }
 
 pub(crate) struct RecordingLink {
@@ -269,17 +412,7 @@ impl Transport for RecordingLink {
             cdb[0],
             error as u32
         );
-        ensure!(
-            used as usize <= bytes.len() && times[1] >= times[0],
-            "invalid MMC response"
-        );
-        Ok(Reply {
-            data: bytes[..used as usize].to_vec(),
-            status,
-            sense,
-            end: times[1] as f64 * 1e-9,
-            duration: (times[1] - times[0]) as f64 * 1e-9,
-        })
+        response(bytes, used, status, sense, times)
     }
 }
 

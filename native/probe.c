@@ -24,20 +24,8 @@ static void release_probe(struct Probe *probe) {
     free(probe);
 }
 
-static bool is_optical_service(io_registry_entry_t entry, const void *context) {
-    (void)context;
-    return IOObjectConformsTo(entry, "IOCompactDiscServices") ||
-           IOObjectConformsTo(entry, "IODVDServices") ||
-           IOObjectConformsTo(entry, "IOBDServices");
-}
-
 static io_service_t optical_service(const char *bsd) {
-    if (strncmp(bsd, "IOService:", 10) == 0) {
-        io_service_t service = IORegistryEntryFromPath(kIOMainPortDefault, bsd);
-        if (service && is_optical_service(service, NULL)) return service;
-        if (service) IOObjectRelease(service);
-        return IO_OBJECT_NULL;
-    }
+    if (strncmp(bsd, "IOService:", 10) == 0) return optical_service_at_path(bsd);
     CFMutableDictionaryRef match = IOBSDNameMatching(kIOMainPortDefault, 0, bsd);
     if (!match) return IO_OBJECT_NULL;
     io_registry_entry_t entry = IOServiceGetMatchingService(kIOMainPortDefault, match);
@@ -150,32 +138,58 @@ static int32_t execute(struct Probe *probe, uint8_t *cdb, uint8_t length, uint8_
     return rc;
 }
 
+// The non-exclusive MMC interface can read metadata while macOS owns the
+// disc. It does not expose raw SCSI tasks or any data-out operations here.
+int32_t discimage_read_metadata(void *handle, const uint8_t *cdb, uint8_t length,
+                                uint8_t *data, uint32_t capacity, uint32_t *used,
+                                uint8_t *status, uint8_t sense[32], uint64_t times[2]) {
+    struct Probe *probe = handle;
+    if (probe->exclusive || probe->recording) return kIOReturnNotPermitted;
+    if (length != 6 && length != 10) return kIOReturnBadArgument;
+    SCSI_Sense_Data sense_data = {0};
+    SCSITaskStatus task_status = 0;
+    IOReturn rc;
+    times[0] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (length == 6 && cdb[0] == 0x12 && cdb[1] == 0 &&
+        cdb[2] == 0 && cdb[3] == 0 && cdb[4] == 36 && cdb[5] == 0 && capacity == 36) {
+        rc = (*probe->mmc)->Inquiry(probe->mmc, (SCSICmd_INQUIRY_StandardData *)data,
+                                    capacity, &task_status, &sense_data);
+    } else if (length == 6 && capacity == 0 && memcmp(cdb, (uint8_t[6]){0}, 6) == 0) {
+        rc = (*probe->mmc)->TestUnitReady(probe->mmc, &task_status, &sense_data);
+    } else if (length == 10 && cdb[0] == 0x46 &&
+               ((cdb[1] == 2 && cdb[2] == 1 && cdb[3] == 8 && capacity == 512) ||
+                (cdb[1] == 0 && cdb[2] == 0 && cdb[3] == 0 && capacity == 4096)) &&
+               cdb[4] == 0 && cdb[5] == 0 && cdb[6] == 0 && cdb[7] == (capacity >> 8) &&
+               cdb[8] == 0 && cdb[9] == 0) {
+        uint16_t feature = ((uint16_t)cdb[2] << 8) | cdb[3];
+        rc = (*probe->mmc)->GetConfiguration(probe->mmc, cdb[1], feature, data,
+                                              capacity, &task_status, &sense_data);
+    } else if (length == 10 && capacity == 34 &&
+               memcmp(cdb, (uint8_t[10]){0x51, 0, 0, 0, 0, 0, 0, 0, 34, 0}, 10) == 0) {
+        rc = (*probe->mmc)->ReadDiscInformation(probe->mmc, data, capacity,
+                                                &task_status, &sense_data);
+    } else if (length == 10 && cdb[0] == 0x52 && cdb[1] == 1 && capacity == 48 &&
+               cdb[2] == 0 && cdb[3] == 0 && cdb[4] == 0 &&
+               ((cdb[5] >= 1 && cdb[5] <= 99) || cdb[5] == 0xff) &&
+               cdb[6] == 0 && cdb[7] == 0 && cdb[8] == 48 && cdb[9] == 0) {
+        rc = (*probe->mmc)->ReadTrackInformation(probe->mmc, 1, cdb[5], data, capacity,
+                                                 &task_status, &sense_data);
+    } else return kIOReturnNotPermitted;
+    times[1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    *status = (uint8_t)task_status;
+    *used = rc == kIOReturnSuccess && task_status == kSCSITaskStatus_GOOD ? capacity : 0;
+    memcpy(sense, &sense_data, sizeof(sense_data) < 32 ? sizeof(sense_data) : 32);
+    return rc;
+}
+
 int32_t discimage_probe_read(void *handle, uint8_t *cdb, uint8_t length, uint8_t *data,
                              uint32_t capacity, uint32_t *used, uint8_t *status,
                              uint8_t sense[32], uint64_t times[2]) {
     if (length == 0 || !allowed(cdb, length, capacity)) return kIOReturnBadArgument;
     struct Probe *probe = handle;
     if (probe->recording) return kIOReturnNotPermitted;
-    if (!probe->exclusive) {
-        SCSI_Sense_Data sense_data = {0};
-        SCSITaskStatus task_status = 0;
-        IOReturn rc;
-        times[0] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        if (cdb[0] == 0x12 && cdb[1] == 0) {
-            rc = (*probe->mmc)->Inquiry(probe->mmc, (SCSICmd_INQUIRY_StandardData *)data,
-                                        capacity, &task_status, &sense_data);
-        } else if (cdb[0] == 0x46 && cdb[1] == 2 && cdb[2] == 1 && cdb[3] == 8 &&
-                   cdb[4] == 0 && cdb[5] == 0 && cdb[6] == 0 && cdb[7] == 2 &&
-                   cdb[8] == 0 && cdb[9] == 0 && capacity == 512) {
-            rc = (*probe->mmc)->GetConfiguration(probe->mmc, 2, 0x0108, data,
-                                                  (SCSICmdField2Byte)capacity, &task_status, &sense_data);
-        } else return kIOReturnNotPermitted;
-        times[1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        *status = (uint8_t)task_status;
-        *used = rc == kIOReturnSuccess && task_status == kSCSITaskStatus_GOOD ? capacity : 0;
-        memcpy(sense, &sense_data, sizeof(sense_data) < 32 ? sizeof(sense_data) : 32);
-        return rc;
-    }
+    if (!probe->exclusive)
+        return discimage_read_metadata(handle, cdb, length, data, capacity, used, status, sense, times);
     return execute(probe, cdb, length, data, capacity, false, 5, used, status, sense, times);
 }
 

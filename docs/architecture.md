@@ -54,7 +54,8 @@ Photo radial fitting scales radii and velocity together; phase fitting exports
 a separate candidate. [Criteria](timing.md).
 
 The same MMC recorder handles burn, erase and calibration targets on macOS and
-Windows. macOS uses IOKit exclusive optical tasks and obtains discovery metadata
-from DiscRecording. Windows transports the same commands through IMAPI2. The
-timing probe has a separate bounded read interface on each platform.
+Windows. macOS uses IOKit exclusive optical tasks. It obtains discovery metadata
+from DiscRecording and falls back to the I/O Registry and read-only MMC queries
+for missing drives. Windows transports the same commands through IMAPI2. The timing
+probe has a separate bounded read interface on each platform.
 Linux supports offline authoring and discovery; recording is not implemented.

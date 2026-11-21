@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// DiscRecording supplies discovery metadata and BSD media nodes.
+// Discover optical drives through DiscRecording and the I/O Registry.
 #import <Foundation/Foundation.h>
 #import <DiscRecording/DiscRecording.h>
 #include <IOKit/scsi/SCSICmds_INQUIRY_Definitions.h>
@@ -96,11 +96,73 @@ static NSDictionary *Snapshot(DRDevice *device) {
             @"cd_text":@([caps[DRDeviceCanWriteCDTextKey] boolValue])},
         @"media":state,@"tracks":tracks};
 }
-static DRDevice *Find(NSString *identifier) {
-    for (DRDevice *device in [DRDevice devices]) {
+static DRDevice *Find(NSArray<DRDevice *> *devices, NSString *identifier) {
+    for (DRDevice *device in devices) {
         if ([[device info][DRDeviceIORegistryEntryPathKey] isEqual:identifier]) return device;
     }
-    Require(NO,@"Selected optical drive is no longer connected"); return nil;
+    return nil;
+}
+
+static DRDevice *RegisteredDevice(NSString *path) {
+    DRDevice *device=[DRDevice deviceForIORegistryEntryPath:path];
+    return device.isValid && [[device info][DRDeviceIORegistryEntryPathKey] isEqual:path] ? device : nil;
+}
+
+static NSString *StringProperty(NSDictionary *properties, NSString *key) {
+    id value=properties[key];
+    return [value isKindOfClass:[NSString class]] ?
+        [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] : @"";
+}
+
+static NSDictionary *RegistrySnapshot(io_service_t service, NSString *path) {
+    NSDictionary *properties=CFBridgingRelease(IORegistryEntrySearchCFProperty(
+        service,kIOServicePlane,CFSTR("SCSI Device Characteristics"),kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents));
+    if (![properties isKindOfClass:[NSDictionary class]]) properties=@{};
+    NSString *vendor=StringProperty(properties,@"Vendor Identification");
+    NSString *product=StringProperty(properties,@"Product Identification");
+    io_name_t name;
+    NSString *label=IORegistryEntryGetName(service,name)==KERN_SUCCESS ?
+        [NSString stringWithUTF8String:name] : nil;
+    if (product.length) label=vendor.length ? [NSString stringWithFormat:@"%@ %@",vendor,product] : product;
+    NSDictionary *info=@{DRDeviceIORegistryEntryPathKey:path,DRDeviceVendorNameKey:vendor,
+        DRDeviceProductNameKey:product};
+    return @{@"hardware":HardwareIdentity(info),@"id":path,@"name":label?:@"Optical drive",
+        @"backend":@"macos-iokit-mmc",@"capabilities":[NSNull null],@"media":[NSNull null],
+        @"tracks":@[],@"iokit_only":@YES};
+}
+
+static void AddRegistryDrives(NSMutableArray *devices) {
+    NSMutableSet *seen=[NSMutableSet set];
+    for (NSDictionary *device in devices) {
+        NSString *path=device[@"id"];
+        io_registry_entry_t entry=IORegistryEntryFromPath(kIOMainPortDefault,path.UTF8String);
+        uint64_t id;
+        if (entry && IORegistryEntryGetRegistryEntryID(entry,&id)==KERN_SUCCESS) [seen addObject:@(id)];
+        if (entry) IOObjectRelease(entry);
+    }
+    for (const char *const *type=optical_classes; *type; ++type) {
+        io_iterator_t matches;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault,IOServiceMatching(*type),&matches)!=KERN_SUCCESS)
+            continue;
+        io_service_t service;
+        while ((service=IOIteratorNext(matches))) {
+            io_string_t path;
+            uint64_t id;
+            if (IORegistryEntryGetRegistryEntryID(service,&id)==KERN_SUCCESS &&
+                ![seen containsObject:@(id)] &&
+                IORegistryEntryGetPath(service,kIOServicePlane,path)==KERN_SUCCESS) {
+                NSString *identifier=[NSString stringWithUTF8String:path];
+                if (identifier.length) {
+                    DRDevice *device=RegisteredDevice(identifier);
+                    [devices addObject:device ? Snapshot(device) : RegistrySnapshot(service,identifier)];
+                    [seen addObject:@(id)];
+                }
+            }
+            IOObjectRelease(service);
+        }
+        IOObjectRelease(matches);
+    }
 }
 static void Pump(double seconds) {
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
@@ -156,30 +218,49 @@ char *discimage_macos_query(const char *json, int (*cancelled)(void)) {
         Require([request isKindOfClass:[NSDictionary class]],@"Invalid native request");
         NSString *op=request[@"op"];
         NSDictionary *result=nil;
+        NSArray<DRDevice *> *visible=[DRDevice devices];
         if ([op isEqual:@"list"]) {
             NSMutableArray *devices=[NSMutableArray array];
-            for (DRDevice *device in [DRDevice devices]) [devices addObject:Snapshot(device)];
+            for (DRDevice *device in visible) [devices addObject:Snapshot(device)];
+            AddRegistryDrives(devices);
             result=@{@"devices":devices};
         } else {
             NSString *path=request[@"device"];
-            DRDevice *device=Find(path);
-            if ([op isEqual:@"probe"]) result=Snapshot(device);
+            Require([path isKindOfClass:[NSString class]] && path.length,@"Invalid optical drive path");
+            DRDevice *device=Find(visible,path);
+            NSDictionary *registry=nil;
+            if (!device && [path hasPrefix:@"IOService:"]) {
+                io_service_t service=optical_service_at_path(path.UTF8String);
+                if (service) {
+                    device=RegisteredDevice(path);
+                    if (!device && [op isEqual:@"probe"]) registry=RegistrySnapshot(service,path);
+                    IOObjectRelease(service);
+                } else Require(NO,@"Selected optical drive is no longer connected");
+            } else Require(device!=nil,@"Selected optical drive is no longer connected");
+            if ([op isEqual:@"probe"]) result=device ? Snapshot(device) : registry;
             else if ([op isEqual:@"media_node"] || [op isEqual:@"probe_node"] || [op isEqual:@"partial_probe_node"]) {
                 BOOL timing=[op isEqual:@"probe_node"];
                 BOOL probing=timing || [op isEqual:@"partial_probe_node"];
-                NSDictionary *snapshot=probing ? ReadySnapshot(device,cancelled) : Snapshot(device);
-                id media=snapshot[@"media"];
-                Require([media isKindOfClass:[NSDictionary class]],@"No ready optical medium");
-                if (timing) {
-                    NSArray *tracks=snapshot[@"tracks"];
-                    Require(![media[@"blank"] boolValue] && ![media[@"appendable"] boolValue] &&
-                        [media[@"sessions"] unsignedIntValue]==1 && tracks.count==1 &&
-                        ![tracks.firstObject[@"audio"] boolValue],
-                        @"Expected the finalized single-data-track target before unmounting");
+                if (device) {
+                    NSDictionary *snapshot=probing ? ReadySnapshot(device,cancelled) : Snapshot(device);
+                    id media=snapshot[@"media"];
+                    Require([media isKindOfClass:[NSDictionary class]],@"No ready optical medium");
+                    if (timing) {
+                        NSArray *tracks=snapshot[@"tracks"];
+                        Require(![media[@"blank"] boolValue] && ![media[@"appendable"] boolValue] &&
+                            [media[@"sessions"] unsignedIntValue]==1 && tracks.count==1 &&
+                            ![tracks.firstObject[@"audio"] boolValue],
+                            @"Expected the finalized single-data-track target before unmounting");
+                    }
                 }
                 result=OpticalMedium(path);
                 Require(result!=nil && (!timing || [result[@"bsd_name"] isKindOfClass:[NSString class]]),
                     @"Cannot identify the selected optical medium");
+                if (!device) {
+                    NSMutableDictionary *node=[result mutableCopy];
+                    node[@"iokit_only"]=@YES;
+                    result=node;
+                }
             } else Require(NO,@"Unknown optical metadata request");
         }
         NSData *output=[NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
